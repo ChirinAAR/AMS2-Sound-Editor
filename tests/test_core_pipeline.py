@@ -585,6 +585,82 @@ def main() -> None:
             assert "backfire_ext" in csd_loaded.links
             print(f"   Ferrari 488 GT3 Mod export directo: {summary_direct.bank_file.name} ({len(out_bank.events)} eventos nativos, 20 enlaces .csdbin OK)!")
 
+    print("14. Probando Gestor de Vehículos Vanilla (Auditoría, Inyección Directa y Restauración Bit-a-Bit)...")
+    from ams2_sound_porter.vanilla_manager import VanillaVehicleManager, calculate_file_sha256
+
+    mgr = VanillaVehicleManager()
+    assert mgr.is_ams2_valid(), "AMS2 no detectado en el sistema"
+    catalog = mgr.scan_catalog()
+    assert len(catalog) >= 150, f"Catálogo insuficiente de vehículos vanilla: {len(catalog)}"
+    print(f"   Catálogo oficial escaneado: {len(catalog)} vehículos base de AMS2 catalogados.")
+
+    # Simular ciclo completo de seguridad y restauración en sandbox aislado
+    with tempfile.TemporaryDirectory() as tmp_sandbox:
+        sb_root = Path(tmp_sandbox)
+        sb_sort = sb_root / "Audio" / "AMS2" / "Vehicles" / "Sort" / "S" / "Super_V8"
+        sb_sort.mkdir(parents=True)
+        sb_bank = sb_sort / "SuperV8_Set1.bank"
+
+        # Copiar banco vanilla real al sandbox
+        real_superv8 = Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2\Audio\AMS2\Vehicles\Sort\S\Super_V8\SuperV8_Set1.bank")
+        import shutil
+        shutil.copy2(real_superv8, sb_bank)
+        orig_sha = calculate_file_sha256(sb_bank)
+
+        # Gestor operando en el sandbox
+        sb_mgr = VanillaVehicleManager(ams2_root=sb_root, backup_dir=sb_root / "backups")
+        sb_vehs = sb_mgr.scan_catalog()
+        assert len(sb_vehs) == 1
+        target_v = sb_vehs[0]
+        sb_mgr.load_vehicle_events_info(target_v)
+        assert "EngineExt" in target_v.event_roles
+        assert "EngineInt" in target_v.event_roles
+
+        # 14a. Compilación directa AC con los GUIDs nativos del vehículo vanilla
+        vanilla_direct = build_direct_ported_bank_from_ac(
+            ac_bank=ac_lib.fmod_bank,
+            mod_identifier=target_v.car_name,
+            target_role_guids=target_v.event_guids,
+            target_role_paths=target_v.event_paths,
+            target_bank_guid=target_v.bank_guid,
+        )
+        assert len(vanilla_direct.bank_bytes) > 0
+        assert_sndh_and_fsb_alignment(vanilla_direct.bank_bytes)
+        sorted_tbls = assert_proj_tables_sorted(vanilla_direct.bank_bytes)
+        assert sorted_tbls >= 13, f"Tablas insuficientes ordenadas: {sorted_tbls}"
+        assert len(sb_mgr.find_vehicles("Super")) == 1
+
+        parsed_vanilla = FmodBank(vanilla_direct.bank_bytes)
+        ext_ev = next(
+            e for e in parsed_vanilla.events
+            if "engineext" in (e.path or "").lower() or e.guid_str.lower() == target_v.event_guids["EngineExt"].lower()
+        )
+        assert ext_ev.guid_str.lower() == target_v.event_guids["EngineExt"].lower()
+        int_ev = next(
+            e for e in parsed_vanilla.events
+            if "engineint" in (e.path or "").lower() or e.guid_str.lower() == target_v.event_guids["EngineInt"].lower()
+        )
+        assert int_ev.guid_str.lower() == target_v.event_guids["EngineInt"].lower()
+        print(f"   Inyección de GUIDs nativos de vehículo vanilla comprobada con éxito ({sorted_tbls} tablas FMOD ordenadas).")
+
+        # 14b. Instalación segura con creación de respaldo automático
+        ok_inst, msg_inst = sb_mgr.install_sound(target_v, vanilla_direct.bank_bytes)
+        assert ok_inst, msg_inst
+        assert target_v.is_modified
+        assert (sb_sort / "SuperV8_Set1.bank.orig").is_file()
+        assert target_v.original_sha256 == orig_sha
+        assert calculate_file_sha256(sb_bank) != orig_sha
+        print("   Instalación en vehículo base con respaldo automático (.orig + SHA256) verificada.")
+
+        # 14c. Restauración al estado original de Steam sin reparación de archivos
+        ok_rest, msg_rest = sb_mgr.restore_vehicle(target_v)
+        assert ok_rest, msg_rest
+        assert not target_v.is_modified
+        assert not (sb_sort / "SuperV8_Set1.bank.orig").is_file()
+        restored_sha = calculate_file_sha256(sb_bank)
+        assert restored_sha == orig_sha, "El archivo restaurado difiere del original de fábrica"
+        print(f"   Restauración 100% fiel de Steam comprobada (SHA256 verificado bit-a-bit: {restored_sha[:12]}...).")
+
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 
 

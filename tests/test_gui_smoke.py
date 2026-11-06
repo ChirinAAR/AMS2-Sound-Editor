@@ -160,25 +160,128 @@ def main() -> None:
                 assert "sincronizadas" in app.status_var.get()
                 print("   GUI Recreación Fiel Sección Interior probada:", app.status_var.get())
 
-                # 5. Probar Eliminar Banda seleccionada
+                # 5. Probar Eliminar Banda seleccionada y Reutilización Segura
                 vis_after = app.rpm_tree.get_children()
                 if vis_after:
-                    app.rpm_tree.selection_set(vis_after[0])
+                    target_del_id = vis_after[0]
+                    del_idx = int(target_del_id)
+                    app.rpm_tree.selection_set(target_del_id)
                     app._on_rpm_band_selected()
                     orig_askyesno = mb.askyesno
                     mb.askyesno = lambda *args, **kw: True
                     try:
                         app.cmd_delete_rpm_band()
-                        assert "eliminada y silenciada" in app.status_var.get()
+                        assert "silenciada" in app.status_var.get()
                         print("   GUI Eliminar Banda probada:", app.status_var.get())
+
+                        # Probar Reactivación de Banda
+                        app._selected_band_idx = del_idx
+                        app.cmd_reactivate_selected_band()
+                        assert "reactivada y desmuteada" in app.status_var.get()
+                        print("   GUI Reactivar Banda probada:", app.status_var.get())
+
+                        # Probar Sobreescribir Muestra de la Banda Seleccionada
+                        app._selected_band_idx = del_idx
+                        avail_vals = app.band_source_combo["values"]
+                        if len(avail_vals) > 1:
+                            app.band_source_var.set(avail_vals[1])
+                            app.cmd_overwrite_selected_band_sample()
+                            assert "sobreescrita exitosamente" in app.status_var.get()
+                            print("   GUI Sobreescribir Muestra probada:", app.status_var.get())
                     finally:
                         mb.askyesno = orig_askyesno
 
+        # 6. Probar Sistema GUI de Vehículos Vanilla de AMS2 (Pestaña 4 y Pestaña 5)
+        print("6. Probando Sistema GUI de Vehículos Vanilla de AMS2...")
+        assert app.target_mode_var.get() == "vanilla"
+        assert len(app.vanilla_mgr.scan_catalog()) >= 150
+        assert len(app.vanilla_combo["values"]) >= 150
+
+        # Probar filtro de búsqueda en tiempo real
+        app.vanilla_search_var.set("Super V8")
+        app._filter_vanilla_vehicles()
+        assert any("Super V8" in val for val in app.vanilla_combo["values"])
+        assert app.vanilla_selected_vehicle is not None
+        assert "super_v8" in app.vanilla_selected_vehicle.vehicle_id
+
+        # Verificar actualización de detalles técnicos
+        assert "Super V8" in app.vanilla_det_name_var.get()
+        assert "SuperV8_Set1.bank" in app.vanilla_det_path_var.get()
+        assert "EngineExt" in app.vanilla_det_events_var.get()
+
+        # Probar alternancia de modos (Vanilla <-> Mod .csdbin)
+        app.target_mode_var.set("mod")
+        app._on_target_mode_changed()
+        assert "COMPILAR Y EXPORTAR" in app.btn_export.cget("text")
+
+        app.target_mode_var.set("vanilla")
+        app._on_target_mode_changed()
+        assert "INYECTAR" in app.btn_export.cget("text") and "SUPER V8" in app.btn_export.cget("text")
+        print("   GUI Selector Vanilla, Búsqueda, Ficha Técnica y Alternancia de Modo verificados con éxito.")
+
+        # Probar modo directo 1:1 en vehículo vanilla (cmd_set_vanilla_direct_mode y build_direct_ported_bank_from_ac)
+        app.cmd_set_vanilla_direct_mode()
+        assert app.port_mode_var.get() == "direct"
+        assert app.target_mode_var.get() == "vanilla"
+        assert "DIRECTO 1:1" in app.btn_export["text"]
+        print("   GUI Porteo Directo 1:1 Vanilla (cmd_set_vanilla_direct_mode) verificado con éxito.")
+
+        orig_install = app.vanilla_mgr.install_sound
+        direct_installed = []
+        app.vanilla_mgr.install_sound = lambda vehicle, bank_bytes, ai_bank_bytes=None: (direct_installed.append(len(bank_bytes)) or True, "OK mock direct")
+        orig_info = mb.showinfo
+        orig_yesno = mb.askyesno
+        mb.showinfo = lambda *args, **kw: None
+        mb.askyesno = lambda *args, **kw: True
+        try:
+            import time
+            app._run_inject_vanilla()
+            timeout = time.time() + 20
+            while not direct_installed and time.time() < timeout:
+                app.update()
+                time.sleep(0.05)
+            assert len(direct_installed) > 0, f"No se llamó a install_sound en inyección directa vanilla. Error: {app.status_var.get()}"
+            assert direct_installed[0] > 10000000, "El banco directo generado tiene tamaño inválido"
+            print("   Inyección vanilla en Modo Directo 1:1 (build_direct_ported_bank_from_ac) verificada sin excepciones:", direct_installed[0], "bytes")
+        finally:
+            app.vanilla_mgr.install_sound = orig_install
+            mb.showinfo = orig_info
+            mb.askyesno = orig_yesno
+
+        # Probar inyección en vehículo vanilla en modo donante (asegurando que build_ported_bank esté definido)
+        installed_called = []
+        app.vanilla_mgr.install_sound = lambda vehicle, bank_bytes, ai_bank_bytes=None: (installed_called.append(len(bank_bytes)) or True, "OK mock")
+        orig_info = mb.showinfo
+        orig_yesno = mb.askyesno
+        mb.showinfo = lambda *args, **kw: None
+        mb.askyesno = lambda *args, **kw: True
+        try:
+            app.port_mode_var.set("donor")
+            import time
+            app._run_inject_vanilla()
+            timeout = time.time() + 20
+            while not installed_called and time.time() < timeout:
+                app.update()
+                time.sleep(0.05)
+            assert len(installed_called) > 0, f"No se llamó a install_sound en inyección vanilla. Error: {app.status_var.get()}"
+            assert installed_called[0] > 100000, "El banco generado tiene tamaño inválido"
+            print("   Inyección vanilla en modo donante (build_ported_bank) verificada sin excepciones:", installed_called[0], "bytes")
+        finally:
+            app.vanilla_mgr.install_sound = orig_install
+            mb.showinfo = orig_info
+            mb.askyesno = orig_yesno
+
         app.update_idletasks()
-        print("GUI Smoke Test + Audio Preview Async + Soporte GUIDs.txt + Pestaña 3 (v1.4.0) superado al 100% sin errores!")
+        print("GUI Smoke Test + Audio Preview Async + Soporte GUIDs.txt + Pestaña 3 (v1.4.0) + Vanilla Manager (v1.6.0) superado al 100% sin errores!")
     finally:
         app._on_close()
+        try:
+            app.quit()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
     main()
+    import os
+    os._exit(0)

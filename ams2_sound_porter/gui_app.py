@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
 import re
 import subprocess
 import tempfile
@@ -21,6 +22,7 @@ from .audio_dsp import conform_audio, read_wav_file, write_wav_bytes
 from .engine_sim import EnginePassTrajectory, render_engine_pass_wav_bytes
 from .fmod_bank import FSB5_MODE_FADPCM, FSB5_MODE_PCM16, FmodBank
 from .omvt_csdbin import SOUND_SLOT_GROUPS, CsdbinDocument
+from .vanilla_manager import VanillaVehicle, VanillaVehicleManager
 from .porter_engine import (
     ModExportSummary,
     RpmBandConfig,
@@ -35,6 +37,7 @@ from .porter_engine import (
     build_default_rpm_bands,
     build_direct_ported_bank_from_ac,
     build_mod_event_paths,
+    build_ported_bank,
     estimate_engine_rpm_bounds,
     export_ams2_mod_package,
     sync_faithful_assetto_corsa_setup,
@@ -133,6 +136,8 @@ class SoundPorterApp(tk.Tk):
         self.band_rmax_var = tk.StringVar(value="")
         self.band_root_rpm_var = tk.StringVar(value="")
         self.band_gain_var = tk.StringVar(value="0.0")
+        self.band_source_var = tk.StringVar(value="")
+        self.band_custom_wav_var = tk.StringVar(value="")
         self.batch_gain_var = tk.StringVar(value="+1.5")
 
         self.sim_telemetry_var = tk.StringVar(
@@ -162,12 +167,49 @@ class SoundPorterApp(tk.Tk):
         self.open_folder_after_var = tk.BooleanVar(value=True)
         self.codec_choice_var = tk.StringVar(value="PCM16")
 
+        # Controles y estado de Vehículos Vanilla / Base de AMS2
+        self.vanilla_mgr = VanillaVehicleManager()
+        self.target_mode_var = tk.StringVar(value="vanilla")
+        self.vanilla_ams2_path_var = tk.StringVar(value=str(self.vanilla_mgr.ams2_root))
+        self.vanilla_search_var = tk.StringVar(value="")
+        self.vanilla_selected_id_var = tk.StringVar(value="")
+        self.vanilla_selected_vehicle: VanillaVehicle | None = None
+        self.vanilla_status_card_var = tk.StringVar(
+            value="Selecciona un vehículo vanilla de la lista para ver su información de audio."
+        )
+        self.vanilla_auto_backup_var = tk.BooleanVar(value=True)
+        self.vanilla_sync_ai_var = tk.BooleanVar(value=True)
+        self.vanilla_filtered_vehicles: list[VanillaVehicle] = []
+        self.vanilla_export_dest_var = tk.StringVar(value="Ningún vehículo vanilla seleccionado.")
+
         self._configure_styles()
         self._build_header()
         self._build_notebook()
         self._build_statusbar()
 
+        # Inicializar catálogo de vehículos vanilla
+        self._populate_vanilla_vehicles_list()
+
+        # Cola de despacho para comunicación segura entre hilos de fondo y la UI
+        self._ui_queue: queue.Queue[tuple[Any, tuple, dict]] = queue.Queue()
+        self._poll_ui_queue()
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _poll_ui_queue(self) -> None:
+        while not self._ui_queue.empty():
+            try:
+                fn, args, kwargs = self._ui_queue.get_nowait()
+                fn(*args, **kwargs)
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"Error en despacho de cola UI: {e}")
+        self.after(40, self._poll_ui_queue)
+
+    def dispatch_to_ui(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        """Encola una función para ejecutarse de forma segura en el hilo principal de Tkinter."""
+        self._ui_queue.put((fn, args, kwargs))
 
     # ========================================================================
     # Estilos visuales TTK
@@ -343,6 +385,11 @@ class SoundPorterApp(tk.Tk):
         right.pack(side="right")
         ttk.Button(
             right,
+            text="🛡️ Restaurar Sonidos Vanilla...",
+            command=self.cmd_open_vanilla_restore_dialog,
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            right,
             text="⏹ Detener Audio",
             command=self.stop_audio_preview,
         ).pack(side="right", padx=(6, 0))
@@ -511,6 +558,13 @@ class SoundPorterApp(tk.Tk):
             command=self.cmd_load_donor_bank,
         )
         self.btn_load_donor.pack(side="left", padx=(0, 8))
+
+        self.btn_load_vanilla_donor = ttk.Button(
+            top,
+            text="🚗 Cargar Banco Vanilla de AMS2...",
+            command=self.cmd_select_and_load_vanilla_donor,
+        )
+        self.btn_load_vanilla_donor.pack(side="left", padx=(0, 8))
 
         self.btn_auto_map = ttk.Button(
             top,
@@ -861,6 +915,41 @@ class SoundPorterApp(tk.Tk):
         ).pack(side="left", padx=(0, 4))
         ttk.Entry(batch_f, textvariable=self.batch_gain_var, width=5).pack(side="left")
 
+        # Fila de selección y sobreescritura de muestra asignada a la banda
+        bed_r_sample = ttk.Frame(band_ed, style="Card.TFrame")
+        bed_r_sample.pack(fill="x", pady=(0, 5))
+
+        ttk.Label(bed_r_sample, text="Muestra asignada / Reemplazo:", style="Card.TLabel").pack(side="left", padx=(0, 6))
+        self.band_source_combo = ttk.Combobox(
+            bed_r_sample,
+            textvariable=self.band_source_var,
+            state="readonly",
+            width=50,
+        )
+        self.band_source_combo.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.band_source_combo.bind("<<ComboboxSelected>>", self._on_band_source_combo_selected)
+
+        ttk.Button(
+            bed_r_sample,
+            text="📂 WAV...",
+            width=8,
+            command=self.cmd_pick_band_custom_wav,
+        ).pack(side="left", padx=(0, 6))
+
+        self.btn_overwrite_sample = ttk.Button(
+            bed_r_sample,
+            text="🔁 Sobreescribir Muestra",
+            command=self.cmd_overwrite_selected_band_sample,
+        )
+        self.btn_overwrite_sample.pack(side="left", padx=(0, 6))
+
+        self.btn_reactivate_band = ttk.Button(
+            bed_r_sample,
+            text="♻ Reactivar Banda",
+            command=self.cmd_reactivate_selected_band,
+        )
+        self.btn_reactivate_band.pack(side="left")
+
         bed_r2 = ttk.Frame(band_ed, style="Card.TFrame")
         bed_r2.pack(fill="x")
 
@@ -922,10 +1011,163 @@ class SoundPorterApp(tk.Tk):
         self.rpm_tree.bind("<Double-1>", lambda _e: self.cmd_preview_selected_band_sample())
 
     # ========================================================================
-    # PESTAÑA 4: Editor .csdbin integrado con OMVT
+    # PESTAÑA 4: Vehículo Oficial Vanilla / Editor .csdbin integrado con OMVT
     # ========================================================================
     def _build_tab_csdbin(self) -> None:
-        top = ttk.Frame(self.tab_csdbin, style="Panel.TFrame")
+        # Selector de Tipo de Vehículo: Vanilla vs Mod
+        target_mode_card = ttk.Frame(self.tab_csdbin, style="Card.TFrame", padding=(12, 8))
+        target_mode_card.pack(fill="x", pady=(0, 8))
+        ttk.Label(target_mode_card, text="Tipo de Vehículo Destino en AMS2:", style="CardSection.TLabel").pack(
+            side="left", padx=(0, 14)
+        )
+        ttk.Radiobutton(
+            target_mode_card,
+            text="🚗  Vehículo Oficial / Vanilla de AMS2 (174+ autos — Sin requerir archivo .csdbin)",
+            value="vanilla",
+            variable=self.target_mode_var,
+            command=self._on_target_mode_changed,
+        ).pack(side="left", padx=(0, 20))
+        ttk.Radiobutton(
+            target_mode_card,
+            text="📦  Vehículo Modificado de la Comunidad (con archivo .csdbin suelto)",
+            value="mod",
+            variable=self.target_mode_var,
+            command=self._on_target_mode_changed,
+        ).pack(side="left")
+
+        # Contenedores para cada modo
+        self.vanilla_view_frame = ttk.Frame(self.tab_csdbin, style="Panel.TFrame")
+        self.mod_view_frame = ttk.Frame(self.tab_csdbin, style="Panel.TFrame")
+
+        self._build_vanilla_view(self.vanilla_view_frame)
+        self._build_mod_csdbin_view(self.mod_view_frame)
+
+        self._on_target_mode_changed()
+
+    def _build_vanilla_view(self, parent: ttk.Frame) -> None:
+        # Card 1: Directorio AMS2
+        path_card = ttk.Frame(parent, style="Card.TFrame", padding=12)
+        path_card.pack(fill="x", pady=(0, 8))
+        path_card.columnconfigure(1, weight=1)
+
+        ttk.Label(path_card, text="Directorio Automobilista 2:", style="Card.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 10), pady=2
+        )
+        ttk.Entry(path_card, textvariable=self.vanilla_ams2_path_var).grid(
+            row=0, column=1, sticky="ew", padx=(0, 10), pady=2
+        )
+        ttk.Button(path_card, text="📁 Examinar...", command=self.cmd_browse_ams2_path).grid(
+            row=0, column=2, padx=(0, 6), pady=2
+        )
+        ttk.Button(path_card, text="🔄 Re-escanear", command=self.cmd_rescan_vanilla_catalog).grid(
+            row=0, column=3, pady=2
+        )
+
+        # Card 2: Selector y búsqueda de vehículos vanilla
+        sel_card = ttk.Frame(parent, style="Card.TFrame", padding=12)
+        sel_card.pack(fill="x", pady=(0, 8))
+        sel_card.columnconfigure(3, weight=1)
+
+        ttk.Label(sel_card, text="🔍 Filtrar Auto:", style="Card.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        search_entry = ttk.Entry(sel_card, textvariable=self.vanilla_search_var, width=22)
+        search_entry.grid(row=0, column=1, sticky="w", padx=(0, 16), pady=4)
+        search_entry.bind("<KeyRelease>", lambda _e: self._filter_vanilla_vehicles())
+
+        ttk.Label(sel_card, text="Vehículo Oficial / Vanilla:", style="Card.TLabel").grid(
+            row=0, column=2, sticky="w", padx=(0, 8), pady=4
+        )
+        self.vanilla_combo = ttk.Combobox(
+            sel_card,
+            textvariable=self.vanilla_selected_id_var,
+            state="readonly",
+        )
+        self.vanilla_combo.grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=4)
+        self.vanilla_combo.bind("<<ComboboxSelected>>", self._on_vanilla_vehicle_selected)
+
+        # Botones de acción directa
+        btn_bar = ttk.Frame(sel_card, style="Card.TFrame")
+        btn_bar.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+
+        ttk.Button(
+            btn_bar,
+            text="⚡ Porteo Directo 1:1 desde AC (Sin Donante — 100% Fiel)",
+            style="Primary.TButton",
+            command=self.cmd_set_vanilla_direct_mode,
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            btn_bar,
+            text="🎯 Mapear sobre Slots (Modo Donante)",
+            command=self.cmd_load_vanilla_as_donor,
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            btn_bar,
+            text="🔄 Restaurar este Vehículo a Original de Steam",
+            command=self.cmd_restore_selected_vanilla,
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            btn_bar,
+            text="🛡️ Restaurar TODOS los Vanilla",
+            command=self.cmd_restore_all_vanilla,
+        ).pack(side="left")
+
+        # Card 3: Ficha técnica y eventos FMOD del vehículo
+        det_card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        det_card.pack(fill="both", expand=True, pady=(0, 8))
+        det_card.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            det_card,
+            text="Ficha Técnica y Enlaces de Sonido FMOD del Vehículo",
+            style="CardSection.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        self.vanilla_det_name_var = tk.StringVar(value="—")
+        self.vanilla_det_brand_var = tk.StringVar(value="—")
+        self.vanilla_det_path_var = tk.StringVar(value="—")
+        self.vanilla_det_ai_var = tk.StringVar(value="—")
+        self.vanilla_det_events_var = tk.StringVar(value="—")
+        self.vanilla_det_integrity_var = tk.StringVar(value="—")
+        self.vanilla_det_sha_var = tk.StringVar(value="—")
+
+        det_fields = [
+            ("Vehículo Oficial:", self.vanilla_det_name_var),
+            ("Marca / Modelo:", self.vanilla_det_brand_var),
+            ("Banco de Audio (.bank):", self.vanilla_det_path_var),
+            ("Banco AI (_AI.bank):", self.vanilla_det_ai_var),
+            ("Eventos y GUIDs Nativos:", self.vanilla_det_events_var),
+            ("Estado de Integridad:", self.vanilla_det_integrity_var),
+            ("Respaldo SHA256:", self.vanilla_det_sha_var),
+        ]
+        for idx_d, (lbl_t, var_d) in enumerate(det_fields, start=1):
+            ttk.Label(det_card, text=lbl_t, style="Card.TLabel").grid(
+                row=idx_d, column=0, sticky="nw", padx=(0, 10), pady=3
+            )
+            lbl_val = ttk.Label(det_card, textvariable=var_d, style="Card.TLabel", wraplength=760)
+            lbl_val.grid(row=idx_d, column=1, sticky="w", pady=3)
+
+        # Card 4: Seguridad y garantía de reversibilidad sin Steam
+        sec_card = ttk.Frame(parent, style="Card.TFrame", padding=12)
+        sec_card.pack(fill="x")
+        ttk.Label(
+            sec_card,
+            text="🛡️ Seguridad y Reversibilidad 100% Garantizada Sin Verificación de Steam",
+            style="CardSection.TLabel",
+        ).pack(anchor="w", pady=(0, 4))
+        sec_desc = (
+            "Esta herramienta crea automáticamente una copia de seguridad binaria idéntica (archivo .orig y almacén "
+            "seguro con hash SHA256) antes de modificar cualquier archivo oficial del juego.\n"
+            "Puedes restaurar cualquier vehículo modificado a su estado original de Steam en cualquier momento con un clic, "
+            "sin descargas, sin alterar archivos de sistema y sin requerir la comprobación o reparación de archivos en Steam."
+        )
+        ttk.Label(sec_card, text=sec_desc, style="CardMuted.TLabel", wraplength=1000).pack(anchor="w")
+
+    def _build_mod_csdbin_view(self, parent: ttk.Frame) -> None:
+        top = ttk.Frame(parent, style="Panel.TFrame")
         top.pack(fill="x", pady=(0, 10))
 
         ttk.Button(
@@ -956,7 +1198,7 @@ class SoundPorterApp(tk.Tk):
 
         ttk.Label(top, textvariable=self.csd_info_var, style="Section.TLabel").pack(side="right")
 
-        sub_nb = ttk.Notebook(self.tab_csdbin)
+        sub_nb = ttk.Notebook(parent)
         sub_nb.pack(fill="both", expand=True)
 
         visual_tab = ttk.Frame(sub_nb, style="Panel.TFrame", padding=8)
@@ -1058,80 +1300,133 @@ class SoundPorterApp(tk.Tk):
         raw_vsb.pack(side="right", fill="y")
 
     # ========================================================================
-    # PESTAÑA 4: Compilación y Exportación del Paquete Mod para AMS2
+    # PESTAÑA 5: Compilación y Exportación / Inyección de Sonido para AMS2
     # ========================================================================
     def _build_tab_export(self) -> None:
-        cfg_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
-        cfg_card.pack(fill="x", pady=(0, 12))
-        cfg_card.columnconfigure(1, weight=1)
+        # Tarjeta 1A: Configuración Modo Vehículo Mod (.csdbin)
+        self.mod_cfg_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
+        self.mod_cfg_card.columnconfigure(1, weight=1)
 
         ttk.Label(
-            cfg_card,
+            self.mod_cfg_card,
             text="Configuración del Paquete Final para Automobilista 2",
             style="CardSection.TLabel",
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
-        ttk.Label(cfg_card, text="Identificador Único del Banco Mod:", style="Card.TLabel").grid(
+        ttk.Label(self.mod_cfg_card, text="Identificador Único del Banco Mod:", style="Card.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 12), pady=5
         )
-        ttk.Entry(cfg_card, textvariable=self.mod_id_var).grid(row=1, column=1, sticky="ew", pady=5)
+        ttk.Entry(self.mod_cfg_card, textvariable=self.mod_id_var).grid(row=1, column=1, sticky="ew", pady=5)
         ttk.Label(
-            cfg_card,
+            self.mod_cfg_card,
             text="Ej: bmw_z4_gt3_ac (define la ruta Audio/AMS2/Vehicles/Mods/<id>/<id>_Engine.bank)",
             style="CardMuted.TLabel",
         ).grid(row=1, column=2, sticky="w", padx=(12, 0))
 
-        ttk.Label(cfg_card, text="Carpeta del Vehículo Mod (Vehicles/<carpeta>):", style="Card.TLabel").grid(
+        ttk.Label(self.mod_cfg_card, text="Carpeta del Vehículo Mod (Vehicles/<carpeta>):", style="Card.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 12), pady=5
         )
-        ttk.Entry(cfg_card, textvariable=self.veh_folder_var).grid(row=2, column=1, sticky="ew", pady=5)
+        ttk.Entry(self.mod_cfg_card, textvariable=self.veh_folder_var).grid(row=2, column=1, sticky="ew", pady=5)
         ttk.Label(
-            cfg_card,
+            self.mod_cfg_card,
             text="Ej: bmw_z4_gt3 (conserva el nombre original del archivo .csdbin cargado)",
             style="CardMuted.TLabel",
         ).grid(row=2, column=2, sticky="w", padx=(12, 0))
 
-        ttk.Label(cfg_card, text="Carpeta de Salida:", style="Card.TLabel").grid(
+        ttk.Label(self.mod_cfg_card, text="Carpeta de Salida:", style="Card.TLabel").grid(
             row=3, column=0, sticky="w", padx=(0, 12), pady=5
         )
-        ttk.Entry(cfg_card, textvariable=self.out_dir_var).grid(row=3, column=1, sticky="ew", pady=5)
-        ttk.Button(cfg_card, text="📁 Examinar...", command=self.cmd_pick_output_dir).grid(
+        ttk.Entry(self.mod_cfg_card, textvariable=self.out_dir_var).grid(row=3, column=1, sticky="ew", pady=5)
+        ttk.Button(self.mod_cfg_card, text="📁 Examinar...", command=self.cmd_pick_output_dir).grid(
             row=3, column=2, sticky="w", padx=(12, 0), pady=5
         )
 
-        # Opciones avanzadas de compilación FMOD
-        opts_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
-        opts_card.pack(fill="x", pady=(0, 12))
+        # Tarjeta 1B: Configuración Modo Vehículo Vanilla
+        self.vanilla_cfg_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
+        self.vanilla_cfg_card.columnconfigure(1, weight=1)
 
-        ttk.Label(opts_card, text="Opciones de Ingeniería FMOD", style="CardSection.TLabel").pack(
+        ttk.Label(
+            self.vanilla_cfg_card,
+            text="Inyección Directa en Vehículo Oficial / Base de Automobilista 2",
+            style="CardSection.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(self.vanilla_cfg_card, text="Vehículo Oficial Destino:", style="Card.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 12), pady=5
+        )
+        ttk.Label(self.vanilla_cfg_card, textvariable=self.vanilla_export_dest_var, style="Section.TLabel").grid(
+            row=1, column=1, sticky="w", pady=5
+        )
+
+        # Metodología de Porteo para el Vehículo Oficial: Directo 1:1 vs Mapeo Donante
+        vanilla_mode_f = ttk.LabelFrame(
+            self.vanilla_cfg_card,
+            text="Metodología de Sonido para este Vehículo:",
+            padding=(10, 8),
+        )
+        vanilla_mode_f.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+
+        ttk.Radiobutton(
+            vanilla_mode_f,
+            text="⚡ Transmutación Directa 1:1 (Recomendado — Sonido 100% idéntico a Assetto Corsa sin donante)",
+            variable=self.port_mode_var,
+            value="direct",
+            command=self._on_port_mode_changed,
+        ).pack(anchor="w", pady=2)
+
+        ttk.Radiobutton(
+            vanilla_mode_f,
+            text="🎯 Mapeo sobre Banco Donante de AMS2 (Plantilla clásica de slots fijos de Automobilista 2)",
+            variable=self.port_mode_var,
+            value="donor",
+            command=self._on_port_mode_changed,
+        ).pack(anchor="w", pady=2)
+
+        ttk.Checkbutton(
+            self.vanilla_cfg_card,
+            text="🛡️ Respaldo Preventivo Garantizado: Crear copia segura del archivo original (.orig y almacén con hash SHA256) antes de modificar nada",
+            variable=self.vanilla_auto_backup_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Checkbutton(
+            self.vanilla_cfg_card,
+            text="👥 Inyectar también banco de audio de IA (_AI.bank) si existe para los oponentes",
+            variable=self.vanilla_sync_ai_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
+
+        # Tarjeta 2: Opciones avanzadas de ingeniería FMOD
+        self.opts_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
+        self.opts_card.pack(fill="x", pady=(0, 12))
+
+        ttk.Label(self.opts_card, text="Opciones de Ingeniería FMOD", style="CardSection.TLabel").pack(
             anchor="w", pady=(0, 8)
         )
 
         ttk.Checkbutton(
-            opts_card,
+            self.opts_card,
             text="Modo Standalone con Tabla STDT (Recomendado): Regenera GUIDs únicos e incrusta rutas 'event:/...' dentro del .bank sin tocar MasterBank.strings.bank",
             variable=self.standalone_var,
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
-            opts_card,
+            self.opts_card,
             text="Sincronizar Auto-Pitch RPM automáticamente en FMOD (INST): Ajusta la referencia de RPM de cada capa para que la afinación del motor sea exacta",
             variable=self.sync_pitch_var,
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
-            opts_card,
+            self.opts_card,
             text="Vincular y compilar automáticamente el archivo .csdbin cargado junto con el banco .bank",
             variable=self.auto_link_csd_var,
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
-            opts_card,
+            self.opts_card,
             text="Abrir la carpeta de salida en el Explorador de Windows al finalizar",
             variable=self.open_folder_after_var,
         ).pack(anchor="w", pady=3)
 
-        codec_row = ttk.Frame(opts_card, style="Card.TFrame")
+        codec_row = ttk.Frame(self.opts_card, style="Card.TFrame")
         codec_row.pack(fill="x", pady=(8, 0))
         ttk.Label(codec_row, text="Códec de Compresión FSB5:", style="Card.TLabel").pack(side="left", padx=(0, 12))
         ttk.Radiobutton(
@@ -1499,6 +1794,18 @@ class SoundPorterApp(tk.Tk):
                 self._refresh_donor_tree()
                 self._refresh_rpm_tab()
                 self.status_var.set("Modo Donante seleccionado. Carga un archivo .bank donante de AMS2 en el Paso 2.")
+
+        if hasattr(self, "btn_export") and hasattr(self, "target_mode_var") and self.target_mode_var.get() == "vanilla":
+            veh_name = (
+                self.vanilla_selected_vehicle.display_name
+                if self.vanilla_selected_vehicle
+                else "Vehículo Vanilla"
+            )
+            if self.is_direct_ac_mode:
+                btn_text = f"⚡ INYECTAR DIRECTO 1:1 EN '{veh_name.upper()}' (SIN DONANTE - 100% FIEL)"
+            else:
+                btn_text = f"🎯 INYECTAR MAPEO EN '{veh_name.upper()}' (MODO DONANTE)"
+            self.btn_export.config(text=btn_text)
 
     def _update_donor_tree_headings(self) -> None:
         if self.is_direct_ac_mode:
@@ -2202,7 +2509,7 @@ class SoundPorterApp(tk.Tk):
         resp = messagebox.askyesno(
             "Eliminar Banda",
             f"¿Deseas eliminar la Banda #{idx:02d} [{b.event_role} / {b.load_role.upper()}]?\n\n"
-            "La banda será silenciada y retirada de la escalera activa de este sonido.",
+            "La banda será silenciada y su pista física quedará libre para ser reasignada o reactivada.",
         )
         if not resp:
             return
@@ -2217,13 +2524,213 @@ class SoundPorterApp(tk.Tk):
                 self.mappings[gidx].action = "silence"
                 self.mappings[gidx].match_reason = "Banda eliminada por el usuario"
 
-        self._selected_band_idx = None
+        # Sincronizar capa gemela AuxInt si aplica
+        if b.event_role == "EngineInt":
+            orig_sig = (b.load_role, int(round(b.orig_rpm_min)), int(round(b.orig_rpm_max)))
+            for other in self.rpm_bands:
+                if other.event_role == "AuxInt" and (other.load_role, int(round(other.orig_rpm_min)), int(round(other.orig_rpm_max))) == orig_sig:
+                    other.is_muted_bus = True
+                    other.rpm_min = 0.0
+                    other.fade_in_end = 0.0
+                    other.fade_out_start = 0.0
+                    other.rpm_max = 0.0
+                    for gidx in other.donor_slot_indices:
+                        if 0 <= gidx < len(self.mappings):
+                            self.mappings[gidx].action = "silence"
+                            self.mappings[gidx].match_reason = "Banda eliminada por el usuario"
+
         self._refresh_donor_tree()
         self._refresh_rpm_tab()
-        self.status_var.set(f"✔ Banda #{idx:02d} eliminada y silenciada exitosamente.")
+        self._on_rpm_band_selected()
+        self.status_var.set(f"✔ Banda #{idx:02d} silenciada. Su pista física queda disponible para reasignar.")
+
+    def cmd_pick_band_custom_wav(self) -> None:
+        """Abre un explorador de archivos para asignar un WAV local directamente a la banda."""
+        p = filedialog.askopenfilename(
+            title="Elegir archivo WAV de muestra para esta banda",
+            filetypes=[("Archivos WAV", "*.wav"), ("Todos los archivos", "*.*")],
+        )
+        if p:
+            self.band_custom_wav_var.set(p)
+            self.band_source_var.set(f"WAV: {Path(p).name}")
+
+    def _on_band_source_combo_selected(self, _event=None) -> None:
+        """Al cambiar la selección en el desplegable de muestras de la banda, sugiere RPM Raíz si aplica."""
+        val = self.band_source_var.get().strip()
+        if val.startswith("[") and self.source_lib:
+            try:
+                s_idx = int(val[1:3])
+                it = self.source_lib.items[s_idx]
+                if it.effective_rpm and it.effective_rpm > 100.0:
+                    self.band_root_rpm_var.set(f"{it.effective_rpm:.0f}")
+            except Exception:
+                pass
+
+    def cmd_reactivate_selected_band(self) -> None:
+        """Reactiva y desmutea la banda seleccionada actualmente."""
+        bank = self.active_engine_bank
+        if not bank or not self.rpm_bands or self._selected_band_idx is None:
+            messagebox.showinfo("Seleccionar banda", "Selecciona primero una banda silenciada para reactivarla.")
+            return
+        idx = self._selected_band_idx
+        if not (0 <= idx < len(self.rpm_bands)):
+            return
+        b = self.rpm_bands[idx]
+        b.is_muted_bus = False
+        if b.rpm_max <= b.rpm_min + 40.0:
+            b.rpm_min = b.orig_rpm_min if b.orig_rpm_min > 0 else 2500.0
+            b.fade_in_end = b.orig_fade_in_end if b.orig_fade_in_end > 0 else 3000.0
+            b.fade_out_start = b.orig_fade_out_start if b.orig_fade_out_start > 0 else 5500.0
+            b.rpm_max = b.orig_rpm_max if b.orig_rpm_max > 0 else 6000.0
+            self.band_rmin_var.set(f"{b.rpm_min:.0f}")
+            self.band_fi_var.set(f"{b.fade_in_end:.0f}")
+            self.band_fo_var.set(f"{b.fade_out_start:.0f}")
+            self.band_rmax_var.set(f"{b.rpm_max:.0f}")
+
+        for gidx in b.donor_slot_indices:
+            if 0 <= gidx < len(self.mappings):
+                m = self.mappings[gidx]
+                if m.action == "silence":
+                    m.action = "replace_source" if (m.source_index is not None and self.source_lib) else "passthrough"
+                    m.match_reason = "Reactivada por el usuario"
+
+        if b.event_role == "EngineInt":
+            orig_sig = (b.load_role, int(round(b.orig_rpm_min)), int(round(b.orig_rpm_max)))
+            for other in self.rpm_bands:
+                if other.event_role == "AuxInt" and (other.load_role, int(round(other.orig_rpm_min)), int(round(other.orig_rpm_max))) == orig_sig:
+                    other.is_muted_bus = False
+                    other.rpm_min = b.rpm_min
+                    other.fade_in_end = b.fade_in_end
+                    other.fade_out_start = b.fade_out_start
+                    other.rpm_max = b.rpm_max
+                    for gidx in other.donor_slot_indices:
+                        if 0 <= gidx < len(self.mappings):
+                            self.mappings[gidx].action = "replace_source" if (self.mappings[gidx].source_index is not None and self.source_lib) else "passthrough"
+                            self.mappings[gidx].match_reason = "Reactivada por el usuario"
+
+        self._refresh_donor_tree()
+        self._refresh_rpm_tab()
+        self._on_rpm_band_selected()
+        self.status_var.set(f"✔ Banda #{idx:02d} reactivada y desmuteada con éxito.")
+
+    def cmd_overwrite_selected_band_sample(self) -> None:
+        """Sobreescribe directamente la muestra asignada a la banda seleccionada con la muestra elegida de AC o WAV."""
+        bank = self.active_engine_bank
+        if not bank or not self.rpm_bands or self._selected_band_idx is None:
+            messagebox.showinfo("Seleccionar banda", "Selecciona primero una banda en la tabla o en el gráfico para sobreescribir su muestra.")
+            return
+
+        idx = self._selected_band_idx
+        if not (0 <= idx < len(self.rpm_bands)):
+            return
+        b = self.rpm_bands[idx]
+
+        val = self.band_source_var.get().strip()
+        c_wav = self.band_custom_wav_var.get().strip()
+        c_wav_p = Path(c_wav) if (c_wav and Path(c_wav).is_file()) else None
+
+        src_idx: int | None = None
+        sample_name = ""
+
+        if c_wav_p:
+            sample_name = c_wav_p.name
+        elif val.startswith("[") and self.source_lib:
+            try:
+                src_idx = int(val[1:3])
+                sample_name = self.source_lib.items[src_idx].name
+            except Exception:
+                pass
+
+        if not sample_name:
+            messagebox.showwarning(
+                "Seleccionar muestra",
+                "Elige una muestra de Assetto Corsa en la lista desplegable o selecciona un archivo WAV externo.",
+            )
+            return
+
+        b.is_muted_bus = False
+        src_item = self.source_lib.items[src_idx] if (src_idx is not None and self.source_lib and 0 <= src_idx < len(self.source_lib.items)) else None
+
+        if b.rpm_max <= b.rpm_min + 40.0:
+            if src_item and src_item.effective_rpm and src_item.effective_rpm > 100.0:
+                er = float(src_item.effective_rpm)
+                b.rpm_min = max(0.0, er - 800.0)
+                b.fade_in_end = max(0.0, er - 300.0)
+                b.fade_out_start = er + 300.0
+                b.rpm_max = er + 800.0
+            else:
+                b.rpm_min = b.orig_rpm_min if b.orig_rpm_min > 0 else 2500.0
+                b.fade_in_end = b.orig_fade_in_end if b.orig_fade_in_end > 0 else 3000.0
+                b.fade_out_start = b.orig_fade_out_start if b.orig_fade_out_start > 0 else 5500.0
+                b.rpm_max = b.orig_rpm_max if b.orig_rpm_max > 0 else 6000.0
+            self.band_rmin_var.set(f"{b.rpm_min:.0f}")
+            self.band_fi_var.set(f"{b.fade_in_end:.0f}")
+            self.band_fo_var.set(f"{b.fade_out_start:.0f}")
+            self.band_rmax_var.set(f"{b.rpm_max:.0f}")
+
+        if src_item and src_item.load_role in ("on", "off", "idle", "pops"):
+            b.load_role = src_item.load_role
+
+        try:
+            curr_gain = float(self.band_gain_var.get().strip() or "0.0")
+        except ValueError:
+            curr_gain = 0.0
+
+        root_val: float | None = None
+        if src_item and src_item.effective_rpm and src_item.effective_rpm > 100.0:
+            root_val = float(src_item.effective_rpm)
+            self.band_root_rpm_var.set(f"{root_val:.0f}")
+        else:
+            root_txt = self.band_root_rpm_var.get().strip()
+            if root_txt:
+                try:
+                    root_val = float(root_txt)
+                except ValueError:
+                    pass
+
+        b.donor_label = f"AC: {sample_name}"
+
+        for gidx in b.donor_slot_indices:
+            while len(self.mappings) <= gidx:
+                self.mappings.append(SlotMappingConfig(len(self.mappings)))
+            m = self.mappings[gidx]
+            if c_wav_p:
+                m.action = "replace_wav"
+                m.custom_wav_path = c_wav_p
+                m.match_reason = f"Sobreescrito por WAV: {sample_name}"
+            elif src_idx is not None:
+                m.action = "replace_source"
+                m.source_index = src_idx
+                m.match_reason = f"Sobreescrito por usuario: {sample_name}"
+            m.gain_db = curr_gain
+            m.override_root_rpm = root_val
+
+        # Sincronizar capa gemela AuxInt si aplica
+        if b.event_role == "EngineInt":
+            orig_sig = (b.load_role, int(round(b.orig_rpm_min)), int(round(b.orig_rpm_max)))
+            for other in self.rpm_bands:
+                if other.event_role == "AuxInt" and (other.load_role, int(round(other.orig_rpm_min)), int(round(other.orig_rpm_max))) == orig_sig:
+                    other.is_muted_bus = False
+                    other.rpm_min = b.rpm_min
+                    other.fade_in_end = b.fade_in_end
+                    other.fade_out_start = b.fade_out_start
+                    other.rpm_max = b.rpm_max
+                    other.load_role = b.load_role
+                    for gidx in other.donor_slot_indices:
+                        if 0 <= gidx < len(self.mappings):
+                            self.mappings[gidx].action = "replace_wav" if c_wav_p else "replace_source"
+                            self.mappings[gidx].source_index = src_idx
+                            self.mappings[gidx].custom_wav_path = c_wav_p
+                            self.mappings[gidx].gain_db = curr_gain
+                            self.mappings[gidx].override_root_rpm = root_val
+
+        self._refresh_donor_tree()
+        self._refresh_rpm_tab()
+        self._on_rpm_band_selected()
+        self.status_var.set(f"✔ Banda #{idx:02d} sobreescrita exitosamente con '{sample_name}'.")
 
     def cmd_add_rpm_band(self) -> None:
-        """Abre un diálogo interactivo para añadir una nueva banda al sonido (INT o EXT) desde Assetto Corsa."""
+        """Abre un diálogo interactivo para añadir/reasignar una banda al sonido (INT o EXT) desde Assetto Corsa."""
         bank = self.active_engine_bank
         if not bank or not self.rpm_bands:
             messagebox.showinfo("Cargar banco de audio", "Carga primero un banco .bank de AC o donante de AMS2.")
@@ -2236,7 +2743,7 @@ class SoundPorterApp(tk.Tk):
         # Crear diálogo modal
         dlg = tk.Toplevel(self)
         dlg.title(f"Añadir Banda de Sonido ({'Interior' if persp == 'int' else 'Exterior'}) desde AC")
-        dlg.geometry("580x480")
+        dlg.geometry("590x510")
         dlg.configure(bg=BG_DARK)
         dlg.transient(self)
         dlg.grab_set()
@@ -2248,7 +2755,16 @@ class SoundPorterApp(tk.Tk):
             card,
             text=f"➕ Añadir Banda de RPM a la vista {'INTERIOR (Cabina)' if persp == 'int' else 'EXTERIOR'}:",
             style="CardSection.TLabel",
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(anchor="w", pady=(0, 6))
+
+        # Detectar si hay pistas físicas libres (silenciadas) o si se reutilizará una existente
+        free_b = next((b for b in self.rpm_bands if b.perspective == persp and (b.is_muted_bus or self._band_is_silenced(b))), None)
+        if free_b:
+            free_idx = self.rpm_bands.index(free_b)
+            info_txt = f"ℹ Se reutilizará la pista física libre #{free_idx:02d} [{free_b.load_role.upper()}] para que el motor en AMS2 la reproduzca sin zonas mudas."
+        else:
+            info_txt = "ℹ Todas las pistas están activas. Se reasignará la banda más cercana o seleccionada manteniendo la estructura FMOD intacta."
+        ttk.Label(card, text=info_txt, style="CardMuted.TLabel", wraplength=530).pack(anchor="w", pady=(0, 10))
 
         # 1. Selector de muestra de Assetto Corsa
         ttk.Label(card, text="Muestra de origen (Assetto Corsa / WAV):", style="Card.TLabel").pack(anchor="w")
@@ -2401,73 +2917,89 @@ class SoundPorterApp(tk.Tk):
                     src_idx = int(val[1:3])
                     sample_name = self.source_lib.items[src_idx].name
 
-            # Asignar a un slot del banco de la misma perspectiva (preferentemente silenciado o mudo)
-            assigned_gidx: int | None = None
-            for gidx, sl in enumerate(bank.slots):
-                if sl.perspective == persp:
-                    cfg = self.mappings[gidx] if 0 <= gidx < len(self.mappings) else None
-                    if cfg and cfg.action == "silence":
-                        assigned_gidx = gidx
+            # Asignación segura a una pista física del donante existente para evitar bandas mudas
+            target_band: RpmBandConfig | None = None
+
+            # 1. Buscar si hay una banda silenciada/eliminada en esta perspectiva
+            for b_cand in self.rpm_bands:
+                if b_cand.perspective == persp and (b_cand.is_muted_bus or self._band_is_silenced(b_cand)):
+                    target_band = b_cand
+                    break
+
+            # 2. Si no hay silenciadas, buscar una capa de fill secundario
+            if target_band is None:
+                for b_cand in self.rpm_bands:
+                    if b_cand.perspective == persp and b_cand.is_fill_layer:
+                        target_band = b_cand
                         break
-            if assigned_gidx is None:
-                # Tomar cualquier slot libre o el primero de la perspectiva
-                for gidx, sl in enumerate(bank.slots):
-                    if sl.perspective == persp:
-                        assigned_gidx = gidx
-                        break
-            if assigned_gidx is None:
-                assigned_gidx = 0
 
-            # Configurar el mapeo del slot
-            while len(self.mappings) <= assigned_gidx:
-                self.mappings.append(SlotMappingConfig(len(self.mappings)))
-            m = self.mappings[assigned_gidx]
-            if c_wav_p:
-                m.action = "replace_wav"
-                m.custom_wav_path = c_wav_p
-                m.match_reason = f"Banda añadida: {c_wav_p.name}"
-            elif src_idx is not None:
-                m.action = "replace_source"
-                m.source_index = src_idx
-                m.match_reason = f"Banda añadida: AC [{src_idx:02d}]"
-            m.gain_db = gain_val
-            m.override_root_rpm = root_val
+            # 3. Si no hay libre ni fill, usar la banda seleccionada o la más cercana
+            if target_band is None:
+                if self._selected_band_idx is not None and 0 <= self._selected_band_idx < len(self.rpm_bands):
+                    sel_b = self.rpm_bands[self._selected_band_idx]
+                    if sel_b.perspective == persp:
+                        target_band = sel_b
 
-            # Crear RpmBandConfig
-            new_band_id = f"custom_band_{persp}_{len(self.rpm_bands):02d}"
-            base_pml = bank.rpm_bands[0].pml_guid if bank.rpm_bands else b"custom_pml______"
-            base_ev = bank.rpm_bands[0].event_guid if bank.rpm_bands else b"custom_event____"
+            if target_band is None:
+                candidates = [b_cand for b_cand in self.rpm_bands if b_cand.perspective == persp]
+                if candidates:
+                    candidates.sort(key=lambda b_cand: abs(0.5 * (b_cand.rpm_min + b_cand.rpm_max) - 0.5 * (rmin + rmax)))
+                    target_band = candidates[0]
 
-            new_band = RpmBandConfig(
-                band_id=new_band_id,
-                pml_guid=base_pml,
-                event_guid=base_ev,
-                box_index=len(self.rpm_bands),
-                event_role=target_ev_role,
-                perspective=persp,
-                load_role=add_role_var.get(),
-                donor_slot_indices=[assigned_gidx],
-                donor_label=f"AC: {sample_name}",
-                rpm_min=rmin,
-                rpm_max=rmax,
-                fade_in_end=fi,
-                fade_out_start=fo,
-                orig_rpm_min=rmin,
-                orig_rpm_max=rmax,
-                orig_fade_in_end=fi,
-                orig_fade_out_start=fo,
-                is_muted_bus=False,
-                is_fill_layer=False,
-            )
-            self.rpm_bands.append(new_band)
+            if target_band is None:
+                messagebox.showerror("Error", "No se encontró ninguna pista física de audio disponible en esta perspectiva.")
+                return
+
+            target_band.is_muted_bus = False
+            target_band.rpm_min = rmin
+            target_band.fade_in_end = fi
+            target_band.fade_out_start = fo
+            target_band.rpm_max = rmax
+            target_band.load_role = add_role_var.get()
+            target_band.donor_label = f"AC: {sample_name}"
+
+            for gidx in target_band.donor_slot_indices:
+                while len(self.mappings) <= gidx:
+                    self.mappings.append(SlotMappingConfig(len(self.mappings)))
+                m = self.mappings[gidx]
+                if c_wav_p:
+                    m.action = "replace_wav"
+                    m.custom_wav_path = c_wav_p
+                    m.match_reason = f"Banda reasignada: {c_wav_p.name}"
+                elif src_idx is not None:
+                    m.action = "replace_source"
+                    m.source_index = src_idx
+                    m.match_reason = f"Banda reasignada: AC [{src_idx:02d}]"
+                m.gain_db = gain_val
+                m.override_root_rpm = root_val
+
+            # Sincronizar capa gemela AuxInt si aplica
+            if target_band.event_role == "EngineInt":
+                orig_sig = (target_band.load_role, int(round(target_band.orig_rpm_min)), int(round(target_band.orig_rpm_max)))
+                for other in self.rpm_bands:
+                    if other.event_role == "AuxInt" and (other.load_role, int(round(other.orig_rpm_min)), int(round(other.orig_rpm_max))) == orig_sig:
+                        other.is_muted_bus = False
+                        other.rpm_min = rmin
+                        other.fade_in_end = fi
+                        other.fade_out_start = fo
+                        other.rpm_max = rmax
+                        other.load_role = target_band.load_role
+                        for gidx in other.donor_slot_indices:
+                            if 0 <= gidx < len(self.mappings):
+                                self.mappings[gidx].action = "replace_wav" if c_wav_p else "replace_source"
+                                self.mappings[gidx].source_index = src_idx
+                                self.mappings[gidx].custom_wav_path = c_wav_p
+                                self.mappings[gidx].gain_db = gain_val
+                                self.mappings[gidx].override_root_rpm = root_val
 
             dlg.destroy()
-            self._selected_band_idx = len(self.rpm_bands) - 1
+            target_idx = self.rpm_bands.index(target_band)
+            self._selected_band_idx = target_idx
             self._refresh_donor_tree()
             self._refresh_rpm_tab()
             self._on_rpm_band_selected()
             self.status_var.set(
-                f"✔ Banda #{self._selected_band_idx:02d} añadida exitosamente desde AC a la vista {persp.upper()}."
+                f"✔ Banda #{target_idx:02d} [{target_band.load_role.upper()}] asignada exitosamente con '{sample_name}' ({rmin:.0f} - {rmax:.0f} RPM)."
             )
 
         ttk.Button(act_bar, text="✔ Añadir Banda al Motor", style="Primary.TButton", command=_do_confirm_add).pack(side="right")
@@ -2641,6 +3173,14 @@ class SoundPorterApp(tk.Tk):
                 ),
             )
 
+        combo_vals: list[str] = []
+        if self.source_lib and self.source_lib.items:
+            for it in self.source_lib.items:
+                if it.decodable:
+                    er_txt = f"{it.effective_rpm:.0f} RPM" if it.effective_rpm else "s/RPM"
+                    combo_vals.append(f"[{it.index:02d}] {it.name} ({it.perspective.upper()}/{it.load_role.upper()}, {er_txt})")
+        self.band_source_combo["values"] = combo_vals
+
         if self._selected_band_idx is not None and self.rpm_tree.exists(str(self._selected_band_idx)):
             self.rpm_tree.selection_set(str(self._selected_band_idx))
         else:
@@ -2654,6 +3194,9 @@ class SoundPorterApp(tk.Tk):
             self.band_rmax_var.set("")
             self.band_root_rpm_var.set("")
             self.band_gain_var.set("0.0")
+            self.band_source_var.set("")
+            self.band_custom_wav_var.set("")
+            self.btn_reactivate_band.config(state="disabled")
 
         self._draw_rpm_bands_canvas()
 
@@ -2792,9 +3335,53 @@ class SoundPorterApp(tk.Tk):
         self._selected_band_idx = idx
         b = self.rpm_bands[idx]
         sample_lbl, _ = self._band_sample_summary(b)
-        self.selected_band_lbl.config(
-            text=f"Banda #{idx:02d} [{b.event_role} / {b.load_role.upper()}] — {sample_lbl}"
-        )
+        silenced = self._band_is_silenced(b)
+
+        # Actualizar valores del combo de muestras de AC si hay librería disponible
+        combo_vals: list[str] = []
+        if self.source_lib and self.source_lib.items:
+            for it in self.source_lib.items:
+                if it.decodable:
+                    er_txt = f"{it.effective_rpm:.0f} RPM" if it.effective_rpm else "s/RPM"
+                    combo_vals.append(f"[{it.index:02d}] {it.name} ({it.perspective.upper()}/{it.load_role.upper()}, {er_txt})")
+        self.band_source_combo["values"] = combo_vals
+
+        # Detectar qué muestra tiene actualmente asignada
+        current_sample_val = ""
+        if b.donor_slot_indices and bank:
+            g0 = b.donor_slot_indices[0]
+            if 0 <= g0 < len(self.mappings):
+                cfg0 = self.mappings[g0]
+                if cfg0.action == "replace_source" and cfg0.source_index is not None:
+                    s_idx = cfg0.source_index
+                    for cv in combo_vals:
+                        if cv.startswith(f"[{s_idx:02d}]"):
+                            current_sample_val = cv
+                            break
+                    if not current_sample_val and self.source_lib and 0 <= s_idx < len(self.source_lib.items):
+                        current_sample_val = f"[{s_idx:02d}] {self.source_lib.items[s_idx].name}"
+                elif cfg0.action == "replace_wav" and cfg0.custom_wav_path:
+                    current_sample_val = f"WAV: {cfg0.custom_wav_path.name}"
+                elif cfg0.action == "silence":
+                    current_sample_val = f"[Silenciada / Sin Muestra] ({bank.slots[g0].name})"
+                else:
+                    current_sample_val = f"Donante: {bank.slots[g0].name}"
+        if current_sample_val:
+            self.band_source_var.set(current_sample_val)
+        elif combo_vals:
+            self.band_source_var.set(combo_vals[0])
+
+        if silenced or b.is_muted_bus:
+            self.btn_reactivate_band.config(state="normal")
+            self.selected_band_lbl.config(
+                text=f"Banda #{idx:02d} [{b.event_role} / {b.load_role.upper()}] — [SILENCIADA / LIBRE] — Pulsa 'Sobreescribir Muestra' o 'Reactivar'"
+            )
+        else:
+            self.btn_reactivate_band.config(state="disabled")
+            self.selected_band_lbl.config(
+                text=f"Banda #{idx:02d} [{b.event_role} / {b.load_role.upper()}] — {sample_lbl}"
+            )
+
         self.band_rmin_var.set(f"{b.rpm_min:.0f}")
         self.band_fi_var.set(f"{b.fade_in_end:.0f}")
         self.band_fo_var.set(f"{b.fade_out_start:.0f}")
@@ -2874,6 +3461,33 @@ class SoundPorterApp(tk.Tk):
                 self.mappings[gidx].override_root_rpm = new_root
                 self.mappings[gidx].gain_db = new_gain
 
+        # Si se seleccionó una muestra en el combo de la banda y difiere de la actual, aplicarla también
+        val_src = self.band_source_var.get().strip()
+        c_wav = self.band_custom_wav_var.get().strip()
+        c_wav_p = Path(c_wav) if (c_wav and Path(c_wav).is_file()) else None
+        if c_wav_p:
+            b.is_muted_bus = False
+            b.donor_label = f"WAV: {c_wav_p.name}"
+            for gidx in b.donor_slot_indices:
+                if 0 <= gidx < len(self.mappings):
+                    self.mappings[gidx].action = "replace_wav"
+                    self.mappings[gidx].custom_wav_path = c_wav_p
+                    self.mappings[gidx].match_reason = f"Sobreescrito por WAV: {c_wav_p.name}"
+        elif val_src.startswith("[") and self.source_lib:
+            try:
+                s_idx = int(val_src[1:3])
+                if 0 <= s_idx < len(self.source_lib.items):
+                    src_it = self.source_lib.items[s_idx]
+                    b.is_muted_bus = False
+                    b.donor_label = f"AC: {src_it.name}"
+                    for gidx in b.donor_slot_indices:
+                        if 0 <= gidx < len(self.mappings):
+                            self.mappings[gidx].action = "replace_source"
+                            self.mappings[gidx].source_index = s_idx
+                            self.mappings[gidx].match_reason = f"Sobreescrito por usuario: {src_it.name}"
+            except Exception:
+                pass
+
         self._refresh_donor_tree()
         self._refresh_rpm_tab()
         self.status_var.set(
@@ -2930,10 +3544,10 @@ class SoundPorterApp(tk.Tk):
                     max_rpm=max_v,
                     sample_rate=44100,
                 )
-                self.after(0, lambda: self._on_simulation_ready(persp_lbl, wav_bytes, traj))
+                self.dispatch_to_ui(self._on_simulation_ready, persp_lbl, wav_bytes, traj)
             except Exception as exc:
                 err_s = str(exc)
-                self.after(0, lambda: self._on_simulation_error(err_s))
+                self.dispatch_to_ui(self._on_simulation_error, err_s)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3246,7 +3860,369 @@ class SoundPorterApp(tk.Tk):
             messagebox.showerror("Error al exportar .csd", str(exc))
 
     # ========================================================================
-    # Acciones de Pestaña 4 (Compilación en segundo plano y Exportación)
+    # Acciones y Lógica de Vehículos Vanilla / Base de Automobilista 2
+    # ========================================================================
+    def _on_target_mode_changed(self) -> None:
+        mode = self.target_mode_var.get()
+        if mode == "vanilla":
+            if hasattr(self, "mod_view_frame"):
+                self.mod_view_frame.pack_forget()
+            if hasattr(self, "vanilla_view_frame"):
+                self.vanilla_view_frame.pack(fill="both", expand=True)
+            if hasattr(self, "mod_cfg_card") and hasattr(self, "vanilla_cfg_card"):
+                self.mod_cfg_card.pack_forget()
+                self.vanilla_cfg_card.pack(fill="x", pady=(0, 12), before=self.opts_card)
+            if hasattr(self, "btn_export"):
+                veh_name = (
+                    self.vanilla_selected_vehicle.display_name
+                    if self.vanilla_selected_vehicle
+                    else "Vehículo Vanilla"
+                )
+                if self.is_direct_ac_mode:
+                    btn_text = f"⚡ INYECTAR DIRECTO 1:1 EN '{veh_name.upper()}' (SIN DONANTE - 100% FIEL)"
+                else:
+                    btn_text = f"🎯 INYECTAR MAPEO EN '{veh_name.upper()}' (MODO DONANTE)"
+                self.btn_export.config(text=btn_text)
+        else:
+            if hasattr(self, "vanilla_view_frame"):
+                self.vanilla_view_frame.pack_forget()
+            if hasattr(self, "mod_view_frame"):
+                self.mod_view_frame.pack(fill="both", expand=True)
+            if hasattr(self, "mod_cfg_card") and hasattr(self, "vanilla_cfg_card"):
+                self.vanilla_cfg_card.pack_forget()
+                self.mod_cfg_card.pack(fill="x", pady=(0, 12), before=self.opts_card)
+            if hasattr(self, "btn_export"):
+                self.btn_export.config(text="🚀  COMPILAR Y EXPORTAR PAQUETE DE SONIDO PARA AUTOMOBILISTA 2")
+
+    def _populate_vanilla_vehicles_list(self, select_id: str | None = None) -> None:
+        if not hasattr(self, "vanilla_mgr"):
+            return
+        vehicles = self.vanilla_mgr.scan_catalog()
+        self.vanilla_filtered_vehicles = list(vehicles)
+        self._filter_vanilla_vehicles(select_id=select_id)
+
+    def _filter_vanilla_vehicles(self, select_id: str | None = None) -> None:
+        if not hasattr(self, "vanilla_mgr"):
+            return
+        query = self.vanilla_search_var.get().strip().lower()
+        all_vehs = self.vanilla_mgr.scan_catalog()
+        if query:
+            filtered = [
+                v
+                for v in all_vehs
+                if query in v.display_name.lower()
+                or query in v.brand.lower()
+                or query in v.car_name.lower()
+            ]
+        else:
+            filtered = list(all_vehs)
+
+        self.vanilla_filtered_vehicles = filtered
+        combo_vals: list[str] = []
+        for v in filtered:
+            status_tag = "🟠 [Modificado]" if v.is_modified else "🟢 [Original]"
+            combo_vals.append(f"{status_tag} {v.display_name}")
+
+        if hasattr(self, "vanilla_combo"):
+            self.vanilla_combo["values"] = combo_vals
+            if select_id:
+                for idx, v in enumerate(filtered):
+                    if v.vehicle_id == select_id:
+                        self.vanilla_combo.current(idx)
+                        self._on_vanilla_vehicle_selected()
+                        return
+            if combo_vals:
+                current_selected = self.vanilla_selected_vehicle
+                if current_selected and any(v.vehicle_id == current_selected.vehicle_id for v in filtered):
+                    idx = next(i for i, v in enumerate(filtered) if v.vehicle_id == current_selected.vehicle_id)
+                    self.vanilla_combo.current(idx)
+                else:
+                    self.vanilla_combo.current(0)
+                self._on_vanilla_vehicle_selected()
+            else:
+                self.vanilla_selected_vehicle = None
+                self._clear_vanilla_details()
+
+    def _clear_vanilla_details(self) -> None:
+        if hasattr(self, "vanilla_det_name_var"):
+            self.vanilla_det_name_var.set("—")
+            self.vanilla_det_brand_var.set("—")
+            self.vanilla_det_path_var.set("—")
+            self.vanilla_det_ai_var.set("—")
+            self.vanilla_det_events_var.set("—")
+            self.vanilla_det_integrity_var.set("—")
+            self.vanilla_det_sha_var.set("—")
+            self.vanilla_export_dest_var.set("Ningún vehículo vanilla coincide con la búsqueda.")
+
+    def _on_vanilla_vehicle_selected(self, _event=None) -> None:
+        if not hasattr(self, "vanilla_combo"):
+            return
+        idx = self.vanilla_combo.current()
+        if idx < 0 or idx >= len(self.vanilla_filtered_vehicles):
+            return
+        v = self.vanilla_filtered_vehicles[idx]
+        self.vanilla_selected_vehicle = v
+        self.vanilla_mgr.load_vehicle_events_info(v)
+
+        if hasattr(self, "vanilla_det_name_var"):
+            self.vanilla_det_name_var.set(v.display_name)
+            self.vanilla_det_brand_var.set(f"{v.brand} ({v.car_name})")
+            size_mb = v.bank_path.stat().st_size / (1024 * 1024) if v.bank_path.is_file() else 0.0
+            self.vanilla_det_path_var.set(f"{v.bank_path}  ({size_mb:.2f} MB, {v.slots_count} slots)")
+            self.vanilla_det_ai_var.set(str(v.ai_bank_path) if v.ai_bank_path else "Sin banco AI separado")
+
+            ev_list = []
+            for r in v.event_roles:
+                g_short = v.event_guids.get(r, "")[:8]
+                ev_list.append(f"{r} [{g_short}...]")
+            self.vanilla_det_events_var.set(", ".join(ev_list) if ev_list else "Eventos nativos estándar")
+
+            if v.is_modified:
+                self.vanilla_det_integrity_var.set(
+                    "🟠 MODIFICADO: Utilizando sonido porteado (Copia de fábrica protegida)"
+                )
+            else:
+                self.vanilla_det_integrity_var.set("🟢 ORIGINAL DE STEAM: Archivo de fábrica intacto")
+
+            if v.original_sha256:
+                self.vanilla_det_sha_var.set(
+                    f"Original: {v.original_sha256} (Registrado: {v.backup_timestamp or 'N/A'})"
+                )
+            else:
+                self.vanilla_det_sha_var.set(
+                    "Archivo original de fábrica de Steam (se respaldará automáticamente al inyectar)"
+                )
+
+            self.vanilla_export_dest_var.set(f"{v.display_name} -> {v.relative_audio_path}")
+            if hasattr(self, "btn_export") and self.target_mode_var.get() == "vanilla":
+                if self.is_direct_ac_mode:
+                    btn_text = f"⚡ INYECTAR DIRECTO 1:1 EN '{v.display_name.upper()}' (SIN DONANTE - 100% FIEL)"
+                else:
+                    btn_text = f"🎯 INYECTAR MAPEO EN '{v.display_name.upper()}' (MODO DONANTE)"
+                self.btn_export.config(text=btn_text)
+
+    def cmd_browse_ams2_path(self) -> None:
+        d = filedialog.askdirectory(title="Seleccionar carpeta de instalación de Automobilista 2")
+        if d:
+            p = Path(d)
+            if (p / "Audio" / "AMS2" / "Vehicles" / "Sort").is_dir():
+                self.vanilla_mgr.ams2_root = p
+                self.vanilla_ams2_path_var.set(str(p))
+                self.cmd_rescan_vanilla_catalog()
+            else:
+                messagebox.showerror(
+                    "Directorio Inválido",
+                    "La carpeta seleccionada no parece contener una instalación válida de AMS2.\n\n"
+                    "No se encontró la subcarpeta obligatoria 'Audio/AMS2/Vehicles/Sort'.",
+                )
+
+    def cmd_rescan_vanilla_catalog(self) -> None:
+        self.vanilla_mgr.scan_catalog(force=True)
+        self._populate_vanilla_vehicles_list()
+        self.status_var.set(
+            f"✔ Catálogo re-escaneado: {len(self.vanilla_mgr._vehicles_cache)} vehículos vanilla disponibles."
+        )
+
+    def cmd_set_vanilla_direct_mode(self) -> None:
+        v = self.vanilla_selected_vehicle
+        if not v or not v.bank_path.is_file():
+            messagebox.showwarning("Sin Selección", "Por favor selecciona primero un vehículo oficial de la lista.")
+            return
+
+        self.port_mode_var.set("direct")
+        self.target_mode_var.set("vanilla")
+        self.vanilla_mgr.load_vehicle_events_info(v)
+        self._on_port_mode_changed()
+
+        if self.source_lib and self.source_lib.fmod_bank:
+            self.status_var.set(
+                f"⚡ Modo Porteo Directo 1:1 activo para '{v.display_name}'. "
+                f"Sonido de Assetto Corsa 100% puro sin donante listo para inyectar en Paso 5."
+            )
+            self.notebook.select(self.tab_export)
+        else:
+            self.status_var.set(
+                f"⚡ '{v.display_name}' configurado para Porteo Directo 1:1. "
+                f"Carga el archivo .bank de Assetto Corsa en el Paso 1 para transmutarlo."
+            )
+            self.notebook.select(self.tab_source)
+
+    def cmd_load_vanilla_as_donor(self) -> None:
+        v = self.vanilla_selected_vehicle
+        if not v or not v.bank_path.is_file():
+            messagebox.showwarning("Sin Selección", "Por favor selecciona un vehículo vanilla de la lista.")
+            return
+        self._load_donor_bank_file(v.bank_path)
+        self.notebook.select(self.tab_donor)
+        self.status_var.set(f"✔ Banco vanilla de '{v.display_name}' cargado como donante en Paso 2.")
+
+    def cmd_select_and_load_vanilla_donor(self) -> None:
+        if self.vanilla_selected_vehicle:
+            self.cmd_load_vanilla_as_donor()
+        else:
+            self.notebook.select(self.tab_csdbin)
+            self.target_mode_var.set("vanilla")
+            self._on_target_mode_changed()
+
+    def cmd_restore_selected_vanilla(self) -> None:
+        v = self.vanilla_selected_vehicle
+        if not v:
+            messagebox.showwarning("Sin Selección", "Selecciona un vehículo vanilla de la lista.")
+            return
+        if not v.is_modified and not v.has_backup and not (v.bank_path.parent / f"{v.bank_path.name}.orig").is_file():
+            messagebox.showinfo("Vehículo Ya Original", f"'{v.display_name}' ya está en su estado 100% original de Steam.")
+            return
+
+        ans = messagebox.askyesno(
+            "Restaurar Vehículo a Original de Steam",
+            f"¿Deseas restaurar '{v.display_name}' a sus sonidos originales de fábrica de Steam?\n\n"
+            f"• Archivo: {v.bank_path}\n"
+            f"• Comprobación: Hash SHA256 idéntico al original\n\n"
+            f"La restauración es instantánea y no requiere comprobación en Steam.",
+        )
+        if not ans:
+            return
+
+        ok, msg = self.vanilla_mgr.restore_vehicle(v)
+        if ok:
+            self._populate_vanilla_vehicles_list(select_id=v.vehicle_id)
+            self.status_var.set(f"✔ '{v.display_name}' restaurado con éxito a original.")
+            messagebox.showinfo("Restauración Exitosa", msg)
+        else:
+            messagebox.showerror("Error al Restaurar", msg)
+
+    def cmd_restore_all_vanilla(self) -> None:
+        modded = self.vanilla_mgr.get_modified_vehicles()
+        if not modded:
+            messagebox.showinfo(
+                "Todos los Vehículos Originales",
+                "Todos los vehículos oficiales de Automobilista 2 ya están en su estado 100% original de Steam.",
+            )
+            return
+
+        ans = messagebox.askyesno(
+            "Restaurar TODOS los Vehículos Vanilla",
+            f"Se han detectado {len(modded)} vehículo(s) vanilla con sonidos modificados:\n\n"
+            + "\n".join(f"• {v.display_name}" for v in modded[:10])
+            + (f"\n... y {len(modded)-10} más." if len(modded) > 10 else "")
+            + "\n\n¿Deseas restaurar TODOS los vehículos al estado original de Steam ahora?",
+        )
+        if not ans:
+            return
+
+        s_cnt, f_cnt, msgs = self.vanilla_mgr.restore_all()
+        self._populate_vanilla_vehicles_list()
+        res_summary = f"Restauración masiva completada:\n• {s_cnt} vehículo(s) restaurados con éxito al 100% de Steam.\n"
+        if f_cnt > 0:
+            res_summary += f"• {f_cnt} error(es).\n"
+        res_summary += "\n" + "\n".join(msgs[:15])
+        messagebox.showinfo("Restauración Masiva Finalizada", res_summary)
+
+    def cmd_open_vanilla_restore_dialog(self) -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title("Gestor de Restauración de Sonidos Vanilla — Automobilista 2")
+        dlg.geometry("860x520")
+        dlg.minsize(700, 420)
+        dlg.configure(bg=BG_DARK)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        top_f = ttk.Frame(dlg, style="Panel.TFrame", padding=14)
+        top_f.pack(fill="x")
+        ttk.Label(
+            top_f,
+            text="🛡️  Restauración Garantizada de Vehículos Vanilla de Steam",
+            style="HeaderTitle.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            top_f,
+            text="Restaura cualquier vehículo base modificado a sus archivos originales de Steam con un solo clic, sin reparar en Steam.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        mid_f = ttk.Frame(dlg, style="Panel.TFrame", padding=14)
+        mid_f.pack(fill="both", expand=True)
+
+        cols = ("veh", "path", "date", "sha")
+        tree = ttk.Treeview(mid_f, columns=cols, show="headings", selectmode="browse")
+        tree.heading("veh", text="Vehículo Oficial")
+        tree.heading("path", text="Archivo en Juego")
+        tree.heading("date", text="Fecha Respaldo")
+        tree.heading("sha", text="SHA256 Original")
+        tree.column("veh", width=240)
+        tree.column("path", width=280)
+        tree.column("date", width=150)
+        tree.column("sha", width=140)
+
+        vsb = ttk.Scrollbar(mid_f, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def refresh_tree() -> None:
+            for item in tree.get_children():
+                tree.delete(item)
+            mod_list = self.vanilla_mgr.get_modified_vehicles()
+            if not mod_list:
+                tree.insert("", "end", values=("(Ningún vehículo modificado — Todo original de fábrica)", "—", "—", "—"))
+                return
+            for v in mod_list:
+                sha_short = (v.original_sha256[:12] + "...") if v.original_sha256 else "Archivo .orig"
+                date_str = (v.backup_timestamp[:19].replace("T", " ")) if v.backup_timestamp else "Disponible"
+                tree.insert(
+                    "", "end", iid=v.vehicle_id, values=(v.display_name, v.bank_path.name, date_str, sha_short)
+                )
+
+        refresh_tree()
+
+        bot_f = ttk.Frame(dlg, style="Panel.TFrame", padding=14)
+        bot_f.pack(fill="x")
+
+        def do_restore_selected() -> None:
+            sel = tree.selection()
+            if not sel or sel[0].startswith("("):
+                messagebox.showwarning(
+                    "Sin Selección", "Selecciona un vehículo de la lista para restaurar.", parent=dlg
+                )
+                return
+            veh_id = sel[0]
+            veh = self.vanilla_mgr.get_vehicle_by_id(veh_id)
+            if veh:
+                ok, msg = self.vanilla_mgr.restore_vehicle(veh)
+                if ok:
+                    messagebox.showinfo("Restaurado", msg, parent=dlg)
+                    refresh_tree()
+                    self._populate_vanilla_vehicles_list()
+                else:
+                    messagebox.showerror("Error", msg, parent=dlg)
+
+        def do_restore_all() -> None:
+            mod_list = self.vanilla_mgr.get_modified_vehicles()
+            if not mod_list:
+                messagebox.showinfo("Sin Vehículos", "No hay ningún vehículo vanilla modificado.", parent=dlg)
+                return
+            if not messagebox.askyesno(
+                "Confirmar Restauración Total",
+                "¿Deseas restaurar TODOS los vehículos vanilla modificados a su estado original de Steam?",
+                parent=dlg,
+            ):
+                return
+            s_cnt, f_cnt, msgs = self.vanilla_mgr.restore_all()
+            refresh_tree()
+            self._populate_vanilla_vehicles_list()
+            messagebox.showinfo("Finalizado", f"Se restauraron {s_cnt} vehículo(s) con éxito.", parent=dlg)
+
+        ttk.Button(
+            bot_f,
+            text="🔄 Restaurar Seleccionado",
+            style="Primary.TButton",
+            command=do_restore_selected,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(bot_f, text="🛡️ Restaurar TODOS", command=do_restore_all).pack(side="left", padx=(0, 8))
+        ttk.Button(bot_f, text="Cerrar", command=dlg.destroy).pack(side="right")
+
+    # ========================================================================
+    # Acciones de Pestaña 5 (Compilación en segundo plano y Exportación / Inyección)
     # ========================================================================
     def cmd_pick_output_dir(self) -> None:
         d = filedialog.askdirectory(title="Seleccionar carpeta de salida para el Mod")
@@ -3254,6 +4230,10 @@ class SoundPorterApp(tk.Tk):
             self.out_dir_var.set(d)
 
     def cmd_run_export(self) -> None:
+        if self.target_mode_var.get() == "vanilla":
+            self._run_inject_vanilla()
+            return
+
         if self.is_direct_ac_mode:
             if not self.source_lib or not self.source_lib.fmod_bank:
                 messagebox.showwarning(
@@ -3293,12 +4273,13 @@ class SoundPorterApp(tk.Tk):
         codec_mode = FSB5_MODE_PCM16 if self.codec_choice_var.get() == "PCM16" else FSB5_MODE_FADPCM
         tcut_cfg = self._collect_throttle_cut_config()
         bands_to_export = list(self.rpm_bands) if self.rpm_bands else None
+        is_direct = self.is_direct_ac_mode
 
         self.btn_export.config(state="disabled")
         self.progress.start(12)
         mode_label = (
             "Transmutación Directa (Sin Donante - 100% Fiel AC)"
-            if self.is_direct_ac_mode
+            if is_direct
             else f"Mapeo Donante ({self.codec_choice_var.get()})"
         )
         self.status_var.set(f"⏳ Compilando banco FMOD ({mode_label}) y empaquetando .csdbin...")
@@ -3307,8 +4288,8 @@ class SoundPorterApp(tk.Tk):
 
         def worker() -> None:
             try:
-                direct_bank = self.source_lib.fmod_bank if self.is_direct_ac_mode else None
-                donor_bank = None if self.is_direct_ac_mode else self.donor_bank
+                direct_bank = self.source_lib.fmod_bank if is_direct else None
+                donor_bank = None if is_direct else self.donor_bank
                 summary = export_ams2_mod_package(
                     output_root=out_root,
                     mod_identifier=mod_id,
@@ -3326,10 +4307,10 @@ class SoundPorterApp(tk.Tk):
                     rpm_bands=bands_to_export,
                     throttle_cut=tcut_cfg,
                 )
-                self.after(0, lambda: self._on_export_success(summary))
+                self.dispatch_to_ui(self._on_export_success, summary)
             except Exception as exc:
                 err_msg = str(exc)
-                self.after(0, lambda: self._on_export_error(err_msg))
+                self.dispatch_to_ui(self._on_export_error, err_msg)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3381,6 +4362,135 @@ class SoundPorterApp(tk.Tk):
         self._append_log(f"❌ ERROR DE COMPILACIÓN: {err_msg}")
         self.status_var.set("❌ Error durante la compilación.")
         messagebox.showerror("Error durante la exportación", err_msg)
+
+    def _run_inject_vanilla(self) -> None:
+        veh = self.vanilla_selected_vehicle
+        if not veh:
+            messagebox.showwarning(
+                "Sin Vehículo Vanilla Seleccionado",
+                "Por favor selecciona un vehículo oficial / vanilla de la lista en el Paso 4 antes de inyectar.",
+            )
+            self.notebook.select(self.tab_csdbin)
+            return
+
+        if self.is_direct_ac_mode:
+            if not self.source_lib or not self.source_lib.fmod_bank:
+                messagebox.showwarning(
+                    "Falta Banco de Assetto Corsa",
+                    "Por favor carga un archivo .bank de Assetto Corsa en el Paso 1 antes de inyectar.",
+                )
+                self.notebook.select(self.tab_source)
+                return
+        else:
+            if not self.donor_bank:
+                ans = messagebox.askyesno(
+                    "Cargar Banco Donante Automáticamente",
+                    f"No has cargado ningún banco donante en el Paso 2.\n\n"
+                    f"¿Deseas cargar el banco original de '{veh.display_name}' como donante?",
+                )
+                if ans:
+                    self.cmd_load_vanilla_as_donor()
+                else:
+                    self.notebook.select(self.tab_donor)
+                return
+
+        ans_confirm = messagebox.askyesno(
+            "Confirmar Inyección en Vehículo Vanilla",
+            f"¿Deseas inyectar el nuevo sonido en el vehículo oficial:\n\n"
+            f"'{veh.display_name}'?\n\n"
+            f"• Archivo: {veh.bank_path}\n"
+            f"• Modo: {'Transmutación Directa AC (100% Fiel)' if self.is_direct_ac_mode else 'Mapeo sobre Donante'}\n\n"
+            f"🛡️ Se creará automáticamente un respaldo seguro (SHA256) antes de modificar nada.\n"
+            f"Podrás restaurar el sonido original de Steam en cualquier momento con un clic.",
+        )
+        if not ans_confirm:
+            return
+
+        self.btn_export.config(state="disabled")
+        self.progress.start(12)
+        mode_label = (
+            "Transmutación Directa (Sin Donante - 100% Fiel AC)"
+            if self.is_direct_ac_mode
+            else f"Mapeo Donante ({self.codec_choice_var.get()})"
+        )
+        self.status_var.set(f"⏳ Inyectando sonido porteado en '{veh.display_name}' con respaldo seguro...")
+        self._append_log("\n----------------------------------------------------------------------")
+        self._append_log(f"Iniciando inyección en vehículo vanilla '{veh.display_name}' [{mode_label}]...")
+
+        bands_to_export = list(self.rpm_bands) if self.rpm_bands else None
+        tcut_cfg = self._collect_throttle_cut_config()
+        sync_pitch = self.sync_pitch_var.get()
+        codec_mode = FSB5_MODE_PCM16 if self.codec_choice_var.get() == "PCM16" else FSB5_MODE_FADPCM
+        is_direct = self.is_direct_ac_mode
+        sync_ai = self.vanilla_sync_ai_var.get()
+
+        def worker() -> None:
+            try:
+                self.vanilla_mgr.load_vehicle_events_info(veh)
+
+                bank_bytes: bytes
+                if is_direct:
+                    assert self.source_lib and self.source_lib.fmod_bank
+                    direct_res = build_direct_ported_bank_from_ac(
+                        ac_bank=self.source_lib.fmod_bank,
+                        mod_identifier=veh.car_name,
+                        target_role_guids=veh.event_guids,
+                        target_role_paths=veh.event_paths,
+                        target_bank_guid=veh.bank_guid or None,
+                        rpm_bands=bands_to_export,
+                    )
+                    bank_bytes = direct_res.bank_bytes
+                else:
+                    assert self.donor_bank
+                    donor_res = build_ported_bank(
+                        donor=self.donor_bank,
+                        library=self.source_lib,
+                        mappings=self.mappings,
+                        mod_identifier=veh.car_name,
+                        standalone_guids=False,
+                        sync_autopitch=sync_pitch,
+                        output_codec_mode=codec_mode,
+                        rpm_bands=bands_to_export,
+                        throttle_cut=tcut_cfg,
+                    )
+                    bank_bytes = donor_res.bank_bytes
+
+                ai_bytes = bank_bytes if (sync_ai and veh.ai_bank_path) else None
+                ok, msg = self.vanilla_mgr.install_sound(
+                    vehicle=veh,
+                    bank_bytes=bank_bytes,
+                    ai_bank_bytes=ai_bytes,
+                )
+                if not ok:
+                    raise RuntimeError(msg)
+
+                self.dispatch_to_ui(self._on_inject_vanilla_success, veh, len(bank_bytes), msg)
+            except Exception as exc:
+                err_str = str(exc)
+                self.dispatch_to_ui(self._on_export_error, f"Fallo en inyección vanilla: {err_str}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_inject_vanilla_success(self, veh: VanillaVehicle, byte_count: int, msg: str) -> None:
+        self.progress.stop()
+        self.btn_export.config(state="normal")
+        self._append_log(f"✔ ¡Inyección exitosa en vehículo vanilla '{veh.display_name}'!")
+        self._append_log(f"  Ruta en juego: {veh.bank_path} ({byte_count / (1024*1024):.2f} MB)")
+        self._append_log(f"  Respaldo seguro original: {veh.original_sha256}")
+        self._append_log(f"  Estado de restauración: Listo para restaurar con 1 clic sin Steam.")
+        self.status_var.set(f"✅ ¡Sonido inyectado con éxito en '{veh.display_name}'!")
+
+        self._populate_vanilla_vehicles_list(select_id=veh.vehicle_id)
+        messagebox.showinfo(
+            "¡Sonido Inyectado con Éxito en Vehículo Oficial!",
+            f"El nuevo sonido ha sido instalado y activado en '{veh.display_name}'.\n\n"
+            f"• Archivo: {veh.bank_path.name}\n"
+            f"• Tamaño: {byte_count:,} bytes\n"
+            f"• Respaldo original: Protegido (SHA256)\n\n"
+            f"El vehículo ya usará este sonido cuando entres a pista en Automobilista 2.\n"
+            f"Puedes restaurar el sonido original de Steam en cualquier momento desde esta herramienta "
+            f"sin necesidad de realizar una comprobación de archivos en Steam.",
+        )
 
 
 def launch_gui() -> None:

@@ -1813,8 +1813,42 @@ def _patch_proj_chunks(
                             i += 1
 
         remap_leaves(0, len(buf))
+        buf = _sort_evts_in_proj_payload(buf)
 
     return bytes(buf)
+
+
+def _sort_evts_in_proj_payload(buf: bytearray) -> bytearray:
+    """Reordena los chunks LIST:EVNT dentro de LIST:EVTS en orden ascendente por su GUID EVTB.
+
+    Garantiza que las tablas FMOD mantengan orden memcmp estricto para binary search (bsearch)
+    cuando se reasignan GUIDs nativos de vehículos vanilla o GUIDs personalizados.
+    """
+    for cid, ps, pe, pos in iter_riff_chunks(buf, 0, len(buf)):
+        if cid == b"LIST" and buf[ps : ps + 4] == b"EVTS":
+            children: list[tuple[bytes | None, bytes]] = []
+            header = bytearray()
+            for ev_cid, ev_ps, ev_pe, ev_pos in iter_riff_chunks(buf, ps + 4, pe):
+                ev_pad_end = ev_pe + ((ev_pe - ev_ps) & 1)
+                if ev_cid == b"LCNT":
+                    header.extend(buf[ev_pos:ev_pad_end])
+                    continue
+                chunk_full = bytes(buf[ev_pos:ev_pad_end])
+                ev_guid = None
+                for s_cid, s_ps, s_pe, _ in iter_riff_chunks(buf, ev_ps + 4, ev_pe):
+                    if s_cid in LOCAL_OBJECT_BASE_CHUNKS and s_pe - s_ps >= 16:
+                        ev_guid = bytes(buf[s_ps : s_ps + 16])
+                        break
+                children.append((ev_guid, chunk_full))
+            if any(g is not None for g, _ in children):
+                children.sort(key=lambda x: x[0] if x[0] is not None else b"\xff" * 16)
+                new_payload = b"EVTS" + header + b"".join(c for _, c in children)
+                new_chunk = b"LIST" + struct.pack("<I", len(new_payload)) + new_payload
+                if len(new_payload) & 1:
+                    new_chunk += b"\x00"
+                pad_end = pe + ((pe - ps) & 1)
+                return bytearray(buf[:pos] + new_chunk + buf[pad_end:])
+    return buf
 
 
 def _replace_sndh_and_stdt_in_proj(
@@ -2230,18 +2264,22 @@ def build_direct_ported_bank_from_ac(
     mod_identifier: str = "custom_mod",
     standalone_guids: bool = True,
     rpm_bands: list[RpmBandConfig] | None = None,
+    target_role_guids: dict[str, str | bytes] | None = None,
+    target_role_paths: dict[str, str] | None = None,
+    target_bank_guid: str | bytes | None = None,
 ) -> PortedBankResult:
     """Construye un nuevo archivo .bank para Automobilista 2 directamente desde un banco .bank de Assetto Corsa.
 
     Preserva el 100% del diseño de sonido original de Assetto Corsa (curvas, timelines, filtros,
     multi-instrumentos, pitch automations y efectos extras) sin verse condicionado ni degradado
     por un banco donante de AMS2.
-    Realiza:
+    Soporta:
       1. Parcheo binario in-place del parámetro de motor 'rpms' -> 'rpm' de AMS2 en chunks PRMB.
       2. Re-enrutamiento de buses de instancia (IBSB) hacia los buses de master correspondientes
          en AMS2 ({c1986fb5-b329-4565-8342-b223857006d5} Exterior y {a8959bf6-0b54-43ea-9d9a-06a8831c40d4} Cockpit).
-      3. Regeneración determinista de GUIDs independientes (standalone_guids) preservando el orden memcmp.
-      4. Inserción de tabla de rutas FMOD RadixTree (STDT) con rutas limpias 'event:/AMS2/Vehicles/Mods/...'.
+      3. Regeneración determinista de GUIDs independientes (standalone_guids) o inyección directa
+         de GUIDs objetivo de vehículos vanilla de AMS2 (target_role_guids).
+      4. Inserción de tabla de rutas FMOD RadixTree (STDT).
       5. Re-ensamblado con alineación de 32 bytes para sub-bancos FSB5 (SNDH y chunks SND ).
     """
     EXT_BUS = guid_str_to_bytes("{c1986fb5-b329-4565-8342-b223857006d5}")
@@ -2309,7 +2347,35 @@ def build_direct_ported_bank_from_ac(
     role_to_event_path: dict[str, str] = {}
     stdt_entries: list[tuple[str, bytes]] = []
 
-    if standalone_guids:
+    if target_role_guids:
+        # Modo Destino Vanilla / Fijo: Asignar directamente los GUIDs nativos del vehículo base de AMS2
+        guid_map = {}
+        for ev in ac_bank.events:
+            if ev.role in target_role_guids:
+                raw_tg = target_role_guids[ev.role]
+                tg_b = guid_str_to_bytes(raw_tg) if isinstance(raw_tg, str) else bytes(raw_tg)
+                guid_map[ev.guid_bytes] = tg_b
+                event_guid_map[ev.guid_str] = bytes_to_guid_str(tg_b)
+                role_to_event_guid[ev.role] = bytes_to_guid_str(tg_b)
+                ev_path = (target_role_paths or {}).get(ev.role) or (ev.path or f"event:/AMS2/Vehicles/{safe_mod}/{ev.role}")
+                role_to_event_path[ev.role] = ev_path
+                stdt_entries.append((ev_path, tg_b))
+            else:
+                event_guid_map[ev.guid_str] = ev.guid_str
+                role_to_event_guid[ev.role] = ev.guid_str
+                clean_path = ev.path or f"event:/AMS2/Vehicles/{safe_mod}/{ev.role}_{ev.index}"
+                role_to_event_path[ev.role] = clean_path
+                stdt_entries.append((clean_path, ev.guid_bytes))
+
+        if target_bank_guid:
+            raw_bg = target_bank_guid
+            bg_b = guid_str_to_bytes(raw_bg) if isinstance(raw_bg, str) else bytes(raw_bg)
+            guid_map[ac_bank.bank_guid] = bg_b
+            new_bank_guid = bytes_to_guid_str(bg_b)
+            stdt_entries.append((f"bank:/{safe_mod}", bg_b))
+        else:
+            new_bank_guid = bytes_to_guid_str(ac_bank.bank_guid)
+    elif standalone_guids:
         local_sorted = collect_local_proj_guids(proj_buf)
         guid_map = build_order_preserving_guid_map(local_sorted, safe_mod)
         new_bank_guid_bytes = guid_map.get(ac_bank.bank_guid, ac_bank.bank_guid)

@@ -684,12 +684,15 @@ class FmodBank:
 
     def __init__(
         self,
-        path: Path | None = None,
+        path: Path | str | bytes | bytearray | None = None,
         raw: bytes | None = None,
         guids_path: Path | None = None,
         external_guids: dict[bytes, str] | None = None,
     ):
-        if raw is None and path is not None:
+        if isinstance(path, (bytes, bytearray)):
+            raw = bytes(path)
+            path = None
+        elif raw is None and path is not None:
             raw = Path(path).read_bytes()
         if raw is None:
             raise ValueError("Se requiere 'path' o 'raw' para cargar FmodBank.")
