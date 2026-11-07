@@ -92,6 +92,8 @@ class VanillaVehicle:
     backup_timestamp: str | None = None
     csdbin_path: Path | None = None      # Archivo .csdbin suelto en Vehicles/<carpeta> si existe
     target_parameters: list[str] = field(default_factory=list) # Parámetros detectados en el banco nativo (load, rpm, etc.)
+    ctrl_parameters: set[str] = field(default_factory=set)     # Parámetros activos en CTRS/CTRL (load, throttle, rpm)
+
 
 
 class VanillaVehicleManager:
@@ -266,7 +268,7 @@ class VanillaVehicleManager:
                         vehicle.csdbin_path = csd
                         break
 
-        if vehicle.event_roles and (vehicle.ai_event_roles or not vehicle.ai_bank_path):
+        if vehicle.event_roles and vehicle.target_parameters and (vehicle.ai_event_roles or not vehicle.ai_bank_path):
             return
         if not vehicle.bank_path.is_file():
             return
@@ -278,36 +280,71 @@ class VanillaVehicleManager:
             roles: set[str] = set()
             guids: dict[str, str] = {}
             paths: dict[str, str] = {}
+            int_count = 0
             for ev in b.events:
                 ev_p = master_strings.get(ev.guid_str.lower(), ev.path or "")
-                if ev.role:
-                    roles.add(ev.role)
-                    if ev.guid_str:
-                        guids[ev.role] = ev.guid_str
-                    if ev_p:
-                        paths[ev.role] = ev_p
-                    elif ev.path:
-                        paths[ev.role] = ev.path
+                p_low = ev_p.lower()
+                role = ev.role or "Unknown"
+
+                # Clasificación precisa por ruta en master_strings para evitar solapamientos y eventos perdidos
+                if "starter" in p_low:
+                    role = "Starter"
+                elif "starting" in p_low:
+                    role = "Starting"
+                elif "exhaust" in p_low:
+                    role = "Exhaust"
+                elif any(k in p_low for k in ("engineext", "engine_ext", "ext_engine")):
+                    role = "EngineExt"
+                elif any(k in p_low for k in ("engineint", "engine_int", "int_engine")):
+                    int_count += 1
+                    role = "EngineInt" if int_count == 1 else "AuxInt"
+                elif role == "Starting" and "Starter" not in guids:
+                    role = "Starter"
+
+                if role:
+                    roles.add(role)
+                    if ev.guid_str and role not in guids:
+                        guids[role] = ev.guid_str
+                    if ev_p and role not in paths:
+                        paths[role] = ev_p
+                    elif ev.path and role not in paths:
+                        paths[role] = ev.path
             vehicle.event_roles = sorted(list(roles))
             vehicle.event_guids = guids
             vehicle.event_paths = paths
 
-            # Extraer nombres de parámetros nativos del banco de jugador (load, rpm, throttle, etc.)
+            # Extraer nombres de parámetros nativos y controladores activos del banco de jugador (load, rpm, throttle, etc.)
             p_names: set[str] = set()
+            prm_guid_to_name: dict[bytes, str] = {}
+            ctrl_prms: set[str] = set()
             for cid, ps, pe, _ in iter_riff_chunks(b.raw, 12, len(b.raw)):
                 if cid == b"LIST" and b.raw[ps : ps + 4] == b"PROJ":
                     proj_pay = b.raw[ps + 4 : pe]
                     def scan_prms(s: int, e: int) -> None:
                         for scid, sps, spe, _ in iter_riff_chunks(proj_pay, s, e):
                             if scid == b"PRMB" and spe - sps >= 25:
+                                g = proj_pay[sps : sps + 16]
                                 slen = struct.unpack_from("<H", proj_pay, sps + 21)[0]
                                 name = proj_pay[sps + 23 : sps + 23 + slen].decode("latin1", "replace").rstrip("\x00")
                                 p_names.add(name)
+                                prm_guid_to_name[g] = name
                             elif scid == b"LIST":
                                 scan_prms(sps + 4, spe)
                     scan_prms(0, len(proj_pay))
+
+                    # Escaneo de controladores activos CTRS/CTRL
+                    for scid, sps, spe, _ in iter_riff_chunks(proj_pay, 0, len(proj_pay)):
+                        if scid == b"LIST" and proj_pay[sps : sps + 4] == b"CTRS":
+                            ctrs = proj_pay[sps + 4 : spe]
+                            for ccid, cps, cpe, _ in iter_riff_chunks(ctrs, 0, len(ctrs)):
+                                if ccid == b"CTRL" and cpe - cps >= 48:
+                                    cpay = ctrs[cps:cpe]
+                                    for pg, pname in prm_guid_to_name.items():
+                                        if pg in cpay and pname in ("load", "throttle", "rpm"):
+                                            ctrl_prms.add(pname)
                     break
             vehicle.target_parameters = sorted(list(p_names))
+            vehicle.ctrl_parameters = ctrl_prms
 
             # Analizar también banco de IA si existe
             if vehicle.ai_bank_path and vehicle.ai_bank_path.is_file():

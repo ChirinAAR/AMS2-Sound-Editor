@@ -4441,6 +4441,7 @@ class SoundPorterApp(tk.Tk):
                         target_role_paths=veh.event_paths,
                         target_bank_guid=veh.bank_guid or None,
                         target_param_names=veh.target_parameters,
+                        target_ctrl_params=veh.ctrl_parameters,
                         rpm_bands=bands_to_export,
                     )
                     bank_bytes = direct_res.bank_bytes
@@ -4463,19 +4464,34 @@ class SoundPorterApp(tk.Tk):
                 ai_bytes: bytes | None = None
                 if sync_ai and veh.ai_bank_path and veh.ai_bank_path.is_file():
                     self.dispatch_to_ui(self._append_log, f"  Compilando banco de IA y TV Replays '{veh.ai_bank_path.name}'...")
-                    ai_donor = FmodBank(veh.ai_bank_path)
-                    ai_mappings = auto_map_samples(ai_donor, self.source_lib)
-                    ai_res = build_ported_bank(
-                        donor=ai_donor,
-                        library=self.source_lib,
-                        mappings=ai_mappings,
-                        mod_identifier=f"{veh.car_name}_AI",
-                        standalone_guids=False,
-                        sync_autopitch=sync_pitch,
-                        output_codec_mode=codec_mode,
-                        force_sample_rate=48000,
-                    )
-                    ai_bytes = ai_res.bank_bytes
+                    if is_direct:
+                        assert self.source_lib and self.source_lib.fmod_bank
+                        ai_direct_res = build_direct_ported_bank_from_ac(
+                            ac_bank=self.source_lib.fmod_bank,
+                            mod_identifier=f"{veh.car_name}_AI",
+                            target_role_guids=veh.ai_event_guids,
+                            target_role_paths=veh.ai_event_paths,
+                            target_bank_guid=veh.ai_bank_guid or None,
+                            target_param_names=veh.target_parameters,
+                            target_ctrl_params=veh.ctrl_parameters,
+                            is_ai_bank=True,
+                            rpm_bands=bands_to_export,
+                        )
+                        ai_bytes = ai_direct_res.bank_bytes
+                    else:
+                        ai_donor = FmodBank(veh.ai_bank_path)
+                        ai_mappings = auto_map_samples(ai_donor, self.source_lib)
+                        ai_res = build_ported_bank(
+                            donor=ai_donor,
+                            library=self.source_lib,
+                            mappings=ai_mappings,
+                            mod_identifier=f"{veh.car_name}_AI",
+                            standalone_guids=False,
+                            sync_autopitch=sync_pitch,
+                            output_codec_mode=codec_mode,
+                            force_sample_rate=48000,
+                        )
+                        ai_bytes = ai_res.bank_bytes
 
                 # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) si existe
                 csd_bytes: bytes | None = None
