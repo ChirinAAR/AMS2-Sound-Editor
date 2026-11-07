@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .fmod_bank import FmodBank, bytes_to_guid_str, guid_str_to_bytes
+from .fmod_stdt import parse_stdt_all_paths
 
 
 DEFAULT_AMS2_SEARCH_PATHS = [
@@ -78,9 +79,14 @@ class VanillaVehicle:
     event_guids: dict[str, str] = field(default_factory=dict)       # role -> guid_str
     event_paths: dict[str, str] = field(default_factory=dict)       # role -> path
     bank_guid: str = ""
+    ai_bank_guid: str = ""
+    ai_event_roles: list[str] = field(default_factory=list)
+    ai_event_guids: dict[str, str] = field(default_factory=dict)    # role -> guid_str
+    ai_event_paths: dict[str, str] = field(default_factory=dict)    # role -> path
     is_modified: bool = False            # True si está usando sonido porteado
     has_backup: bool = False             # True si existe respaldo seguro original
     original_sha256: str | None = None
+    original_ai_sha256: str | None = None
     current_sha256: str | None = None
     backup_timestamp: str | None = None
     csdbin_path: Path | None = None      # Archivo .csdbin suelto en Vehicles/<carpeta> si existe
@@ -111,7 +117,31 @@ class VanillaVehicleManager:
         self.manifest_path = self.backup_dir / "vanilla_backups.json"
         self._vehicles_cache: list[VanillaVehicle] = []
         self._manifest_cache: dict[str, Any] = {}
+        self._master_strings_cache: dict[str, str] | None = None
         self._load_manifest()
+
+    def get_master_strings(self) -> dict[str, str]:
+        """Carga y cachea el diccionario de GUID -> path desde MasterBank.strings.bank de AMS2."""
+        if self._master_strings_cache is not None:
+            return self._master_strings_cache
+        master_path = self.ams2_root / "Audio" / "MasterBank.strings.bank"
+        if not master_path.is_file():
+            sys_root = detect_ams2_root()
+            if sys_root and (sys_root / "Audio" / "MasterBank.strings.bank").is_file():
+                master_path = sys_root / "Audio" / "MasterBank.strings.bank"
+
+        out: dict[str, str] = {}
+        if master_path.is_file():
+            try:
+                b_master = FmodBank(master_path)
+                if b_master.stdt_bytes:
+                    raw_paths = parse_stdt_all_paths(b_master.stdt_bytes)
+                    for k_bytes, path_str in raw_paths.items():
+                        out[bytes_to_guid_str(k_bytes).lower()] = path_str
+            except Exception:
+                pass
+        self._master_strings_cache = out
+        return out
 
     def _load_manifest(self) -> None:
         """Carga el manifiesto de respaldos."""
@@ -234,11 +264,12 @@ class VanillaVehicleManager:
                         vehicle.csdbin_path = csd
                         break
 
-        if vehicle.event_roles:
+        if vehicle.event_roles and (vehicle.ai_event_roles or not vehicle.ai_bank_path):
             return
         if not vehicle.bank_path.is_file():
             return
         try:
+            master_strings = self.get_master_strings()
             b = FmodBank(vehicle.bank_path)
             vehicle.slots_count = len(b.slots)
             vehicle.bank_guid = bytes_to_guid_str(b.bank_guid) if b.bank_guid else ""
@@ -246,15 +277,51 @@ class VanillaVehicleManager:
             guids: dict[str, str] = {}
             paths: dict[str, str] = {}
             for ev in b.events:
+                ev_p = master_strings.get(ev.guid_str.lower(), ev.path or "")
                 if ev.role:
                     roles.add(ev.role)
                     if ev.guid_str:
                         guids[ev.role] = ev.guid_str
-                    if ev.path:
+                    if ev_p:
+                        paths[ev.role] = ev_p
+                    elif ev.path:
                         paths[ev.role] = ev.path
             vehicle.event_roles = sorted(list(roles))
             vehicle.event_guids = guids
             vehicle.event_paths = paths
+
+            # Analizar también banco de IA si existe
+            if vehicle.ai_bank_path and vehicle.ai_bank_path.is_file():
+                ai_b = FmodBank(vehicle.ai_bank_path)
+                vehicle.ai_bank_guid = bytes_to_guid_str(ai_b.bank_guid) if ai_b.bank_guid else ""
+                ai_roles: set[str] = set()
+                ai_guids: dict[str, str] = {}
+                ai_paths: dict[str, str] = {}
+                for ev in ai_b.events:
+                    p = master_strings.get(ev.guid_str.lower(), ev.path or "")
+                    p_low = p.lower()
+                    if "main_live" in p_low or "_live" in p_low:
+                        role = "ai_engine_live"
+                    elif "main" in p_low:
+                        role = "ai_engine_ext"
+                    elif "engineext" in p_low:
+                        role = "ai_engine_ext"
+                    elif "engineint" in p_low:
+                        role = "ai_engine_int"
+                    elif ev.role == "EngineExt":
+                        role = "ai_engine_ext"
+                    elif ev.role == "EngineInt":
+                        role = "ai_engine_int"
+                    else:
+                        role = ev.role or f"AI_Event_{ev.index}"
+                    ai_roles.add(role)
+                    if ev.guid_str:
+                        ai_guids[role] = ev.guid_str
+                    if p:
+                        ai_paths[role] = p
+                vehicle.ai_event_roles = sorted(list(ai_roles))
+                vehicle.ai_event_guids = ai_guids
+                vehicle.ai_event_paths = ai_paths
         except Exception:
             pass
 
@@ -313,7 +380,9 @@ class VanillaVehicleManager:
 
             # 3. Si existe _AI.bank, respaldarlo también
             backup_ai_name = None
+            curr_ai_sha = None
             if vehicle.ai_bank_path and vehicle.ai_bank_path.is_file():
+                curr_ai_sha = calculate_file_sha256(vehicle.ai_bank_path)
                 ai_backup_file = veh_backup_folder / vehicle.ai_bank_path.name
                 shutil.copy2(vehicle.ai_bank_path, ai_backup_file)
                 ai_orig_file = vehicle.ai_bank_path.parent / f"{vehicle.ai_bank_path.name}.orig"
@@ -343,6 +412,7 @@ class VanillaVehicleManager:
                 "backup_ai_file": str(veh_backup_folder / backup_ai_name) if backup_ai_name else None,
                 "backup_csd_file": str(veh_backup_folder / backup_csd_name) if backup_csd_name else None,
                 "original_sha256": curr_sha,
+                "original_ai_sha256": curr_ai_sha,
                 "original_size": file_size,
                 "backup_timestamp": now_str,
                 "is_modified": False,
@@ -351,6 +421,7 @@ class VanillaVehicleManager:
 
             vehicle.has_backup = True
             vehicle.original_sha256 = curr_sha
+            vehicle.original_ai_sha256 = curr_ai_sha
             vehicle.backup_timestamp = now_str
             return True, f"Copia de seguridad creada con éxito (SHA256: {curr_sha[:12]}...)"
         except Exception as e:
@@ -361,6 +432,7 @@ class VanillaVehicleManager:
         vehicle: VanillaVehicle,
         bank_bytes: bytes,
         ai_bank_bytes: bytes | None = None,
+        csdbin_bytes: bytes | None = None,
     ) -> tuple[bool, str]:
         """Inyecta el nuevo sonido compilado en el vehículo vanilla, creando primero el respaldo seguro."""
         if not bank_bytes:
@@ -381,12 +453,22 @@ class VanillaVehicleManager:
             tmp_target.rename(target_path)
 
             # 3. Si se proporciona banco AI, escribirlo
+            ai_msg_part = ""
             if ai_bank_bytes and vehicle.ai_bank_path:
                 ai_tmp = vehicle.ai_bank_path.with_suffix(".bank.tmp")
                 ai_tmp.write_bytes(ai_bank_bytes)
                 if vehicle.ai_bank_path.is_file():
                     vehicle.ai_bank_path.unlink()
                 ai_tmp.rename(vehicle.ai_bank_path)
+                ai_msg_part = f"\n• Banco IA / TV Replay: {vehicle.ai_bank_path.name} ({len(ai_bank_bytes):,} bytes)"
+
+            # 3b. Si se proporciona .csdbin suelto, escribirlo
+            if csdbin_bytes and vehicle.csdbin_path:
+                csd_tmp = vehicle.csdbin_path.with_suffix(".csdbin.tmp")
+                csd_tmp.write_bytes(csdbin_bytes)
+                if vehicle.csdbin_path.is_file():
+                    vehicle.csdbin_path.unlink()
+                csd_tmp.rename(vehicle.csdbin_path)
 
             # 4. Actualizar estado en el manifiesto
             if vehicle.vehicle_id in self._manifest_cache:
@@ -397,9 +479,8 @@ class VanillaVehicleManager:
             vehicle.is_modified = True
             return True, (
                 f"¡Sonido inyectado con éxito en '{vehicle.display_name}'!\n"
-                f"Ruta: {target_path}\n"
-                f"Tamaño: {len(bank_bytes):,} bytes.\n"
-                f"El vehículo ya usará este sonido en AMS2. Respaldo original seguro y activo."
+                f"• Banco Jugador: {target_path.name} ({len(bank_bytes):,} bytes){ai_msg_part}\n"
+                f"El vehículo ya usará este sonido en AMS2 (Jugador + IA + TV Replays). Respaldo original seguro y activo."
             )
         except Exception as e:
             if tmp_target.is_file():

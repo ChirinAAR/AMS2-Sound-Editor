@@ -1390,7 +1390,7 @@ class SoundPorterApp(tk.Tk):
 
         ttk.Checkbutton(
             self.vanilla_cfg_card,
-            text="👥 Inyectar también banco de audio de IA (_AI.bank) si existe para los oponentes",
+            text="👥 Sincronizar e inyectar también banco de audio de IA (_AI.bank) en un solo paso (Cubre rivales en pista y vistas de Repetición / TV Replay)",
             variable=self.vanilla_sync_ai_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
 
@@ -4323,7 +4323,10 @@ class SoundPorterApp(tk.Tk):
 
         b_res = summary.bank_result
         size_mb = summary.bank_file.stat().st_size / (1024 * 1024)
-        self._append_log(f"✔ Banco FMOD generado: {summary.bank_file} ({size_mb:.2f} MB)")
+        self._append_log(f"✔ Banco Jugador FMOD generado: {summary.bank_file} ({size_mb:.2f} MB)")
+        if summary.ai_bank_file and summary.ai_bank_file.is_file():
+            ai_size_mb = summary.ai_bank_file.stat().st_size / (1024 * 1024)
+            self._append_log(f"✔ Banco IA + TV Replays generado: {summary.ai_bank_file} ({ai_size_mb:.2f} MB)")
         if self.is_direct_ac_mode:
             self._append_log(
                 f"  ⚡ Modo: {b_res.codec_used} | {b_res.replaced_slots_count} muestras de AC preservadas al 100%"
@@ -4455,11 +4458,49 @@ class SoundPorterApp(tk.Tk):
                     )
                     bank_bytes = donor_res.bank_bytes
 
-                ai_bytes = bank_bytes if (sync_ai and veh.ai_bank_path) else None
+                # 2. Compilar banco de la IA si está marcado y existe (cubre rivales en pista y cámara de TV / Replay)
+                ai_bytes: bytes | None = None
+                if sync_ai and veh.ai_bank_path and veh.ai_bank_path.is_file():
+                    self.dispatch_to_ui(self._append_log, f"  Compilando banco de IA y TV Replays '{veh.ai_bank_path.name}'...")
+                    ai_donor = FmodBank(veh.ai_bank_path)
+                    ai_mappings = auto_map_samples(ai_donor, self.source_lib)
+                    ai_res = build_ported_bank(
+                        donor=ai_donor,
+                        library=self.source_lib,
+                        mappings=ai_mappings,
+                        mod_identifier=f"{veh.car_name}_AI",
+                        standalone_guids=False,
+                        sync_autopitch=sync_pitch,
+                        output_codec_mode=codec_mode,
+                        force_sample_rate=48000,
+                    )
+                    ai_bytes = ai_res.bank_bytes
+
+                # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) si existe
+                csd_bytes: bytes | None = None
+                if veh.csdbin_path and veh.csdbin_path.is_file():
+                    try:
+                        csd_doc = CsdbinDocument.from_file(veh.csdbin_path)
+                        if "engine_placement" in csd_doc.links:
+                            raw_blob = csd_doc.links["engine_placement"].replace("blob:", "")
+                            bdata = bytearray(bytes.fromhex(raw_blob))
+                            num_slots = len(bdata) // 32
+                            for s in (3, 4):
+                                if s < num_slots:
+                                    offset = s * 32
+                                    vol = struct.unpack_from("<f", bdata, offset)[0]
+                                    struct.pack_into("<f", bdata, offset, min(1.0, max(vol * 1.35, 0.40)))
+                                    struct.pack_into("<f", bdata, offset + 20, 8.0)
+                            csd_doc.links["engine_placement"] = f"blob:{bdata.hex()}"
+                            csd_bytes = csd_doc.save_csdbin()
+                    except Exception:
+                        pass
+
                 ok, msg = self.vanilla_mgr.install_sound(
                     vehicle=veh,
                     bank_bytes=bank_bytes,
                     ai_bank_bytes=ai_bytes,
+                    csdbin_bytes=csd_bytes,
                 )
                 if not ok:
                     raise RuntimeError(msg)

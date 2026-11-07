@@ -2267,6 +2267,7 @@ def build_direct_ported_bank_from_ac(
     target_role_guids: dict[str, str | bytes] | None = None,
     target_role_paths: dict[str, str] | None = None,
     target_bank_guid: str | bytes | None = None,
+    is_ai_bank: bool = False,
 ) -> PortedBankResult:
     """Construye un nuevo archivo .bank para Automobilista 2 directamente desde un banco .bank de Assetto Corsa.
 
@@ -2278,9 +2279,11 @@ def build_direct_ported_bank_from_ac(
       2. Re-enrutamiento de buses de instancia (IBSB) hacia los buses de master correspondientes
          en AMS2 ({c1986fb5-b329-4565-8342-b223857006d5} Exterior y {a8959bf6-0b54-43ea-9d9a-06a8831c40d4} Cockpit).
       3. Regeneración determinista de GUIDs independientes (standalone_guids) o inyección directa
-         de GUIDs objetivo de vehículos vanilla de AMS2 (target_role_guids).
-      4. Inserción de tabla de rutas FMOD RadixTree (STDT).
-      5. Re-ensamblado con alineación de 32 bytes para sub-bancos FSB5 (SNDH y chunks SND ).
+         de GUIDs y rutas nativas de un vehículo vanilla base.
+      4. Modo dual-bank para IA (is_ai_bank=True), registrando rutas compatibles para rivales
+         (AI_EngineMAIN) y para repetición/cámara de TV broadcast (AI_EngineMAIN_LIVE).
+      5. Inserción de tabla de rutas FMOD RadixTree (STDT).
+      6. Re-ensamblado con alineación de 32 bytes para sub-bancos FSB5 (SNDH y chunks SND ).
     """
     EXT_BUS = guid_str_to_bytes("{c1986fb5-b329-4565-8342-b223857006d5}")
     INT_BUS = guid_str_to_bytes("{a8959bf6-0b54-43ea-9d9a-06a8831c40d4}")
@@ -2380,7 +2383,12 @@ def build_direct_ported_bank_from_ac(
         guid_map = build_order_preserving_guid_map(local_sorted, safe_mod)
         new_bank_guid_bytes = guid_map.get(ac_bank.bank_guid, ac_bank.bank_guid)
         new_bank_guid = bytes_to_guid_str(new_bank_guid_bytes)
-        stdt_entries.append((f"bank:/{safe_mod}_Engine", new_bank_guid_bytes))
+
+        mod_prefix = safe_mod[:-3] if safe_mod.endswith("_AI") else safe_mod
+        if is_ai_bank:
+            stdt_entries.append((f"bank:/{mod_prefix}_Engine_AI", new_bank_guid_bytes))
+        else:
+            stdt_entries.append((f"bank:/{safe_mod}_Engine", new_bank_guid_bytes))
 
         used_paths: set[str] = set()
         for ev in ac_bank.events:
@@ -2389,13 +2397,27 @@ def build_direct_ported_bank_from_ac(
             event_guid_map[ev.guid_str] = ng
             role_to_event_guid[ev.role] = ng
 
-            last_part = ev.path.split("/")[-1] if ev.path else ev.role
-            clean_ev_path = f"event:/AMS2/Vehicles/Mods/{safe_mod}/{last_part}"
-            if clean_ev_path.lower() in used_paths:
-                clean_ev_path = f"{clean_ev_path}_{ev.index}"
-            used_paths.add(clean_ev_path.lower())
-            role_to_event_path[ev.role] = clean_ev_path
-            stdt_entries.append((clean_ev_path, ng_bytes))
+            if is_ai_bank and ev.role == "EngineExt":
+                live_path = f"event:/AMS2/Vehicles/Mods/{mod_prefix}/AI_EngineMAIN_LIVE"
+                main_path = f"event:/AMS2/Vehicles/Mods/{mod_prefix}/AI_EngineMAIN"
+                stdt_entries.append((live_path, ng_bytes))
+                stdt_entries.append((main_path, ng_bytes))
+                role_to_event_path["EngineExt"] = main_path
+                role_to_event_path["ai_engine_ext"] = main_path
+                role_to_event_path["ai_engine_live"] = live_path
+            elif is_ai_bank and ev.role == "EngineInt":
+                int_path = f"event:/AMS2/Vehicles/Mods/{mod_prefix}/AI_EngineInt"
+                stdt_entries.append((int_path, ng_bytes))
+                role_to_event_path["EngineInt"] = int_path
+                role_to_event_path["ai_engine_int"] = int_path
+            else:
+                last_part = ev.path.split("/")[-1] if ev.path else ev.role
+                clean_ev_path = f"event:/AMS2/Vehicles/Mods/{safe_mod}/{last_part}"
+                if clean_ev_path.lower() in used_paths:
+                    clean_ev_path = f"{clean_ev_path}_{ev.index}"
+                used_paths.add(clean_ev_path.lower())
+                role_to_event_path[ev.role] = clean_ev_path
+                stdt_entries.append((clean_ev_path, ng_bytes))
     else:
         new_bank_guid = bytes_to_guid_str(ac_bank.bank_guid)
         for ev in ac_bank.events:
@@ -2479,6 +2501,9 @@ def apply_ported_bank_to_csdbin(
     csd_doc: CsdbinDocument,
     bank_result: PortedBankResult,
     bank_rel_path_no_ext: str,
+    ai_bank_result: PortedBankResult | None = None,
+    ai_bank_rel_path_no_ext: str | None = None,
+    optimize_chase_cam: bool = True,
 ) -> CsdbinDocument:
     """Actualiza los enlaces del documento .csdbin con las rutas `event:/...` registradas en STDT."""
     clean_bank_path = bank_rel_path_no_ext.replace("\\", "/").removesuffix(".bank")
@@ -2489,6 +2514,27 @@ def apply_ported_bank_to_csdbin(
         csd_doc.links["engine_ext"] = rpaths["EngineExt"]
     if "EngineInt" in rpaths:
         csd_doc.links["engine_int"] = rpaths["EngineInt"]
+
+    # Enlaces de banco y eventos de IA (rivales en pista + repeticiones LIVE)
+    if ai_bank_result is not None and ai_bank_rel_path_no_ext:
+        clean_ai_path = ai_bank_rel_path_no_ext.replace("\\", "/").removesuffix(".bank")
+        csd_doc.links["ai_engine_bank"] = clean_ai_path
+
+        ai_rpaths = ai_bank_result.role_to_event_path
+        if "ai_engine_ext" in ai_rpaths:
+            csd_doc.links["ai_engine_ext"] = ai_rpaths["ai_engine_ext"]
+        elif "EngineExt" in ai_rpaths:
+            csd_doc.links["ai_engine_ext"] = ai_rpaths["EngineExt"]
+
+        if "ai_engine_live" in ai_rpaths:
+            csd_doc.links["ai_engine_live"] = ai_rpaths["ai_engine_live"]
+        elif "EngineExt" in ai_rpaths:
+            csd_doc.links["ai_engine_live"] = ai_rpaths["EngineExt"]
+
+        if "ai_engine_int" in ai_rpaths:
+            csd_doc.links["ai_engine_int"] = ai_rpaths["ai_engine_int"]
+        elif "EngineInt" in ai_rpaths:
+            csd_doc.links["ai_engine_int"] = ai_rpaths["EngineInt"]
 
     if "Exhaust" in rpaths:
         if "exhaust_int" in csd_doc.links or "exhaust_ext" not in csd_doc.links:
@@ -2561,6 +2607,26 @@ def apply_ported_bank_to_csdbin(
         csd_doc.links["wind_bank"] = clean_bank_path
         csd_doc.links["wind"] = wind_path
 
+    # Optimización de colocación 3D para Chase Cam (3ra persona):
+    # En AMS2 la cámara trasera se sitúa a 6-8m. Si la distancia mínima es 2.0m, la curva logarítmica
+    # atenúa más de 10 dB, haciendo que el auto suene lejano. Aquí expandimos el radio a 8.0m y ajustamos ganancia.
+    if optimize_chase_cam and "engine_placement" in csd_doc.links:
+        try:
+            raw_blob = csd_doc.links["engine_placement"].replace("blob:", "")
+            bdata = bytearray(bytes.fromhex(raw_blob))
+            num_slots = len(bdata) // 32
+            for s in (3, 4):  # Slot 3 = Chase Near, Slot 4 = Chase Far
+                if s < num_slots:
+                    offset = s * 32
+                    vol = struct.unpack_from("<f", bdata, offset)[0]
+                    # Refuerzo del volumen para compensar pérdida de presencia
+                    struct.pack_into("<f", bdata, offset, min(1.0, max(vol * 1.35, 0.40)))
+                    # Expandir distancia mínima a 8.0m para que la cámara de persecución quede en zona 0 dB
+                    struct.pack_into("<f", bdata, offset + 20, 8.0)
+            csd_doc.links["engine_placement"] = f"blob:{bdata.hex()}"
+        except Exception:
+            pass
+
     return csd_doc
 
 
@@ -2575,6 +2641,8 @@ class ModExportSummary:
     readme_file: Path
     manifest_file: Path
     bank_result: PortedBankResult
+    ai_bank_file: Path | None = None
+    ai_bank_result: PortedBankResult | None = None
 
 
 def export_ams2_mod_package(
@@ -2593,6 +2661,8 @@ def export_ams2_mod_package(
     rpm_bands: list[RpmBandConfig] | None = None,
     throttle_cut: ThrottleCutConfig | None = None,
     direct_ac_bank: FmodBank | None = None,
+    build_ai_bank: bool = True,
+    optimize_chase_cam: bool = True,
 ) -> ModExportSummary:
     """Compila el .bank y el .csdbin listos para copiar en Automobilista 2 / AMS2 Content Manager."""
     output_root = Path(output_root)
@@ -2633,11 +2703,70 @@ def export_ams2_mod_package(
     bank_file.parent.mkdir(parents=True, exist_ok=True)
     bank_file.write_bytes(bank_res.bank_bytes)
 
+    # Compilación simultánea del banco de audio de IA y TV Replays (_AI.bank)
+    ai_bank_res: PortedBankResult | None = None
+    ai_bank_file: Path | None = None
+    ai_bank_rel_no_ext: str | None = None
+
+    if build_ai_bank:
+        ai_bank_rel_no_ext = f"Audio/AMS2/Vehicles/Mods/{safe_mod}/{safe_mod}_Engine_AI"
+        if direct_ac_bank is not None:
+            ai_bank_res = build_direct_ported_bank_from_ac(
+                ac_bank=direct_ac_bank,
+                mod_identifier=f"{safe_mod}_AI",
+                standalone_guids=standalone_guids,
+                rpm_bands=rpm_bands,
+                is_ai_bank=True,
+            )
+        elif donor is not None and donor.source_path is not None:
+            companion_ai = donor.source_path.parent / f"{donor.source_path.stem}_AI.bank"
+            if companion_ai.is_file():
+                ai_donor = FmodBank(companion_ai)
+                ai_mappings = auto_map_samples(ai_donor, library) if library else []
+                ai_bank_res = build_ported_bank(
+                    donor=ai_donor,
+                    mappings=ai_mappings,
+                    library=library,
+                    mod_identifier=f"{safe_mod}_AI",
+                    standalone_guids=standalone_guids,
+                    sync_autopitch=sync_autopitch,
+                    output_codec_mode=output_codec_mode,
+                    force_sample_rate=force_sample_rate,
+                )
+            elif library and library.fmod_bank:
+                ai_bank_res = build_direct_ported_bank_from_ac(
+                    ac_bank=library.fmod_bank,
+                    mod_identifier=f"{safe_mod}_AI",
+                    standalone_guids=standalone_guids,
+                    rpm_bands=rpm_bands,
+                    is_ai_bank=True,
+                )
+        elif library and library.fmod_bank:
+            ai_bank_res = build_direct_ported_bank_from_ac(
+                ac_bank=library.fmod_bank,
+                mod_identifier=f"{safe_mod}_AI",
+                standalone_guids=standalone_guids,
+                rpm_bands=rpm_bands,
+                is_ai_bank=True,
+            )
+
+        if ai_bank_res is not None:
+            ai_bank_file = output_root / f"{ai_bank_rel_no_ext}.bank"
+            ai_bank_file.parent.mkdir(parents=True, exist_ok=True)
+            ai_bank_file.write_bytes(ai_bank_res.bank_bytes)
+
     csdbin_file: Path | None = None
     csd_text_file: Path | None = None
     if csd_doc is not None:
         if auto_link_csdbin and standalone_guids:
-            apply_ported_bank_to_csdbin(csd_doc, bank_res, bank_rel_no_ext)
+            apply_ported_bank_to_csdbin(
+                csd_doc=csd_doc,
+                bank_result=bank_res,
+                bank_rel_path_no_ext=bank_rel_no_ext,
+                ai_bank_result=ai_bank_res,
+                ai_bank_rel_path_no_ext=ai_bank_rel_no_ext,
+                optimize_chase_cam=optimize_chase_cam,
+            )
         # Conservar el nombre de archivo original del .csdbin si proviene de un vehículo mod existente
         # (p.ej. carpeta 'Vehicles/bmw_z4_gt3' con archivo 'z4_gt3.csdbin')
         orig_stem = ""
@@ -2658,6 +2787,8 @@ def export_ams2_mod_package(
         "codec": bank_res.codec_used,
         "bank_relative_path": f"{bank_rel_no_ext}.bank",
         "bank_guid": bank_res.new_bank_guid,
+        "ai_bank_relative_path": f"{ai_bank_rel_no_ext}.bank" if ai_bank_file else None,
+        "ai_bank_guid": ai_bank_res.new_bank_guid if ai_bank_res else None,
         "replaced_slots": bank_res.replaced_slots_count,
         "kept_slots": bank_res.kept_slots_count,
         "throttle_cut_injected_events": bank_res.throttle_cut_injected_events,
@@ -2674,11 +2805,14 @@ def export_ams2_mod_package(
         "======================================================================",
         "",
         "ARCHIVOS GENERADOS:",
-        f"  1. Banco FMOD (con tabla STDT): {bank_file.relative_to(output_root)}",
+        f"  1. Banco Jugador (STDT):       {bank_file.relative_to(output_root)}",
     ]
+    if ai_bank_file:
+        readme_lines.append(f"  2. Banco IA + TV Replays:      {ai_bank_file.relative_to(output_root)}")
     if csdbin_file:
-        readme_lines.append(f"  2. Binario Auto (.csdbin):      {csdbin_file.relative_to(output_root)}")
-        readme_lines.append(f"  3. Texto OMVT (.csd):           {csd_text_file.relative_to(output_root)}")
+        idx_c = 3 if ai_bank_file else 2
+        readme_lines.append(f"  {idx_c}. Binario Auto (.csdbin):      {csdbin_file.relative_to(output_root)}")
+        readme_lines.append(f"  {idx_c+1}. Texto OMVT (.csd):           {csd_text_file.relative_to(output_root)}")
     readme_lines += [
         "",
         "CÓMO INSTALAR EN UN VEHÍCULO MOD DE AUTOMOBILISTA 2:",
@@ -2705,4 +2839,6 @@ def export_ams2_mod_package(
         readme_file=readme_file,
         manifest_file=manifest_file,
         bank_result=bank_res,
+        ai_bank_file=ai_bank_file,
+        ai_bank_result=ai_bank_res,
     )

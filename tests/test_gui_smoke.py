@@ -228,7 +228,7 @@ def main() -> None:
 
         orig_install = app.vanilla_mgr.install_sound
         direct_installed = []
-        app.vanilla_mgr.install_sound = lambda vehicle, bank_bytes, ai_bank_bytes=None: (direct_installed.append(len(bank_bytes)) or True, "OK mock direct")
+        app.vanilla_mgr.install_sound = lambda vehicle, bank_bytes, ai_bank_bytes=None, **kw: (direct_installed.append((len(bank_bytes), len(ai_bank_bytes) if ai_bank_bytes else 0)) or True, "OK mock direct")
         orig_info = mb.showinfo
         orig_yesno = mb.askyesno
         mb.showinfo = lambda *args, **kw: None
@@ -241,8 +241,8 @@ def main() -> None:
                 app.update()
                 time.sleep(0.05)
             assert len(direct_installed) > 0, f"No se llamó a install_sound en inyección directa vanilla. Error: {app.status_var.get()}"
-            assert direct_installed[0] > 10000000, "El banco directo generado tiene tamaño inválido"
-            print("   Inyección vanilla en Modo Directo 1:1 (build_direct_ported_bank_from_ac) verificada sin excepciones:", direct_installed[0], "bytes")
+            assert direct_installed[0][0] > 10000000, "El banco directo generado tiene tamaño inválido"
+            print("   Inyección vanilla en Modo Directo 1:1 DUAL (build_direct_ported_bank_from_ac) verificada sin excepciones:", direct_installed[0], "bytes")
         finally:
             app.vanilla_mgr.install_sound = orig_install
             mb.showinfo = orig_info
@@ -250,7 +250,7 @@ def main() -> None:
 
         # Probar inyección en vehículo vanilla en modo donante (asegurando que build_ported_bank esté definido)
         installed_called = []
-        app.vanilla_mgr.install_sound = lambda vehicle, bank_bytes, ai_bank_bytes=None: (installed_called.append(len(bank_bytes)) or True, "OK mock")
+        app.vanilla_mgr.install_sound = lambda vehicle, bank_bytes, ai_bank_bytes=None, **kw: (installed_called.append((len(bank_bytes), len(ai_bank_bytes) if ai_bank_bytes else 0)) or True, "OK mock")
         orig_info = mb.showinfo
         orig_yesno = mb.askyesno
         mb.showinfo = lambda *args, **kw: None
@@ -264,7 +264,7 @@ def main() -> None:
                 app.update()
                 time.sleep(0.05)
             assert len(installed_called) > 0, f"No se llamó a install_sound en inyección vanilla. Error: {app.status_var.get()}"
-            assert installed_called[0] > 100000, "El banco generado tiene tamaño inválido"
+            assert installed_called[0][0] > 100000, "El banco generado tiene tamaño inválido"
             print("   Inyección vanilla en modo donante (build_ported_bank) verificada sin excepciones:", installed_called[0], "bytes")
         finally:
             app.vanilla_mgr.install_sound = orig_install

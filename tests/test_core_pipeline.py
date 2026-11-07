@@ -563,6 +563,8 @@ def main() -> None:
             )
             assert summary_direct.bank_file.is_file()
             assert summary_direct.bank_file.stat().st_size > 0
+            assert summary_direct.ai_bank_file is not None and summary_direct.ai_bank_file.is_file()
+            assert summary_direct.ai_bank_file.stat().st_size > 0
             assert summary_direct.csdbin_file and summary_direct.csdbin_file.is_file()
             assert summary_direct.manifest_file.is_file()
             assert summary_direct.readme_file.is_file()
@@ -573,17 +575,29 @@ def main() -> None:
             assert len(out_bank.slots) == len(ac_488.slots)
             assert len(out_bank.stdt_bytes) > 0
 
-            # Verificar que el .csdbin contiene todos los roles de eventos porteados
+            # Verificar banco de IA y TV Replay
+            ai_out_bank = FmodBank(summary_direct.ai_bank_file)
+            assert len(ai_out_bank.events) >= 15
+            assert len(ai_out_bank.stdt_bytes) > 0
+            ai_paths = parse_stdt_all_paths(ai_out_bank.stdt_bytes)
+            assert any("AI_EngineMAIN_LIVE" in p for p in ai_paths.values()), "Falta evento AI_EngineMAIN_LIVE para TV Replays"
+            assert any("AI_EngineMAIN" in p for p in ai_paths.values()), "Falta evento AI_EngineMAIN para rivales"
+
+            # Verificar que el .csdbin contiene todos los enlaces de jugador e IA
             csd_loaded = CsdbinDocument.from_file(summary_direct.csdbin_file)
             assert csd_loaded.links["engine_bank"] == "Audio/AMS2/Vehicles/Mods/f488_direct/f488_direct_Engine"
             assert "engine_ext" in csd_loaded.links
             assert "engine_int" in csd_loaded.links
+            assert csd_loaded.links["ai_engine_bank"] == "Audio/AMS2/Vehicles/Mods/f488_direct/f488_direct_Engine_AI"
+            assert "AI_EngineMAIN" in csd_loaded.links["ai_engine_ext"]
+            assert "AI_EngineMAIN_LIVE" in csd_loaded.links["ai_engine_live"]
+            assert "AI_EngineInt" in csd_loaded.links["ai_engine_int"]
             assert "gearshift_bank" in csd_loaded.links
             assert "gearshift_up" in csd_loaded.links
             assert "turbo_bank" in csd_loaded.links
             assert "turbo" in csd_loaded.links
             assert "backfire_ext" in csd_loaded.links
-            print(f"   Ferrari 488 GT3 Mod export directo: {summary_direct.bank_file.name} ({len(out_bank.events)} eventos nativos, 20 enlaces .csdbin OK)!")
+            print(f"   Ferrari 488 GT3 Mod export directo DUAL (Jugador + IA): {summary_direct.bank_file.name} y {summary_direct.ai_bank_file.name} (Enlaces AI .csdbin OK)!")
 
     print("14. Probando Gestor de Vehículos Vanilla (Auditoría, Inyección Directa y Restauración Bit-a-Bit)...")
     from ams2_sound_porter.vanilla_manager import VanillaVehicleManager, calculate_file_sha256
@@ -601,20 +615,28 @@ def main() -> None:
         sb_sort.mkdir(parents=True)
         sb_bank = sb_sort / "SuperV8_Set1.bank"
 
-        # Copiar banco vanilla real al sandbox
+        # Copiar banco vanilla real y banco AI al sandbox
         real_superv8 = Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2\Audio\AMS2\Vehicles\Sort\S\Super_V8\SuperV8_Set1.bank")
+        real_superv8_ai = Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2\Audio\AMS2\Vehicles\Sort\S\Super_V8\SuperV8_Set1_AI.bank")
         import shutil
         shutil.copy2(real_superv8, sb_bank)
         orig_sha = calculate_file_sha256(sb_bank)
+
+        sb_ai_bank = sb_sort / "SuperV8_Set1_AI.bank"
+        shutil.copy2(real_superv8_ai, sb_ai_bank)
+        orig_ai_sha = calculate_file_sha256(sb_ai_bank)
 
         # Gestor operando en el sandbox
         sb_mgr = VanillaVehicleManager(ams2_root=sb_root, backup_dir=sb_root / "backups")
         sb_vehs = sb_mgr.scan_catalog()
         assert len(sb_vehs) == 1
         target_v = sb_vehs[0]
+        assert target_v.ai_bank_path and target_v.ai_bank_path.is_file()
         sb_mgr.load_vehicle_events_info(target_v)
         assert "EngineExt" in target_v.event_roles
         assert "EngineInt" in target_v.event_roles
+        assert len(target_v.ai_event_roles) >= 2
+        assert "ai_engine_live" in target_v.ai_event_roles or "AI_EngineMAIN_LIVE" in target_v.ai_event_roles or "ai_engine_ext" in target_v.ai_event_roles
 
         # 14a. Compilación directa AC con los GUIDs nativos del vehículo vanilla
         vanilla_direct = build_direct_ported_bank_from_ac(
@@ -643,17 +665,43 @@ def main() -> None:
         assert int_ev.guid_str.lower() == target_v.event_guids["EngineInt"].lower()
         print(f"   Inyección de GUIDs nativos de vehículo vanilla comprobada con éxito ({sorted_tbls} tablas FMOD ordenadas).")
 
-        # 14b. Instalación segura con creación de respaldo automático
-        ok_inst, msg_inst = sb_mgr.install_sound(target_v, vanilla_direct.bank_bytes)
+        # 14b. Compilación de banco de IA y TV Replays
+        ai_donor = FmodBank(sb_ai_bank)
+        ai_mappings = auto_map_samples(ai_donor, ac_lib)
+        ai_res = build_ported_bank(
+            donor=ai_donor,
+            library=ac_lib,
+            mappings=ai_mappings,
+            mod_identifier=f"{target_v.car_name}_AI",
+            standalone_guids=False,
+            output_codec_mode=FSB5_MODE_PCM16,
+        )
+        assert len(ai_res.bank_bytes) > 0
+        assert_sndh_and_fsb_alignment(ai_res.bank_bytes)
+
+        # 14c. Instalación DUAL segura (Jugador + IA) con creación de respaldos automáticos
+        ok_inst, msg_inst = sb_mgr.install_sound(target_v, vanilla_direct.bank_bytes, ai_bank_bytes=ai_res.bank_bytes)
         assert ok_inst, msg_inst
         assert target_v.is_modified
         assert (sb_sort / "SuperV8_Set1.bank.orig").is_file()
+        assert (sb_sort / "SuperV8_Set1_AI.bank.orig").is_file()
         assert target_v.original_sha256 == orig_sha
+        assert target_v.original_ai_sha256 == orig_ai_sha
         assert calculate_file_sha256(sb_bank) != orig_sha
-        print("   Instalación en vehículo base con respaldo automático (.orig + SHA256) verificada.")
+        assert calculate_file_sha256(sb_ai_bank) != orig_ai_sha
+        print("   Instalación DUAL en vehículo base con respaldos automáticos (.orig + SHA256) verificada.")
 
-        # 14c. Restauración al estado original de Steam sin reparación de archivos
+        # 14d. Restauración DUAL al estado original de Steam sin reparación de archivos
         ok_rest, msg_rest = sb_mgr.restore_vehicle(target_v)
+        assert ok_rest, msg_rest
+        assert not target_v.is_modified
+        assert not (sb_sort / "SuperV8_Set1.bank.orig").is_file()
+        assert not (sb_sort / "SuperV8_Set1_AI.bank.orig").is_file()
+        restored_sha = calculate_file_sha256(sb_bank)
+        restored_ai_sha = calculate_file_sha256(sb_ai_bank)
+        assert restored_sha == orig_sha, "El banco del jugador restaurado difiere del original de fábrica"
+        assert restored_ai_sha == orig_ai_sha, "El banco de IA restaurado difiere del original de fábrica"
+        print(f"   Restauración DUAL 100% fiel de Steam comprobada (SHA256 verificado bit-a-bit: Jugador={restored_sha[:10]}... IA={restored_ai_sha[:10]}...).")
         assert ok_rest, msg_rest
         assert not target_v.is_modified
         assert not (sb_sort / "SuperV8_Set1.bank.orig").is_file()
