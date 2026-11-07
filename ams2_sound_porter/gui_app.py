@@ -4440,6 +4440,7 @@ class SoundPorterApp(tk.Tk):
                         target_role_guids=veh.event_guids,
                         target_role_paths=veh.event_paths,
                         target_bank_guid=veh.bank_guid or None,
+                        target_param_names=veh.target_parameters,
                         rpm_bands=bands_to_export,
                     )
                     bank_bytes = direct_res.bank_bytes

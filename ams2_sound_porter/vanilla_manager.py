@@ -12,12 +12,13 @@ import os
 import shutil
 import time
 import winreg
+import struct
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .fmod_bank import FmodBank, bytes_to_guid_str, guid_str_to_bytes
+from .fmod_bank import FmodBank, bytes_to_guid_str, guid_str_to_bytes, iter_riff_chunks
 from .fmod_stdt import parse_stdt_all_paths
 
 
@@ -90,6 +91,7 @@ class VanillaVehicle:
     current_sha256: str | None = None
     backup_timestamp: str | None = None
     csdbin_path: Path | None = None      # Archivo .csdbin suelto en Vehicles/<carpeta> si existe
+    target_parameters: list[str] = field(default_factory=list) # Parámetros detectados en el banco nativo (load, rpm, etc.)
 
 
 class VanillaVehicleManager:
@@ -289,6 +291,23 @@ class VanillaVehicleManager:
             vehicle.event_roles = sorted(list(roles))
             vehicle.event_guids = guids
             vehicle.event_paths = paths
+
+            # Extraer nombres de parámetros nativos del banco de jugador (load, rpm, throttle, etc.)
+            p_names: set[str] = set()
+            for cid, ps, pe, _ in iter_riff_chunks(b.raw, 12, len(b.raw)):
+                if cid == b"LIST" and b.raw[ps : ps + 4] == b"PROJ":
+                    proj_pay = b.raw[ps + 4 : pe]
+                    def scan_prms(s: int, e: int) -> None:
+                        for scid, sps, spe, _ in iter_riff_chunks(proj_pay, s, e):
+                            if scid == b"PRMB" and spe - sps >= 25:
+                                slen = struct.unpack_from("<H", proj_pay, sps + 21)[0]
+                                name = proj_pay[sps + 23 : sps + 23 + slen].decode("latin1", "replace").rstrip("\x00")
+                                p_names.add(name)
+                            elif scid == b"LIST":
+                                scan_prms(sps + 4, spe)
+                    scan_prms(0, len(proj_pay))
+                    break
+            vehicle.target_parameters = sorted(list(p_names))
 
             # Analizar también banco de IA si existe
             if vehicle.ai_bank_path and vehicle.ai_bank_path.is_file():

@@ -2259,6 +2259,77 @@ def build_ported_bank(
     )
 
 
+def _patch_prmb_and_ibsb_in_proj(
+    proj_payload: bytes,
+    renames: dict[str, str],
+    ibg_to_target_bus: dict[bytes, bytes],
+) -> bytes:
+    """Renombra parámetros en chunks PRMB y re-enruta IBSB preservando integridad RIFF."""
+    out = bytearray()
+    for cid, ps, pe, _ in iter_riff_chunks(proj_payload, 0, len(proj_payload)):
+        pay = proj_payload[ps:pe]
+        if cid == b"LIST":
+            ltype = pay[:4]
+            inner = _patch_prmb_and_ibsb_in_proj(pay[4:], renames, ibg_to_target_bus)
+            out += _riff_list(ltype, inner)
+        elif cid == b"PRMB" and len(pay) >= 23:
+            slen = struct.unpack_from("<H", pay, 21)[0]
+            name = pay[23 : 23 + slen].decode("latin1", "replace").rstrip("\x00")
+            if name in renames:
+                new_n = renames[name].encode("latin1")
+                new_pay = pay[:21] + struct.pack("<H", len(new_n)) + new_n + pay[23 + slen :]
+                out += _riff_chunk(b"PRMB", new_pay)
+            else:
+                out += _riff_chunk(cid, pay)
+        elif cid == b"IBSB" and len(pay) >= 34:
+            new_pay = bytearray(pay)
+            ig = bytes(pay[:16])
+            if ig in ibg_to_target_bus:
+                new_pay[18:34] = ibg_to_target_bus[ig]
+            out += _riff_chunk(b"IBSB", bytes(new_pay))
+        else:
+            out += _riff_chunk(cid, pay)
+    return bytes(out)
+
+
+def _clone_events_in_proj(proj_buf: bytes, clones: list[tuple[bytes, bytes]]) -> bytes:
+    """Clona eventos especificados (src_guid -> dst_guid) dentro de LIST:EVTS."""
+    buf = bytearray(proj_buf)
+    for src_guid, dst_guid in clones:
+        for cid, ps, pe, pos in iter_riff_chunks(buf, 0, len(buf)):
+            if cid == b"LIST" and buf[ps : ps + 4] == b"EVTS":
+                evts_pay = buf[ps + 4 : pe]
+                items: list[tuple[bytes | None, bytes]] = []
+                target_evnt: bytes | None = None
+                for scid, sps, spe, spos in iter_riff_chunks(evts_pay, 0, len(evts_pay)):
+                    if scid == b"LCNT":
+                        continue
+                    sc_full = bytes(evts_pay[spos : spe + ((spe - sps) & 1)])
+                    eguid = None
+                    for sscid, ssps, sspe, _ in iter_riff_chunks(evts_pay, sps + 4, spe):
+                        if sscid == b"EVTB" and sspe - ssps >= 16:
+                            eguid = bytes(evts_pay[ssps : ssps + 16])
+                            break
+                    items.append((eguid, sc_full))
+                    if eguid == src_guid:
+                        target_evnt = sc_full
+                if target_evnt:
+                    cloned = bytearray(target_evnt)
+                    for sscid, ssps, sspe, _ in iter_riff_chunks(cloned, 12, len(cloned)):
+                        if sscid == b"EVTB" and sspe - ssps >= 16:
+                            cloned[ssps : ssps + 16] = dst_guid
+                            break
+                    items.append((dst_guid, bytes(cloned)))
+                    items.sort(key=lambda x: x[0] if x[0] else b"\xff" * 16)
+                    new_lcnt = _riff_chunk(b"LCNT", struct.pack("<I", len(items)))
+                    new_evts_body = b"EVTS" + new_lcnt + b"".join(c for _, c in items)
+                    new_evts_chunk = _riff_chunk(b"LIST", new_evts_body)
+                    pad_end = pe + ((pe - ps) & 1)
+                    buf = bytearray(buf[:pos] + new_evts_chunk + buf[pad_end:])
+                    break
+    return bytes(buf)
+
+
 def build_direct_ported_bank_from_ac(
     ac_bank: FmodBank,
     mod_identifier: str = "custom_mod",
@@ -2267,6 +2338,7 @@ def build_direct_ported_bank_from_ac(
     target_role_guids: dict[str, str | bytes] | None = None,
     target_role_paths: dict[str, str] | None = None,
     target_bank_guid: str | bytes | None = None,
+    target_param_names: set[str] | list[str] | None = None,
     is_ai_bank: bool = False,
 ) -> PortedBankResult:
     """Construye un nuevo archivo .bank para Automobilista 2 directamente desde un banco .bank de Assetto Corsa.
@@ -2312,36 +2384,17 @@ def build_direct_ported_bank_from_ac(
         elif cid == b"LIST" and ac_bank.raw[ps : ps + 4] == b"PROJ":
             orig_proj_payload = ac_bank.raw[ps + 4 : pe]
 
-    # 3. Parcheo binario de PROJ: 'rpms' -> 'rpm' en PRMB y actualización de IBSB a buses AMS2
-    proj_buf = bytearray(orig_proj_payload)
-    prmb_patched_count = 0
-    ibsb_patched_count = 0
+    # 3. Parcheo binario de PROJ: 'rpms' -> 'rpm', 'throttle' -> 'load' (según el vehículo) y buses IBSB a AMS2
+    renames: dict[str, str] = {"rpms": "rpm"}
+    if target_param_names is not None:
+        tp_set = set(target_param_names)
+        if "load" in tp_set or "throttle" not in tp_set:
+            renames["throttle"] = "load"
+    elif target_role_guids:
+        # En inyección vanilla de AMS2 por defecto modular sobre 'load' (Madness Engine)
+        renames["throttle"] = "load"
 
-    def walk_patch(s: int, e: int) -> None:
-        nonlocal prmb_patched_count, ibsb_patched_count
-        for scid, sps, spe, _ in iter_riff_chunks(proj_buf, s, e):
-            if scid == b"PRMB" and spe - sps >= 31:
-                p = proj_buf[sps:spe]
-                slen = struct.unpack_from("<H", p, 21)[0]
-                name = p[23 : 23 + slen].decode("utf-8", errors="replace").rstrip("\x00")
-                if name == "rpms":
-                    # Reducir tamaño de chunk en 1 byte (el byte impar se cubre con pad byte RIFF, 0 desplazamiento neto)
-                    new_csize = spe - sps - 1
-                    struct.pack_into("<I", proj_buf, sps - 4, new_csize)
-                    struct.pack_into("<H", proj_buf, sps + 21, 3)
-                    proj_buf[sps + 23 : sps + 26] = b"rpm"
-                    proj_buf[sps + 26 : spe - 1] = p[27:]
-                    proj_buf[spe - 1] = 0
-                    prmb_patched_count += 1
-            elif scid == b"IBSB" and spe - sps >= 34:
-                ig = bytes(proj_buf[sps : sps + 16])
-                if ig in ibg_to_target_bus:
-                    proj_buf[sps + 18 : sps + 34] = ibg_to_target_bus[ig]
-                    ibsb_patched_count += 1
-            elif scid == b"LIST":
-                walk_patch(sps + 4, spe)
-
-    walk_patch(0, len(proj_buf))
+    proj_buf = bytearray(_patch_prmb_and_ibsb_in_proj(orig_proj_payload, renames, ibg_to_target_bus))
 
     safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_mod"
     guid_map: dict[bytes, bytes] | None = None
@@ -2352,23 +2405,104 @@ def build_direct_ported_bank_from_ac(
 
     if target_role_guids:
         # Modo Destino Vanilla / Fijo: Asignar directamente los GUIDs nativos del vehículo base de AMS2
-        guid_map = {}
+        # Scoring para seleccionar UN ÚNICO evento primario por cada rol (evita GUIDs duplicados que crashean FMOD)
+        role_candidates: dict[str, list[tuple[int, FmodEventInfo]]] = {}
         for ev in ac_bank.events:
-            if ev.role in target_role_guids:
-                raw_tg = target_role_guids[ev.role]
+            p_low = (ev.path or "").lower()
+            for target_role in target_role_guids:
+                score = 0
+                r_low = target_role.lower()
+                if ev.role == target_role:
+                    score += 50
+                if r_low == "engineint" and any(k in p_low for k in ("engine_int", "int_engine", "cockpit", "cabin")):
+                    score += 100
+                elif r_low == "engineext" and any(k in p_low for k in ("engine_ext", "ext_engine", "exterior")):
+                    score += 100
+                elif r_low == "exhaust" and any(k in p_low for k in ("exhaust", "tailpipe", "muffler")):
+                    score += 100
+                elif r_low == "gearshiftint" and any(k in p_low for k in ("gear_int", "shift_int")):
+                    score += 100
+                elif r_low == "gearshiftext" and any(k in p_low for k in ("gear_ext", "shift_ext")):
+                    score += 100
+                elif r_low == "backfireext" and any(k in p_low for k in ("backfire_ext", "backfire")):
+                    score += 100
+                elif r_low == "backfireint" and any(k in p_low for k in ("backfire_int",)):
+                    score += 100
+                elif ev.role and ev.role.lower() == r_low:
+                    score += 30
+
+                if score > 0:
+                    score += len(ev.linked_samples)
+                    role_candidates.setdefault(target_role, []).append((score, ev))
+
+        assigned_role_for_ev_idx: dict[int, str] = {}
+        assigned_roles: set[str] = set()
+        role_priority = ["EngineInt", "EngineExt", "Exhaust", "AuxInt", "GearshiftInt", "GearshiftExt", "BackfireExt", "BackfireInt", "Starting"]
+        sorted_roles = sorted(target_role_guids.keys(), key=lambda r: role_priority.index(r) if r in role_priority else 99)
+
+        for target_role in sorted_roles:
+            cands = role_candidates.get(target_role, [])
+            cands.sort(key=lambda x: -x[0])
+            for score, ev in cands:
+                if ev.index not in assigned_role_for_ev_idx:
+                    assigned_role_for_ev_idx[ev.index] = target_role
+                    assigned_roles.add(target_role)
+                    break
+
+        guid_map = {}
+        used_guids: set[bytes] = set()
+
+        # 1. Mapear eventos primarios asignados
+        for ev in ac_bank.events:
+            if ev.index in assigned_role_for_ev_idx:
+                target_role = assigned_role_for_ev_idx[ev.index]
+                raw_tg = target_role_guids[target_role]
                 tg_b = guid_str_to_bytes(raw_tg) if isinstance(raw_tg, str) else bytes(raw_tg)
                 guid_map[ev.guid_bytes] = tg_b
+                used_guids.add(tg_b)
                 event_guid_map[ev.guid_str] = bytes_to_guid_str(tg_b)
-                role_to_event_guid[ev.role] = bytes_to_guid_str(tg_b)
-                ev_path = (target_role_paths or {}).get(ev.role) or (ev.path or f"event:/AMS2/Vehicles/{safe_mod}/{ev.role}")
-                role_to_event_path[ev.role] = ev_path
+                role_to_event_guid[target_role] = bytes_to_guid_str(tg_b)
+                ev_path = (target_role_paths or {}).get(target_role) or (ev.path or f"event:/AMS2/Vehicles/{safe_mod}/{target_role}")
+                role_to_event_path[target_role] = ev_path
                 stdt_entries.append((ev_path, tg_b))
-            else:
-                event_guid_map[ev.guid_str] = ev.guid_str
-                role_to_event_guid[ev.role] = ev.guid_str
-                clean_path = ev.path or f"event:/AMS2/Vehicles/{safe_mod}/{ev.role}_{ev.index}"
-                role_to_event_path[ev.role] = clean_path
-                stdt_entries.append((clean_path, ev.guid_bytes))
+
+        # 2. Mapear eventos secundarios / auxiliares (garantizando estricta unicidad memcmp de GUIDs)
+        for ev in ac_bank.events:
+            if ev.index not in assigned_role_for_ev_idx:
+                cand_guid = ev.guid_bytes
+                if cand_guid in used_guids:
+                    cand_guid = hashlib.sha256(cand_guid + safe_mod.encode("utf-8") + struct.pack("<I", ev.index)).digest()[:16]
+                guid_map[ev.guid_bytes] = cand_guid
+                used_guids.add(cand_guid)
+                event_guid_map[ev.guid_str] = bytes_to_guid_str(cand_guid)
+                sec_path = ev.path or f"event:/AMS2/Vehicles/{safe_mod}/Aux_{ev.role}_{ev.index}"
+                role_to_event_path[ev.role] = sec_path
+                stdt_entries.append((sec_path, cand_guid))
+
+        # 3. Clonado de eventos para roles nativos de AMS2 faltantes en el .bank de AC (e.g. Exhaust, Starting)
+        clones: list[tuple[bytes, bytes]] = []
+        if "Exhaust" in target_role_guids and "Exhaust" not in assigned_roles:
+            p_ext = next((ev for ev in ac_bank.events if assigned_role_for_ev_idx.get(ev.index) == "EngineExt"), None)
+            if p_ext:
+                ex_b = guid_str_to_bytes(target_role_guids["Exhaust"])
+                clones.append((p_ext.guid_bytes, ex_b))
+                ex_path = (target_role_paths or {}).get("Exhaust") or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust"
+                role_to_event_guid["Exhaust"] = bytes_to_guid_str(ex_b)
+                role_to_event_path["Exhaust"] = ex_path
+                stdt_entries.append((ex_path, ex_b))
+
+        if "Starting" in target_role_guids and "Starting" not in assigned_roles:
+            p_int = next((ev for ev in ac_bank.events if assigned_role_for_ev_idx.get(ev.index) == "EngineInt"), None)
+            if p_int:
+                st_b = guid_str_to_bytes(target_role_guids["Starting"])
+                clones.append((p_int.guid_bytes, st_b))
+                st_path = (target_role_paths or {}).get("Starting") or f"event:/AMS2/Vehicles/{safe_mod}/Starting"
+                role_to_event_guid["Starting"] = bytes_to_guid_str(st_b)
+                role_to_event_path["Starting"] = st_path
+                stdt_entries.append((st_path, st_b))
+
+        if clones:
+            proj_buf = bytearray(_clone_events_in_proj(bytes(proj_buf), clones))
 
         if target_bank_guid:
             raw_bg = target_bank_guid

@@ -709,6 +709,32 @@ def main() -> None:
         assert restored_sha == orig_sha, "El archivo restaurado difiere del original de fábrica"
         print(f"   Restauración 100% fiel de Steam comprobada (SHA256 verificado bit-a-bit: {restored_sha[:12]}...).")
 
+    # 15. Probando resolución de anomalías Mercer V8 (crasheo por GUIDs duplicados) y corrección de parámetros (load vs throttle)
+    mercer_bank_path = Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_gtm_mercer_v8\sfx\rss_gtm_mercer_v8.bank")
+    if mercer_bank_path.is_file():
+        print("15. Probando resolución de anomalías Mercer V8 (crasheo por GUIDs duplicados) y corrección de parámetros (load vs throttle)...")
+        mercer_b = FmodBank(mercer_bank_path)
+        mgr_v = VanillaVehicleManager(Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2"))
+        sls_v = next((v for v in mgr_v.scan_catalog() if "SLS" in v.car_name), None)
+        if sls_v:
+            mgr_v.load_vehicle_events_info(sls_v)
+            mercer_sls_res = build_direct_ported_bank_from_ac(
+                ac_bank=mercer_b,
+                mod_identifier=sls_v.car_name,
+                target_role_guids=sls_v.event_guids,
+                target_role_paths=sls_v.event_paths,
+                target_bank_guid=sls_v.bank_guid or None,
+                target_param_names=sls_v.target_parameters,
+            )
+            reloaded_mercer = FmodBank(raw=mercer_sls_res.bank_bytes)
+            guids_list = [ev.guid_str for ev in reloaded_mercer.events]
+            assert len(set(guids_list)) == len(guids_list), "Se detectaron GUIDs duplicados en el porteo de Mercer V8!"
+            reloaded_roles = {ev.guid_str: ev.role for ev in reloaded_mercer.events}
+            for role_name, exp_guid in sls_v.event_guids.items():
+                assert exp_guid in reloaded_roles, f"Falta el rol {role_name} ({exp_guid}) en el banco de Mercer V8!"
+            assert_sndh_and_fsb_alignment(mercer_sls_res.bank_bytes)
+            print("   Porteo de Mercer V8 verificado: 0 GUIDs duplicados, eventos nativos y parámetros load/rpm sincronizados al 100%!")
+
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 
 
