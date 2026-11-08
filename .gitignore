@@ -23,6 +23,7 @@ env/
 .tox/
 .coverage
 tests
+backups
 .coverage.*
 .pytest_cache/
 htmlcov/
