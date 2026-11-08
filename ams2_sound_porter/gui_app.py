@@ -5,6 +5,7 @@ import ctypes
 import os
 import queue
 import re
+import struct
 import subprocess
 import tempfile
 import threading
@@ -12,6 +13,7 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Any
 
 try:
     import winsound
@@ -179,6 +181,8 @@ class SoundPorterApp(tk.Tk):
         )
         self.vanilla_auto_backup_var = tk.BooleanVar(value=True)
         self.vanilla_sync_ai_var = tk.BooleanVar(value=True)
+        self.vanilla_mute_ai_pops_var = tk.BooleanVar(value=True)
+        self.mute_all_pops_var = tk.BooleanVar(value=False)
         self.vanilla_filtered_vehicles: list[VanillaVehicle] = []
         self.vanilla_export_dest_var = tk.StringVar(value="Ningún vehículo vanilla seleccionado.")
 
@@ -830,7 +834,13 @@ class SoundPorterApp(tk.Tk):
             text="➖",
             width=3,
             command=self.cmd_delete_rpm_band,
-        ).pack(side="left", padx=(2, 10))
+        ).pack(side="left", padx=(2, 6))
+        self.btn_toggle_pops = ttk.Button(
+            view_bar,
+            text="🔇 Silenciar POPS / Petardeos",
+            command=self.cmd_toggle_all_pops,
+        )
+        self.btn_toggle_pops.pack(side="left", padx=(6, 10))
         ttk.Label(view_bar, textvariable=self.rpm_overlap_status_var, style="CardMuted.TLabel").pack(side="right")
 
         self.rpm_canvas = tk.Canvas(
@@ -1394,6 +1404,12 @@ class SoundPorterApp(tk.Tk):
             variable=self.vanilla_sync_ai_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
 
+        ttk.Checkbutton(
+            self.vanilla_cfg_card,
+            text="🔇 Silenciar petardeos y rateo (POPS / Limiter) en vistas de Repetición / TV Replay y autos de la IA (Recomendado)",
+            variable=self.vanilla_mute_ai_pops_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
+
         # Tarjeta 2: Opciones avanzadas de ingeniería FMOD
         self.opts_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
         self.opts_card.pack(fill="x", pady=(0, 12))
@@ -1401,6 +1417,12 @@ class SoundPorterApp(tk.Tk):
         ttk.Label(self.opts_card, text="Opciones de Ingeniería FMOD", style="CardSection.TLabel").pack(
             anchor="w", pady=(0, 8)
         )
+
+        ttk.Checkbutton(
+            self.opts_card,
+            text="🔇 Silenciar completamente la banda de POPS (Petardeos) en la exportación",
+            variable=self.mute_all_pops_var,
+        ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
             self.opts_card,
@@ -2543,6 +2565,58 @@ class SoundPorterApp(tk.Tk):
         self._refresh_rpm_tab()
         self._on_rpm_band_selected()
         self.status_var.set(f"✔ Banda #{idx:02d} silenciada. Su pista física queda disponible para reasignar.")
+
+    def cmd_toggle_all_pops(self) -> None:
+        """Silencia o reactiva todas las bandas de POPS / petardeos con un solo clic."""
+        if not self.rpm_bands:
+            return
+        pops_bands = [b for b in self.rpm_bands if b.load_role == "pops"]
+        if not pops_bands:
+            messagebox.showinfo("POPS", "No hay bandas clasificadas con rol POPS en el banco activo.")
+            return
+
+        any_active = any(not b.is_muted_bus and b.rpm_max > b.rpm_min for b in pops_bands)
+        if any_active:
+            # Silenciar todas las bandas POPS
+            for b in pops_bands:
+                b.is_muted_bus = True
+                b.rpm_min = 0.0
+                b.fade_in_end = 0.0
+                b.fade_out_start = 0.0
+                b.rpm_max = 0.0
+                for gidx in b.donor_slot_indices:
+                    if 0 <= gidx < len(self.mappings):
+                        self.mappings[gidx].action = "silence"
+                        self.mappings[gidx].gain_db = -96.0
+                        self.mappings[gidx].match_reason = "POPS silenciado por el usuario"
+            if hasattr(self, "btn_toggle_pops"):
+                self.btn_toggle_pops.config(text="🔊 Reactivar POPS")
+            self.status_var.set(f"🔇 Todas las bandas de POPS ({len(pops_bands)}) han sido silenciadas exitosamente.")
+        else:
+            # Reactivar todas las bandas POPS
+            for b in pops_bands:
+                b.is_muted_bus = False
+                if b.orig_rpm_max > b.orig_rpm_min:
+                    b.rpm_min = b.orig_rpm_min
+                    b.fade_in_end = b.orig_fade_in_end
+                    b.fade_out_start = b.orig_fade_out_start
+                    b.rpm_max = b.orig_rpm_max
+                else:
+                    b.rpm_min = 5500.0
+                    b.fade_in_end = 6000.0
+                    b.fade_out_start = 8500.0
+                    b.rpm_max = 8500.0
+                for gidx in b.donor_slot_indices:
+                    if 0 <= gidx < len(self.mappings):
+                        self.mappings[gidx].action = "keep_donor"
+                        self.mappings[gidx].gain_db = 0.0
+            if hasattr(self, "btn_toggle_pops"):
+                self.btn_toggle_pops.config(text="🔇 Silenciar POPS / Petardeos")
+            self.status_var.set(f"🔊 Bandas de POPS ({len(pops_bands)}) reactivadas.")
+
+        self._refresh_donor_tree()
+        self._refresh_rpm_tab()
+        self._draw_rpm_bands_canvas()
 
     def cmd_pick_band_custom_wav(self) -> None:
         """Abre un explorador de archivos para asignar un WAV local directamente a la banda."""
@@ -4451,6 +4525,7 @@ class SoundPorterApp(tk.Tk):
                         target_ctrl_params=veh.ctrl_parameters,
                         target_role_buses=getattr(veh, "ai_event_buses", None),
                         rpm_bands=bands_to_export,
+                        mute_secondary_pops=self.mute_all_pops_var.get(),
                         native_bank_path=native_p,
                     )
                     bank_bytes = direct_res.bank_bytes
@@ -4470,9 +4545,51 @@ class SoundPorterApp(tk.Tk):
                     bank_bytes = donor_res.bank_bytes
 
                 # 2. Configurar banco de la IA si está marcado y existe
-                # Enfoque fiel de v1: el banco de IA comparte el mismo sonido y eventos 1:1, asegurando que suene idéntico
-                # en carreras contra rivales y en cámaras de repetición / TV sin desincronizaciones ni cámaras mudas.
-                ai_bytes: bytes | None = bank_bytes if (sync_ai and veh.ai_bank_path) else None
+                # Genera el banco de IA (_AI.bank) preservando curvas de distancia 3D y silenciando rateos/pops
+                ai_bytes: bytes | None = None
+                if sync_ai and veh.ai_bank_path:
+                    veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
+                    native_ai_p = (
+                        veh_backup_folder / veh.ai_bank_path.name
+                        if (veh_backup_folder / veh.ai_bank_path.name).is_file()
+                        else veh.ai_bank_path
+                    )
+                    mute_ai = self.vanilla_mute_ai_pops_var.get()
+                    if native_ai_p.is_file():
+                        ai_donor = FmodBank(native_ai_p)
+                        ai_mappings = auto_map_samples(ai_donor, self.source_lib) if self.source_lib else []
+                        if mute_ai:
+                            for i, m in enumerate(ai_mappings):
+                                sl = ai_donor.slots[i]
+                                if sl.load_role in ("pops", "throttle_cut") or "limiter" in sl.name.lower():
+                                    m.action = "silence"
+                                    m.gain_db = -96.0
+                                    m.match_reason = "Silenciado para Replay / IA limpia"
+                        ai_donor_res = build_ported_bank(
+                            donor=ai_donor,
+                            mappings=ai_mappings,
+                            library=self.source_lib,
+                            mod_identifier=f"{veh.car_name}_AI",
+                            standalone_guids=False,
+                            sync_autopitch=sync_pitch,
+                            output_codec_mode=codec_mode,
+                        )
+                        ai_bytes = ai_donor_res.bank_bytes
+                    elif is_direct and self.source_lib and self.source_lib.fmod_bank:
+                        ai_direct_res = build_direct_ported_bank_from_ac(
+                            ac_bank=self.source_lib.fmod_bank,
+                            mod_identifier=f"{veh.car_name}_AI",
+                            standalone_guids=False,
+                            target_role_guids=veh.ai_event_guids,
+                            target_role_paths=veh.ai_event_paths,
+                            target_bank_guid=veh.ai_bank_guid or None,
+                            target_param_names=veh.target_parameters,
+                            target_ctrl_params=veh.ctrl_parameters,
+                            target_role_buses=getattr(veh, "ai_event_buses", None),
+                            is_ai_bank=True,
+                            mute_secondary_pops=mute_ai,
+                        )
+                        ai_bytes = ai_direct_res.bank_bytes
 
                 # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) si existe
                 csd_bytes: bytes | None = None

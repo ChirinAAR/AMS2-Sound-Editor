@@ -544,12 +544,30 @@ def auto_distribute_rpm_bands(
             b.rpm_max = float(idle_fade_end)
 
         # 2. Bandas POPS / Petardeos
-        pops_start = round(max(idle_fade_end, max_rpm * 0.40))
         for b in [x for x in ev_bands if x.load_role == "pops"]:
-            b.rpm_min = float(pops_start)
-            b.fade_in_end = float(min(ceil_rpm - 100.0, pops_start + 450.0))
-            b.fade_out_start = float(ceil_rpm)
-            b.rpm_max = float(ceil_rpm)
+            if b.is_muted_bus:
+                b.rpm_min = 0.0
+                b.fade_in_end = 0.0
+                b.fade_out_start = 0.0
+                b.rpm_max = 0.0
+                continue
+            is_limiter = "limiter" in (b.donor_label or "").lower() or any(
+                0 <= g < len(mappings_or_donor if isinstance(mappings_or_donor, list) else [])
+                and "limiter" in str(b.donor_label).lower()
+                for g in b.donor_slot_indices
+            )
+            if is_limiter:
+                lim_min = round(max(max_rpm * 0.96, max_rpm - 250.0))
+                b.rpm_min = float(lim_min)
+                b.fade_in_end = float(round(max_rpm))
+                b.fade_out_start = float(ceil_rpm)
+                b.rpm_max = float(ceil_rpm)
+            else:
+                pops_start = round(max(idle_fade_end, max_rpm * 0.70))
+                b.rpm_min = float(pops_start)
+                b.fade_in_end = float(min(ceil_rpm - 100.0, pops_start + 450.0))
+                b.fade_out_start = float(ceil_rpm)
+                b.rpm_max = float(ceil_rpm)
 
         # 3. Escalera limpia sin solapamientos para ON y OFF por separado
         for lrole in ("on", "off"):
@@ -686,7 +704,20 @@ def auto_distribute_single_rpm_band(
 
     # 2. Banda de Petardeos (POPS)
     if target_band.load_role == "pops":
-        pops_start = round(max(idle_fade_end, max_rpm * 0.40))
+        if target_band.is_muted_bus:
+            target_band.rpm_min = 0.0
+            target_band.fade_in_end = 0.0
+            target_band.fade_out_start = 0.0
+            target_band.rpm_max = 0.0
+            return target_band
+        if "limiter" in (target_band.donor_label or "").lower():
+            lim_min = round(max(max_rpm * 0.96, max_rpm - 250.0))
+            target_band.rpm_min = float(lim_min)
+            target_band.fade_in_end = float(round(max_rpm))
+            target_band.fade_out_start = float(ceil_rpm)
+            target_band.rpm_max = float(ceil_rpm)
+            return target_band
+        pops_start = round(max(idle_fade_end, max_rpm * 0.70))
         target_band.rpm_min = float(pops_start)
         target_band.fade_in_end = float(min(ceil_rpm - 100.0, pops_start + 450.0))
         target_band.fade_out_start = float(ceil_rpm)
@@ -1668,10 +1699,16 @@ def _patch_proj_chunks(
 
     if rpm_bands:
         for b in rpm_bands:
-            rmin = max(0.0, float(b.rpm_min))
-            rmax = max(rmin + 10.0, float(b.rpm_max))
-            fi_end = max(rmin, min(rmax, float(b.fade_in_end)))
-            fo_start = max(rmin, min(rmax, float(b.fade_out_start)))
+            if b.is_muted_bus:
+                rmin = 0.0
+                rmax = 0.0
+                fi_end = 0.0
+                fo_start = 0.0
+            else:
+                rmin = max(0.0, float(b.rpm_min))
+                rmax = max(rmin + 10.0, float(b.rpm_max))
+                fi_end = max(rmin, min(rmax, float(b.fade_in_end)))
+                fo_start = max(rmin, min(rmax, float(b.fade_out_start)))
             pmlb_box_updates.setdefault((b.pml_guid, b.event_guid), []).append(b)
             if b.fade_in_curv_guid is not None:
                 fade_in_curv_updates[b.fade_in_curv_guid] = (rmin, fi_end, rmax)
@@ -1712,9 +1749,12 @@ def _patch_proj_chunks(
                             if 0 <= b_cfg.box_index < nboxes:
                                 boff = ps + 52 + b_cfg.box_index * stride
                                 if boff + 24 <= pe:
-                                    rmin = max(0.0, float(b_cfg.rpm_min))
-                                    rmax = max(rmin + 10.0, float(b_cfg.rpm_max))
-                                    struct.pack_into("<ff", buf, boff + 16, rmin, rmax - rmin)
+                                    if b_cfg.is_muted_bus:
+                                        struct.pack_into("<ff", buf, boff + 16, 0.0, 0.0)
+                                    else:
+                                        rmin = max(0.0, float(b_cfg.rpm_min))
+                                        rmax = max(rmin + 10.0, float(b_cfg.rpm_max))
+                                        struct.pack_into("<ff", buf, boff + 16, rmin, rmax - rmin)
             elif cid == b"CURV" and (fade_in_curv_updates or fade_out_curv_updates or bus_cutoff_max_rpm) and pe - ps >= 52:
                 cg = bytes(buf[ps : ps + 16])
                 cnt = struct.unpack_from("<H", buf, ps + 32)[0] >> 1
@@ -1722,7 +1762,10 @@ def _patch_proj_chunks(
                 if cnt >= 2 and stride >= 8 and ps + 36 + cnt * stride <= pe:
                     if cg in fade_in_curv_updates:
                         rmin, fi_end, rmax = fade_in_curv_updates[cg]
-                        if fi_end <= rmin + 1.0:
+                        if rmin == 0.0 and rmax == 0.0:
+                            struct.pack_into("<ff", buf, ps + 36, 0.0, 0.0)
+                            struct.pack_into("<ff", buf, ps + 36 + stride, 0.0, 0.0)
+                        elif fi_end <= rmin + 1.0:
                             struct.pack_into("<ff", buf, ps + 36, rmin, 1.0)
                             struct.pack_into("<ff", buf, ps + 36 + stride, min(rmax, rmin + 1.0), 1.0)
                         else:
@@ -1730,7 +1773,10 @@ def _patch_proj_chunks(
                             struct.pack_into("<ff", buf, ps + 36 + stride, fi_end, 1.0)
                     elif cg in fade_out_curv_updates:
                         rmin, fo_start, rmax = fade_out_curv_updates[cg]
-                        if fo_start >= rmax - 1.0:
+                        if rmin == 0.0 and rmax == 0.0:
+                            struct.pack_into("<ff", buf, ps + 36, 0.0, 0.0)
+                            struct.pack_into("<ff", buf, ps + 36 + stride, 0.0, 0.0)
+                        elif fo_start >= rmax - 1.0:
                             struct.pack_into("<ff", buf, ps + 36, max(rmin, rmax - 1.0), 1.0)
                             struct.pack_into("<ff", buf, ps + 36 + stride, rmax, 1.0)
                         else:
@@ -2443,6 +2489,7 @@ def build_direct_ported_bank_from_ac(
     target_ctrl_params: set[str] | list[str] | None = None,
     target_role_buses: dict[str, str | bytes] | None = None,
     is_ai_bank: bool = False,
+    mute_secondary_pops: bool = False,
     native_bank_path: Path | str | None = None,
 ) -> PortedBankResult:
     """Construye un nuevo archivo .bank para Automobilista 2 directamente desde un banco .bank de Assetto Corsa.
@@ -2463,13 +2510,28 @@ def build_direct_ported_bank_from_ac(
     """
     EXT_BUS = guid_str_to_bytes("{c1986fb5-b329-4565-8342-b223857006d5}")
     INT_BUS = guid_str_to_bytes("{a8959bf6-0b54-43ea-9d9a-06a8831c40d4}")
+    MULTIVIEW_BUS = guid_str_to_bytes("{27ec50dd-048b-4f5d-88f7-481c376f3b1c}")
+    MUTE_BUS = guid_str_to_bytes("{00000000-0000-0000-0000-000000000000}")
 
-    # 1. Asociar cada evento de AC a su bus correspondiente en AMS2 (Exterior o Cockpit)
+    should_mute_pops = is_ai_bank or mute_secondary_pops
+
+    # 1. Asociar cada evento de AC a su bus correspondiente en AMS2 (Exterior o Cockpit o MultiView o Silenciado)
     ibg_to_target_bus: dict[bytes, bytes] = {}
     for ev in ac_bank.events:
         if not ev.ibus_guid_bytes:
             continue
         p_low = (ev.path or "").lower()
+
+        # Si se solicita silenciar rateo / petardeos o es banco de IA:
+        # Silenciar backfires, limiter, tc y cualquier evento secundario sin curva de distancia/rpm
+        if should_mute_pops and (
+            ev.role in ("BackfireExt", "BackfireInt", "Limiter")
+            or any(k in p_low for k in ("backfire", "limiter", "tractioncontrol", "door", "horn"))
+            or (is_ai_bank and not any(p[0].lower() in ("rpm", "rpms", "distance") for p in ev.parameters))
+        ):
+            ibg_to_target_bus[ev.ibus_guid_bytes] = MUTE_BUS
+            continue
+
         is_ext = (
             ev.role in ("EngineExt", "GearshiftExt", "BackfireExt")
             or "_ext" in p_low
@@ -2477,7 +2539,10 @@ def build_direct_ported_bank_from_ac(
             or p_low.endswith("ext")
             or any(k in p_low for k in ("exterior", "rear", "external", "chase", "skid_ext", "tractioncontrol_ext"))
         )
-        ibg_to_target_bus[ev.ibus_guid_bytes] = EXT_BUS if is_ext else INT_BUS
+        if is_ai_bank and is_ext:
+            ibg_to_target_bus[ev.ibus_guid_bytes] = MULTIVIEW_BUS
+        else:
+            ibg_to_target_bus[ev.ibus_guid_bytes] = EXT_BUS if is_ext else INT_BUS
 
     # 2. Extraer FMT y PROJ originales del banco de AC
     fmt_payload = struct.pack("<II", ac_bank.file_version or 0x50, ac_bank.compat_version or 0x46)
@@ -2544,6 +2609,28 @@ def build_direct_ported_bank_from_ac(
             role_to_event_path["EngineInt"] = ei_path
             stdt_entries.append((ei_path, ei_bg))
 
+        # Mapeo de roles de IA en vehiculos vanilla si aplica (ai_engine_*)
+        if is_ai_bank:
+            for ai_role in ("ai_engine_ext", "ai_engine_main", "ai_engine_live"):
+                if ai_role in target_role_guids and p_ext:
+                    ai_bg = guid_str_to_bytes(target_role_guids[ai_role])
+                    if p_ext.guid_bytes not in guid_map:
+                        guid_map[p_ext.guid_bytes] = ai_bg
+                    used_guids.add(ai_bg)
+                    role_to_event_guid[ai_role] = bytes_to_guid_str(ai_bg)
+                    ai_p = (target_role_paths or {}).get(ai_role) or f"event:/AMS2/Vehicles/{safe_mod}/{ai_role}"
+                    role_to_event_path[ai_role] = ai_p
+                    stdt_entries.append((ai_p, ai_bg))
+            if "ai_engine_int" in target_role_guids and p_int:
+                ai_int_bg = guid_str_to_bytes(target_role_guids["ai_engine_int"])
+                if p_int.guid_bytes not in guid_map:
+                    guid_map[p_int.guid_bytes] = ai_int_bg
+                used_guids.add(ai_int_bg)
+                role_to_event_guid["ai_engine_int"] = bytes_to_guid_str(ai_int_bg)
+                ai_int_p = (target_role_paths or {}).get("ai_engine_int") or f"event:/AMS2/Vehicles/{safe_mod}/ai_engine_int"
+                role_to_event_path["ai_engine_int"] = ai_int_p
+                stdt_entries.append((ai_int_p, ai_int_bg))
+
         # Comprobar si AC tiene evento de encendido / starter
         starter_ac_ev = next(
             (ev for ev in ac_bank.events if any(k in (ev.path or "").lower() or k in (ev.role or "").lower() for k in ("starter", "starting", "startup", "start_ext", "start_int", "ignition"))),
@@ -2589,16 +2676,6 @@ def build_direct_ported_bank_from_ac(
                 (ev for ev in ac_bank.events if any(k in (ev.path or "").lower() for k in ("exhaust", "tailpipe", "muffler"))),
                 None,
             )
-            if not ex_ev:
-                ex_ev = next(
-                    (ev for ev in ac_bank.events if ev.role == "BackfireExt" or "backfire_ext" in (ev.path or "").lower()),
-                    None,
-                )
-            if not ex_ev and p_ext:
-                ex_ev = next(
-                    (ev for ev in ext_cands if ev.index != (p_ext.index if p_ext else -1)),
-                    None,
-                )
             if ex_ev and ex_ev.guid_bytes not in guid_map:
                 guid_map[ex_ev.guid_bytes] = ex_bg
                 used_guids.add(ex_bg)
@@ -2606,6 +2683,25 @@ def build_direct_ported_bank_from_ac(
                 ex_path = (target_role_paths or {}).get("Exhaust") or (ex_ev.path or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust")
                 role_to_event_path["Exhaust"] = ex_path
                 stdt_entries.append((ex_path, ex_bg))
+            else:
+                # Si AC no posee escape dedicado, extraer el chunk nativo de Exhaust desde el banco base
+                # para preservar el bus y parámetros originales sin generar petardeos continuos erróneos
+                ex_evnts = []
+                ex_ibses = []
+                if native_bank_path and Path(native_bank_path).is_file():
+                    ex_evnts, ex_ibses = extract_native_starters(Path(native_bank_path), [ex_bg])
+                if not ex_evnts:
+                    EXHAUST_BUS = guid_str_to_bytes("{ffe57d5c-46ed-4b06-86d5-8fa6f8ffdf07}")
+                    ex_ibg = hashlib.sha256(ex_bg + b"_ibus_ams2").digest()[:16]
+                    ex_evnts.append((ex_bg, _make_trigger_evnt(ex_bg, ex_ibg, EXHAUST_BUS)))
+                    ex_ibses.append((ex_ibg, _make_trigger_ibus(ex_ibg, EXHAUST_BUS)))
+                if ex_evnts:
+                    proj_buf = bytearray(inject_native_chunks_in_proj(bytes(proj_buf), ex_evnts, ex_ibses))
+                    used_guids.add(ex_bg)
+                    role_to_event_guid["Exhaust"] = bytes_to_guid_str(ex_bg)
+                    ex_path = (target_role_paths or {}).get("Exhaust") or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust"
+                    role_to_event_path["Exhaust"] = ex_path
+                    stdt_entries.append((ex_path, ex_bg))
 
         # Asignar resto de eventos secundarios de AC con GUIDs únicos garantizados
         for ev in ac_bank.events:
@@ -2915,6 +3011,7 @@ def export_ams2_mod_package(
     direct_ac_bank: FmodBank | None = None,
     build_ai_bank: bool = True,
     optimize_chase_cam: bool = True,
+    mute_ai_pops: bool = True,
 ) -> ModExportSummary:
     """Compila el .bank y el .csdbin listos para copiar en Automobilista 2 / AMS2 Content Manager."""
     output_root = Path(output_root)
@@ -2969,12 +3066,19 @@ def export_ams2_mod_package(
                 standalone_guids=standalone_guids,
                 rpm_bands=rpm_bands,
                 is_ai_bank=True,
+                mute_secondary_pops=mute_ai_pops,
             )
         elif donor is not None and donor.source_path is not None:
             companion_ai = donor.source_path.parent / f"{donor.source_path.stem}_AI.bank"
             if companion_ai.is_file():
                 ai_donor = FmodBank(companion_ai)
                 ai_mappings = auto_map_samples(ai_donor, library) if library else []
+                if mute_ai_pops:
+                    for i, m in enumerate(ai_mappings):
+                        sl = ai_donor.slots[i]
+                        if sl.load_role in ("pops", "throttle_cut") or "limiter" in sl.name.lower():
+                            m.action = "silence"
+                            m.gain_db = -96.0
                 ai_bank_res = build_ported_bank(
                     donor=ai_donor,
                     mappings=ai_mappings,
@@ -2992,6 +3096,7 @@ def export_ams2_mod_package(
                     standalone_guids=standalone_guids,
                     rpm_bands=rpm_bands,
                     is_ai_bank=True,
+                    mute_secondary_pops=mute_ai_pops,
                 )
         elif library and library.fmod_bank:
             ai_bank_res = build_direct_ported_bank_from_ac(
@@ -3000,6 +3105,7 @@ def export_ams2_mod_package(
                 standalone_guids=standalone_guids,
                 rpm_bands=rpm_bands,
                 is_ai_bank=True,
+                mute_secondary_pops=mute_ai_pops,
             )
 
         if ai_bank_res is not None:
