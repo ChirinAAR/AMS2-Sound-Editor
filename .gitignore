@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.env
+.venv
+venv/
+ENV/
+env/
+
+# Testing
+.tox/
+.coverage
+tests
+.coverage.*
+.pytest_cache/
+htmlcov/
+.cache
+
+# Type checkers
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+

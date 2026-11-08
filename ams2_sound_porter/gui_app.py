@@ -4434,15 +4434,24 @@ class SoundPorterApp(tk.Tk):
                 bank_bytes: bytes
                 if is_direct:
                     assert self.source_lib and self.source_lib.fmod_bank
+                    veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
+                    native_p = (
+                        veh_backup_folder / veh.bank_path.name
+                        if (veh_backup_folder / veh.bank_path.name).is_file()
+                        else veh.bank_path
+                    )
                     direct_res = build_direct_ported_bank_from_ac(
                         ac_bank=self.source_lib.fmod_bank,
                         mod_identifier=veh.car_name,
+                        standalone_guids=False,
                         target_role_guids=veh.event_guids,
                         target_role_paths=veh.event_paths,
                         target_bank_guid=veh.bank_guid or None,
                         target_param_names=veh.target_parameters,
                         target_ctrl_params=veh.ctrl_parameters,
+                        target_role_buses=getattr(veh, "ai_event_buses", None),
                         rpm_bands=bands_to_export,
+                        native_bank_path=native_p,
                     )
                     bank_bytes = direct_res.bank_bytes
                 else:
@@ -4460,38 +4469,10 @@ class SoundPorterApp(tk.Tk):
                     )
                     bank_bytes = donor_res.bank_bytes
 
-                # 2. Compilar banco de la IA si está marcado y existe (cubre rivales en pista y cámara de TV / Replay)
-                ai_bytes: bytes | None = None
-                if sync_ai and veh.ai_bank_path and veh.ai_bank_path.is_file():
-                    self.dispatch_to_ui(self._append_log, f"  Compilando banco de IA y TV Replays '{veh.ai_bank_path.name}'...")
-                    if is_direct:
-                        assert self.source_lib and self.source_lib.fmod_bank
-                        ai_direct_res = build_direct_ported_bank_from_ac(
-                            ac_bank=self.source_lib.fmod_bank,
-                            mod_identifier=f"{veh.car_name}_AI",
-                            target_role_guids=veh.ai_event_guids,
-                            target_role_paths=veh.ai_event_paths,
-                            target_bank_guid=veh.ai_bank_guid or None,
-                            target_param_names=veh.target_parameters,
-                            target_ctrl_params=veh.ctrl_parameters,
-                            is_ai_bank=True,
-                            rpm_bands=bands_to_export,
-                        )
-                        ai_bytes = ai_direct_res.bank_bytes
-                    else:
-                        ai_donor = FmodBank(veh.ai_bank_path)
-                        ai_mappings = auto_map_samples(ai_donor, self.source_lib)
-                        ai_res = build_ported_bank(
-                            donor=ai_donor,
-                            library=self.source_lib,
-                            mappings=ai_mappings,
-                            mod_identifier=f"{veh.car_name}_AI",
-                            standalone_guids=False,
-                            sync_autopitch=sync_pitch,
-                            output_codec_mode=codec_mode,
-                            force_sample_rate=48000,
-                        )
-                        ai_bytes = ai_res.bank_bytes
+                # 2. Configurar banco de la IA si está marcado y existe
+                # Enfoque fiel de v1: el banco de IA comparte el mismo sonido y eventos 1:1, asegurando que suene idéntico
+                # en carreras contra rivales y en cámaras de repetición / TV sin desincronizaciones ni cámaras mudas.
+                ai_bytes: bytes | None = bank_bytes if (sync_ai and veh.ai_bank_path) else None
 
                 # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) si existe
                 csd_bytes: bytes | None = None

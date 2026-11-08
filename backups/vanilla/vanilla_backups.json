@@ -1,0 +1,34 @@
+{
+  "mclaren_720s": {
+    "vehicle_id": "mclaren_720s",
+    "display_name": "McLaren — 720S",
+    "bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\M\\McLaren\\720S.bank",
+    "ai_bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\M\\McLaren\\720S_AI.bank",
+    "csdbin_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Vehicles\\mclaren_650s_gt3\\Mcl650sGT3.csdbin",
+    "backup_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\mclaren_720s\\720S.bank",
+    "backup_ai_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\mclaren_720s\\720S_AI.bank",
+    "backup_csd_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\mclaren_720s\\Mcl650sGT3.csdbin",
+    "original_sha256": "ca8f6075618514999b468589239e6f50a83acc080c50b924ac20c6adfde842aa",
+    "original_ai_sha256": "128b8e4e8443d4df0d5d023b33a9310a0c33029e12936bee77270ecf558b48b6",
+    "original_size": 9906208,
+    "backup_timestamp": "2026-11-07T15:17:45.731599",
+    "is_modified": true,
+    "modified_timestamp": "2026-11-07T21:23:05.552211"
+  },
+  "mercedes_sls_gt3": {
+    "vehicle_id": "mercedes_sls_gt3",
+    "display_name": "Mercedes — SLS GT3",
+    "bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\M\\Mercedes\\SLS_GT3.bank",
+    "ai_bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\M\\Mercedes\\SLS_GT3_AI.bank",
+    "csdbin_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Vehicles\\dtmmercedes\\dtmmercedes.csdbin",
+    "backup_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\mercedes_sls_gt3\\SLS_GT3.bank",
+    "backup_ai_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\mercedes_sls_gt3\\SLS_GT3_AI.bank",
+    "backup_csd_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\mercedes_sls_gt3\\dtmmercedes.csdbin",
+    "original_sha256": "deb836b4ef51b9706da6e54d508731f368488e34334ce1ee3451ac14bcac093d",
+    "original_ai_sha256": "d50fc7a6e87f7e1ac01f6f08d84315dff93373fab3ff9195ee4c8b30b5554962",
+    "original_size": 3584608,
+    "backup_timestamp": "2026-11-07T15:18:15.897895",
+    "is_modified": false,
+    "modified_timestamp": "2026-11-07T15:26:27.413069"
+  }
+}

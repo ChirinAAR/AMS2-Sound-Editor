@@ -84,6 +84,7 @@ class VanillaVehicle:
     ai_event_roles: list[str] = field(default_factory=list)
     ai_event_guids: dict[str, str] = field(default_factory=dict)    # role -> guid_str
     ai_event_paths: dict[str, str] = field(default_factory=dict)    # role -> path
+    ai_event_buses: dict[str, str] = field(default_factory=dict)    # role -> bus_guid
     is_modified: bool = False            # True si está usando sonido porteado
     has_backup: bool = False             # True si existe respaldo seguro original
     original_sha256: str | None = None
@@ -274,7 +275,18 @@ class VanillaVehicleManager:
             return
         try:
             master_strings = self.get_master_strings()
-            b = FmodBank(vehicle.bank_path)
+
+            # Preferir leer el respaldo original puro de Steam si existe
+            bank_file_to_read = vehicle.bank_path
+            veh_backup_folder = self.backup_dir / vehicle.vehicle_id
+            backup_file = veh_backup_folder / vehicle.bank_path.name
+            orig_file = vehicle.bank_path.parent / f"{vehicle.bank_path.name}.orig"
+            if backup_file.is_file():
+                bank_file_to_read = backup_file
+            elif orig_file.is_file():
+                bank_file_to_read = orig_file
+
+            b = FmodBank(bank_file_to_read)
             vehicle.slots_count = len(b.slots)
             vehicle.bank_guid = bytes_to_guid_str(b.bank_guid) if b.bank_guid else ""
             roles: set[str] = set()
@@ -347,37 +359,56 @@ class VanillaVehicleManager:
             vehicle.ctrl_parameters = ctrl_prms
 
             # Analizar también banco de IA si existe
-            if vehicle.ai_bank_path and vehicle.ai_bank_path.is_file():
-                ai_b = FmodBank(vehicle.ai_bank_path)
-                vehicle.ai_bank_guid = bytes_to_guid_str(ai_b.bank_guid) if ai_b.bank_guid else ""
-                ai_roles: set[str] = set()
-                ai_guids: dict[str, str] = {}
-                ai_paths: dict[str, str] = {}
-                for ev in ai_b.events:
-                    p = master_strings.get(ev.guid_str.lower(), ev.path or "")
-                    p_low = p.lower()
-                    if "main_live" in p_low or "_live" in p_low:
-                        role = "ai_engine_live"
-                    elif "main" in p_low:
-                        role = "ai_engine_ext"
-                    elif "engineext" in p_low:
-                        role = "ai_engine_ext"
-                    elif "engineint" in p_low:
-                        role = "ai_engine_int"
-                    elif ev.role == "EngineExt":
-                        role = "ai_engine_ext"
-                    elif ev.role == "EngineInt":
-                        role = "ai_engine_int"
-                    else:
-                        role = ev.role or f"AI_Event_{ev.index}"
-                    ai_roles.add(role)
-                    if ev.guid_str:
-                        ai_guids[role] = ev.guid_str
-                    if p:
-                        ai_paths[role] = p
-                vehicle.ai_event_roles = sorted(list(ai_roles))
-                vehicle.ai_event_guids = ai_guids
-                vehicle.ai_event_paths = ai_paths
+            if vehicle.ai_bank_path:
+                ai_file_to_read = vehicle.ai_bank_path
+                backup_ai = veh_backup_folder / vehicle.ai_bank_path.name
+                orig_ai = vehicle.ai_bank_path.parent / f"{vehicle.ai_bank_path.name}.orig"
+                if backup_ai.is_file():
+                    ai_file_to_read = backup_ai
+                elif orig_ai.is_file():
+                    ai_file_to_read = orig_ai
+
+                if ai_file_to_read.is_file():
+                    ai_b = FmodBank(ai_file_to_read)
+                    vehicle.ai_bank_guid = bytes_to_guid_str(ai_b.bank_guid) if ai_b.bank_guid else ""
+                    ai_roles: set[str] = set()
+                    ai_guids: dict[str, str] = {}
+                    ai_paths: dict[str, str] = {}
+                    ai_buses: dict[str, str] = {}
+                    for ev in ai_b.events:
+                        p = master_strings.get(ev.guid_str.lower(), ev.path or "")
+                        p_low = p.lower()
+                        if "main_live" in p_low or "_live" in p_low:
+                            role = "ai_engine_live"
+                        elif "main" in p_low:
+                            role = "ai_engine_main"
+                        elif "engineext" in p_low or "engine_ext" in p_low or ev.role == "EngineExt":
+                            role = "ai_engine_ext"
+                        elif "engineint" in p_low or "engine_int" in p_low or ev.role == "EngineInt":
+                            role = "ai_engine_int"
+                        else:
+                            role = ev.role or f"AI_Event_{ev.index}"
+
+                        if role in ai_guids:
+                            base_role = role
+                            k = 2
+                            while f"{base_role}_{k}" in ai_guids:
+                                k += 1
+                            role = f"{base_role}_{k}"
+
+                        ai_roles.add(role)
+                        if ev.guid_str:
+                            ai_guids[role] = ev.guid_str
+                        if p:
+                            ai_paths[role] = p
+                        elif ev.path:
+                            ai_paths[role] = ev.path
+                        if ev.parent_bus_guid:
+                            ai_buses[role] = ev.parent_bus_guid
+                    vehicle.ai_event_roles = sorted(list(ai_roles))
+                    vehicle.ai_event_guids = ai_guids
+                    vehicle.ai_event_paths = ai_paths
+                    vehicle.ai_event_buses = ai_buses
         except Exception:
             pass
 

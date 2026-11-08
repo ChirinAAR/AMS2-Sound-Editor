@@ -725,6 +725,7 @@ def main() -> None:
                 target_role_paths=sls_v.event_paths,
                 target_bank_guid=sls_v.bank_guid or None,
                 target_param_names=sls_v.target_parameters,
+                native_bank_path=sls_v.bank_path,
             )
             reloaded_mercer = FmodBank(raw=mercer_sls_res.bank_bytes)
             guids_list = [ev.guid_str for ev in reloaded_mercer.events]
