@@ -12,7 +12,7 @@
     "original_ai_sha256": "128b8e4e8443d4df0d5d023b33a9310a0c33029e12936bee77270ecf558b48b6",
     "original_size": 9906208,
     "backup_timestamp": "2026-11-07T15:17:45.731599",
-    "is_modified": true,
+    "is_modified": false,
     "modified_timestamp": "2026-11-07T21:23:05.552211"
   },
   "mercedes_sls_gt3": {
@@ -30,5 +30,21 @@
     "backup_timestamp": "2026-11-07T15:18:15.897895",
     "is_modified": false,
     "modified_timestamp": "2026-11-07T15:26:27.413069"
+  },
+  "porsche_991_rsr_gte": {
+    "vehicle_id": "porsche_991_rsr_gte",
+    "display_name": "Porsche — 991 RSR GTE",
+    "bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\P\\Porsche\\991_RSR_GTE.bank",
+    "ai_bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\P\\Porsche\\991_RSR_GTE_AI.bank",
+    "csdbin_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Vehicles\\porsche_991_gt3r\\porsche991gt3r.csdbin",
+    "backup_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\porsche_991_rsr_gte\\991_RSR_GTE.bank",
+    "backup_ai_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\porsche_991_rsr_gte\\991_RSR_GTE_AI.bank",
+    "backup_csd_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\porsche_991_rsr_gte\\porsche991gt3r.csdbin",
+    "original_sha256": "19eb4758242f054bed3ff1153b8791ed22623010e0ee9ee4dfd89d566fb1f1e1",
+    "original_ai_sha256": "ae03cd66529c6bbf547a7c681ace80b3d285999c1daf07eb1184cd7f00ad3799",
+    "original_size": 4348096,
+    "backup_timestamp": "2026-11-09T15:22:32.828854",
+    "is_modified": false,
+    "modified_timestamp": "2026-11-09T15:22:32.851745"
   }
 }

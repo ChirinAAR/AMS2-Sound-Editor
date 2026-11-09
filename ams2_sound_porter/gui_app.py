@@ -4354,6 +4354,43 @@ class SoundPorterApp(tk.Tk):
         codec_mode = FSB5_MODE_PCM16 if self.codec_choice_var.get() == "PCM16" else FSB5_MODE_FADPCM
         tcut_cfg = self._collect_throttle_cut_config()
         bands_to_export = list(self.rpm_bands) if self.rpm_bands else None
+        if self.mute_all_pops_var.get() and bands_to_export:
+            clean_bands: list[RpmBandConfig] = []
+            for b in bands_to_export:
+                is_tc_band = (
+                    getattr(b, "load_role", "") in ("pops", "throttle_cut")
+                    or any(s in (13, 25, 129) for s in getattr(b, "donor_slot_indices", []))
+                )
+                if is_tc_band:
+                    clean_bands.append(
+                        RpmBandConfig(
+                            band_id=b.band_id,
+                            pml_guid=b.pml_guid,
+                            event_guid=b.event_guid,
+                            box_index=b.box_index,
+                            event_role=b.event_role,
+                            perspective=b.perspective,
+                            load_role=b.load_role,
+                            donor_slot_indices=list(b.donor_slot_indices),
+                            donor_label=b.donor_label,
+                            rpm_min=0.0,
+                            rpm_max=0.0,
+                            fade_in_end=0.0,
+                            fade_out_start=0.0,
+                            orig_rpm_min=b.orig_rpm_min,
+                            orig_rpm_max=b.orig_rpm_max,
+                            orig_fade_in_end=b.orig_fade_in_end,
+                            orig_fade_out_start=b.orig_fade_out_start,
+                            fade_in_curv_guid=b.fade_in_curv_guid,
+                            fade_out_curv_guid=b.fade_out_curv_guid,
+                            bus_rpm_cutoff=b.bus_rpm_cutoff,
+                            is_muted_bus=True,
+                            is_fill_layer=b.is_fill_layer,
+                        )
+                    )
+                else:
+                    clean_bands.append(b)
+            bands_to_export = clean_bands
         is_direct = self.is_direct_ac_mode
 
         self.btn_export.config(state="disabled")
@@ -4503,14 +4540,52 @@ class SoundPorterApp(tk.Tk):
         self._append_log("\n----------------------------------------------------------------------")
         self._append_log(f"Iniciando inyección en vehículo vanilla '{veh.display_name}' [{mode_label}]...")
 
-        bands_to_export = list(self.rpm_bands) if self.rpm_bands else None
+        sync_ai = self.vanilla_sync_ai_var.get()
+        mute_pops = self.vanilla_mute_pops_var.get()
+        invert_cone = self.invert_cone_var.get()
         tcut_cfg = self._collect_throttle_cut_config()
         sync_pitch = self.sync_pitch_var.get()
         codec_mode = FSB5_MODE_PCM16 if self.codec_choice_var.get() == "PCM16" else FSB5_MODE_FADPCM
         is_direct = self.is_direct_ac_mode
-        sync_ai = self.vanilla_sync_ai_var.get()
-        mute_pops = self.vanilla_mute_pops_var.get()
-        invert_cone = self.invert_cone_var.get()
+
+        bands_to_export = list(self.rpm_bands) if self.rpm_bands else None
+        if mute_pops and bands_to_export:
+            clean_bands: list[RpmBandConfig] = []
+            for b in bands_to_export:
+                is_tc_band = (
+                    getattr(b, "load_role", "") in ("pops", "throttle_cut")
+                    or any(s in (13, 25, 129) for s in getattr(b, "donor_slot_indices", []))
+                )
+                if is_tc_band:
+                    clean_bands.append(
+                        RpmBandConfig(
+                            band_id=b.band_id,
+                            pml_guid=b.pml_guid,
+                            event_guid=b.event_guid,
+                            box_index=b.box_index,
+                            event_role=b.event_role,
+                            perspective=b.perspective,
+                            load_role=b.load_role,
+                            donor_slot_indices=list(b.donor_slot_indices),
+                            donor_label=b.donor_label,
+                            rpm_min=0.0,
+                            rpm_max=0.0,
+                            fade_in_end=0.0,
+                            fade_out_start=0.0,
+                            orig_rpm_min=b.orig_rpm_min,
+                            orig_rpm_max=b.orig_rpm_max,
+                            orig_fade_in_end=b.orig_fade_in_end,
+                            orig_fade_out_start=b.orig_fade_out_start,
+                            fade_in_curv_guid=b.fade_in_curv_guid,
+                            fade_out_curv_guid=b.fade_out_curv_guid,
+                            bus_rpm_cutoff=b.bus_rpm_cutoff,
+                            is_muted_bus=True,
+                            is_fill_layer=b.is_fill_layer,
+                        )
+                    )
+                else:
+                    clean_bands.append(b)
+            bands_to_export = clean_bands
 
         def worker() -> None:
             try:

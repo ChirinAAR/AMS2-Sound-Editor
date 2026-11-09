@@ -779,6 +779,7 @@ def main() -> None:
                 target_bank_guid=mclaren_v.bank_guid or None,
                 target_param_names=mclaren_v.target_parameters,
                 native_bank_path=mclaren_v.bank_path,
+                rpm_bands=macca_b.rpm_bands,
                 mute_secondary_pops=True,
                 invert_spatial_cone=True,
             )
@@ -789,7 +790,13 @@ def main() -> None:
             eng_int = next((e for e in reloaded_macca.events if e.role == "EngineInt" and len(e.linked_samples) >= 5), None)
             assert eng_ext is not None and eng_int is not None, "EngineExt o EngineInt perdieron sus muestras de sonido!"
             
-            # Verificar que las cajas de TC chatter (inst b9c38884 en rpms 2100..7400) quedaron silenciadas a 0.0..0.0
+            # Verificar que las muestras de audio de TC y LC (sample_13, sample_25, sample_129) están enmudecidas a ceros directos en FSB5
+            sl13 = reloaded_macca.slots[13]
+            assert sl13.data_bytes == b"\x00" * len(sl13.data_bytes), "El audio FSB5 de sample_13 (TC chatter) no fue silenciado!"
+            sl0 = reloaded_macca.slots[0]
+            assert sl0.data_bytes != b"\x00" * len(sl0.data_bytes), "Una muestra de motor normal fue enmudecida por error!"
+
+            # Verificar que las cajas de TC chatter (inst b9c38884 en rpms 2100..7400) quedaron silenciadas a 0.0..0.0 incluso pasando rpm_bands
             tc_ext_inst = guid_str_to_bytes("{b9c38884-ac8b-4be6-bc69-048ce4c26e93}")
             tc_boxes_checked = 0
             for cid, ps, pe, _ in iter_riff_chunks(macca_res.bank_bytes, 12, len(macca_res.bank_bytes)):
@@ -811,7 +818,7 @@ def main() -> None:
                                                     assert v0 == 0.0 and vlen == 0.0, f"Caja de TC {bi} no fue silenciada: [{v0}..{v0+vlen}]"
                                                     tc_boxes_checked += 1
             assert tc_boxes_checked > 0, "No se encontraron cajas de TC en el banco para verificar"
-            print(f"   Silenciamiento de TC/LC verificado con éxito: {tc_boxes_checked} cajas de chatter de tracción neutralizadas a 0.0..0.0 sin rateo continuo!")
+            print(f"   Silenciamiento directo FSB5 y PMLB verificado: audio silenciado y {tc_boxes_checked} cajas neutralizadas a 0.0..0.0!")
 
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 

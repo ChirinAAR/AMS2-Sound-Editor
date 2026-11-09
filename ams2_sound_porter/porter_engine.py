@@ -2556,10 +2556,107 @@ def inject_native_chunks_in_proj(
     return bytes(buf)
 
 
+def _find_tc_and_lc_slots_in_bank(ac_bank: FmodBank) -> list[FsbSampleSlot]:
+    """Identifica las ranuras (FsbSampleSlot) asociadas a control de tracción (tc),
+    launch control (lc) o petardeos en un banco de Assetto Corsa para su enmudecimiento
+    directo a nivel de flujo de audio PCM en FSB5.
+    """
+    proj = None
+    for cid, ps, pe, _ in iter_riff_chunks(ac_bank.raw, 12, len(ac_bank.raw)):
+        if cid == b"LIST" and ac_bank.raw[ps : ps + 4] == b"PROJ":
+            proj = ac_bank.raw[ps + 4 : pe]
+            break
+    if not proj:
+        return []
+
+    # 1. PRMB TC / LC params
+    tc_param_guids: set[bytes] = set()
+    for cid, ps, pe, _ in iter_riff_chunks(proj, 0, len(proj)):
+        if cid == b"LIST" and proj[ps : ps + 4] == b"PRMS":
+            for scid, sps, spe, _ in iter_riff_chunks(proj, ps + 4, pe):
+                for ccid, cps, cpe, _ in iter_riff_chunks(proj, sps + 4, spe):
+                    if ccid == b"PRMB" and cpe - cps >= 31:
+                        p = proj[cps:cpe]
+                        slen = struct.unpack_from("<H", p, 21)[0]
+                        if 23 + slen + 8 <= len(p):
+                            pname = p[23 : 23 + slen].decode("utf-8", "replace").strip().lower()
+                            if pname in (
+                                "tc", "traction", "tractioncontrol", "traction_control",
+                                "lc", "launch", "launchcontrol", "launch_control"
+                            ):
+                                tc_param_guids.add(bytes(p[:16]))
+            break
+
+    # 2. Eventos dedicados a silenciar (tractioncontrol, limiter, backfire)
+    muted_ev_guids: set[bytes] = set()
+    for ev in ac_bank.events:
+        p_low = (ev.path or "").lower()
+        if ev.role in ("BackfireExt", "BackfireInt", "Limiter") or any(
+            k in p_low for k in ("tractioncontrol", "tc_ext", "tc_int", "limiter", "backfire")
+        ):
+            muted_ev_guids.add(ev.guid_bytes)
+
+    # 3. PMLB instruments
+    tc_inst_guids: set[bytes] = set()
+    for cid, ps, pe, _ in iter_riff_chunks(proj, 0, len(proj)):
+        if cid == b"LIST" and proj[ps : ps + 4] == b"PMLS":
+            for scid, sps, spe, _ in iter_riff_chunks(proj, ps + 4, pe):
+                for ccid, cps, cpe, _ in iter_riff_chunks(proj, sps + 4, spe):
+                    if ccid == b"PMLB" and cpe - cps >= 52:
+                        p = proj[cps:cpe]
+                        param_g = bytes(p[16:32])
+                        ev_g = bytes(p[32:48])
+                        if param_g in tc_param_guids or ev_g in muted_ev_guids:
+                            nboxes = struct.unpack_from("<H", p, 48)[0] >> 1
+                            stride = struct.unpack_from("<H", p, 50)[0]
+                            if stride >= 24 and len(p) >= 52 + nboxes * stride:
+                                for bi in range(nboxes):
+                                    boff = 52 + bi * stride
+                                    tc_inst_guids.add(bytes(p[boff : boff + 16]))
+            break
+
+    if not tc_inst_guids:
+        return []
+
+    # 4. WAIB / MUIS: rastrear WAV GUIDs
+    target_wav_guids: set[bytes] = set()
+    def walk_tree(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(proj, start, end):
+            if cid == b"LIST":
+                ltype = proj[ps : ps + 4]
+                if ltype == b"WAIT":
+                    wg_self = None
+                    wg_target = None
+                    for scid, sps, spe, _ in iter_riff_chunks(proj, ps + 4, pe):
+                        if scid == b"WAIB" and spe - sps >= 32:
+                            wg_self = bytes(proj[sps : sps + 16])
+                            wg_target = bytes(proj[sps + 16 : sps + 32])
+                    if wg_self and wg_self in tc_inst_guids and wg_target:
+                        target_wav_guids.add(wg_target)
+                elif ltype in (b"MUIT", b"SPIT"):
+                    mg_self = None
+                    ch_guids: list[bytes] = []
+                    for scid, sps, spe, _ in iter_riff_chunks(proj, ps + 4, pe):
+                        if scid == b"MUIB" and spe - sps >= 16:
+                            mg_self = bytes(proj[sps : sps + 16])
+                        elif scid == b"MUIT" and spe - sps >= 20:
+                            cnt = struct.unpack_from("<H", proj, sps + 16)[0]
+                            for bi in range(cnt):
+                                ch_guids.append(bytes(proj[sps + 20 + bi * 16 : sps + 36 + bi * 16]))
+                    if mg_self and mg_self in tc_inst_guids:
+                        for cg in ch_guids:
+                            tc_inst_guids.add(cg)
+                else:
+                    walk_tree(ps + 4, pe)
+
+    walk_tree(0, len(proj))
+    return [sl for sl in ac_bank.slots if sl.wav_guid and sl.wav_guid in target_wav_guids]
+
+
 def _silence_tc_and_lc_boxes_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
     """Silencia cajas de instrumentos de control de tracción (tc) y launch control (lc)
-    en todas las pistas PMLB (incluyendo 'rpms' y 'throttle') para evitar rateos o petardeos
-    continuos en AMS2 que aumentan de ritmo con las revoluciones del motor.
+    en todas las pistas PMLB (incluyendo 'rpms' y 'throttle') y reduce la ganancia en INST
+    para evitar rateos o petardeos continuos en AMS2 que aumentan de ritmo con las revoluciones del motor.
     """
     buf = bytearray(proj_payload)
 
@@ -2625,6 +2722,27 @@ def _silence_tc_and_lc_boxes_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
                                     struct.pack_into("<ff", buf, boff + 16, 0.0, 0.0)
                                     silenced_count += 1
             break
+
+    # 4. Enmudecer los chunks INST de estos instrumentos a ganancia mínima (-96.0 dB)
+    def mute_inst_gain(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                ltype = buf[ps : ps + 4]
+                if ltype == b"WAIT":
+                    wg_self = None
+                    inst_range = None
+                    for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
+                        if scid == b"WAIB" and spe - sps >= 32:
+                            wg_self = bytes(buf[sps : sps + 16])
+                        elif scid == b"INST" and spe - sps >= 20:
+                            inst_range = (sps, spe)
+                    if wg_self and wg_self in tc_inst_guids and inst_range:
+                        sps, spe = inst_range
+                        struct.pack_into("<f", buf, sps + 16, -96.0)
+                else:
+                    mute_inst_gain(ps + 4, pe)
+
+    mute_inst_gain(0, len(buf))
 
     return bytes(buf), silenced_count
 
@@ -2704,10 +2822,6 @@ def build_direct_ported_bank_from_ac(
     # Invertir cono espacial 3D si aplica (ajustando la orientación trasera de AC al frente de AMS2)
     if invert_spatial_cone:
         proj_buf = bytearray(invert_event_cone_curves_in_proj(bytes(proj_buf))[0])
-
-    # Silenciar cajas de instrumentos de TC / LC en pistas de RPM si se activa mute_secondary_pops
-    if mute_secondary_pops:
-        proj_buf = bytearray(_silence_tc_and_lc_boxes_in_proj(bytes(proj_buf))[0])
 
     safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_mod"
     guid_map: dict[bytes, bytes] | None = None
@@ -2938,7 +3052,25 @@ def build_direct_ported_bank_from_ac(
         rpm_bands=rpm_bands,
     )
 
-    final_fsb_blobs = [sb.raw_fsb_bytes for sb in ac_bank.subbanks]
+    # Silenciar cajas de instrumentos de TC / LC en pistas de RPM si se activa mute_secondary_pops
+    # (Se ejecuta DESPUÉS de _patch_proj_chunks para garantizar que rpm_bands no reabra las cajas de TC/LC)
+    if mute_secondary_pops:
+        patched_proj_body, _ = _silence_tc_and_lc_boxes_in_proj(patched_proj_body)
+
+    final_fsb_blobs = [bytearray(sb.raw_fsb_bytes) for sb in ac_bank.subbanks]
+    if mute_secondary_pops:
+        muted_tc_slots = _find_tc_and_lc_slots_in_bank(ac_bank)
+        for sl in muted_tc_slots:
+            if sl.subbank_index < len(final_fsb_blobs):
+                fbuf = final_fsb_blobs[sl.subbank_index]
+                if len(fbuf) >= 20:
+                    shdr_size, name_size = struct.unpack_from("<II", fbuf, 12)
+                    data_base = 60 + shdr_size + name_size
+                    start = data_base + sl.data_offset
+                    end = start + len(sl.data_bytes)
+                    if end <= len(fbuf):
+                        fbuf[start:end] = b"\x00" * len(sl.data_bytes)
+
     sndh_ver = ac_bank.sndh_version or (0x00080000 | (2 * len(final_fsb_blobs) + 1))
     dummy_sndh = struct.pack("<I", sndh_ver) + b"\x00" * (8 * len(final_fsb_blobs))
     temp_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, dummy_sndh, new_stdt_payload)
@@ -2959,7 +3091,7 @@ def build_direct_ported_bank_from_ac(
         pad_before = (32 - (snd_payload_start % 32)) % 32
         fsb_pos = snd_payload_start + pad_before
         fsb_len = len(fsb_blob)
-        snd_payload = (b"\x00" * pad_before) + fsb_blob
+        snd_payload = (b"\x00" * pad_before) + bytes(fsb_blob)
         snd_chunk = b"SND " + struct.pack("<I", len(snd_payload)) + snd_payload
         if len(snd_payload) & 1:
             snd_chunk += b"\x00"
