@@ -762,6 +762,57 @@ def main() -> None:
                 )
             print("   Porteo de Mercer V8 verificado: 0 GUIDs duplicados, eventos nativos, conos espaciales 3D invertidos y parámetros load/rpm sincronizados al 100%!")
 
+    # 16. Probando eliminación de rateo/chatter de control de tracción y petardeos continuos en McLaren 720S
+    macca_bank_path = Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_gtm_macca_72_evo_v8\sfx\rss_gtm_macca_72_evo_v8.bank")
+    if macca_bank_path.is_file():
+        print("16. Probando eliminación de rateo/chatter de control de tracción y petardeos continuos en McLaren 720S...")
+        macca_b = FmodBank(macca_bank_path)
+        mgr_v = VanillaVehicleManager(Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2"))
+        mclaren_v = next((v for v in mgr_v.scan_catalog() if "720s" in v.vehicle_id.lower()), None)
+        if mclaren_v:
+            mgr_v.load_vehicle_events_info(mclaren_v)
+            macca_res = build_direct_ported_bank_from_ac(
+                ac_bank=macca_b,
+                mod_identifier=mclaren_v.car_name,
+                target_role_guids=mclaren_v.event_guids,
+                target_role_paths=mclaren_v.event_paths,
+                target_bank_guid=mclaren_v.bank_guid or None,
+                target_param_names=mclaren_v.target_parameters,
+                native_bank_path=mclaren_v.bank_path,
+                mute_secondary_pops=True,
+                invert_spatial_cone=True,
+            )
+            reloaded_macca = FmodBank(raw=macca_res.bank_bytes)
+            assert len(reloaded_macca.events) >= 20, "El banco de McLaren 720S no preservó sus eventos directos!"
+            # Verificar que ningún evento de motor quedó con 0 muestras
+            eng_ext = next((e for e in reloaded_macca.events if e.role == "EngineExt" and len(e.linked_samples) >= 5), None)
+            eng_int = next((e for e in reloaded_macca.events if e.role == "EngineInt" and len(e.linked_samples) >= 5), None)
+            assert eng_ext is not None and eng_int is not None, "EngineExt o EngineInt perdieron sus muestras de sonido!"
+            
+            # Verificar que las cajas de TC chatter (inst b9c38884 en rpms 2100..7400) quedaron silenciadas a 0.0..0.0
+            tc_ext_inst = guid_str_to_bytes("{b9c38884-ac8b-4be6-bc69-048ce4c26e93}")
+            tc_boxes_checked = 0
+            for cid, ps, pe, _ in iter_riff_chunks(macca_res.bank_bytes, 12, len(macca_res.bank_bytes)):
+                if cid == b"LIST" and macca_res.bank_bytes[ps : ps + 4] == b"PROJ":
+                    for scid, sps, spe, _ in iter_riff_chunks(macca_res.bank_bytes, ps + 4, pe):
+                        if scid == b"LIST" and macca_res.bank_bytes[sps : sps + 4] == b"PMLS":
+                            for ccid, cps, cpe, _ in iter_riff_chunks(macca_res.bank_bytes, sps + 4, spe):
+                                for sccid, scps, scpe, _ in iter_riff_chunks(macca_res.bank_bytes, cps + 4, cpe):
+                                    if sccid == b"PMLB" and scpe - scps >= 52:
+                                        p = macca_res.bank_bytes[scps:scpe]
+                                        nboxes = struct.unpack_from("<H", p, 48)[0] >> 1
+                                        stride = struct.unpack_from("<H", p, 50)[0]
+                                        if stride >= 24 and len(p) >= 52 + nboxes * stride:
+                                            for bi in range(nboxes):
+                                                boff = 52 + bi * stride
+                                                ig = p[boff : boff + 16]
+                                                if ig == tc_ext_inst:
+                                                    v0, vlen = struct.unpack_from("<ff", p, boff + 16)
+                                                    assert v0 == 0.0 and vlen == 0.0, f"Caja de TC {bi} no fue silenciada: [{v0}..{v0+vlen}]"
+                                                    tc_boxes_checked += 1
+            assert tc_boxes_checked > 0, "No se encontraron cajas de TC en el banco para verificar"
+            print(f"   Silenciamiento de TC/LC verificado con éxito: {tc_boxes_checked} cajas de chatter de tracción neutralizadas a 0.0..0.0 sin rateo continuo!")
+
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 
 

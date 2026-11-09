@@ -2556,6 +2556,79 @@ def inject_native_chunks_in_proj(
     return bytes(buf)
 
 
+def _silence_tc_and_lc_boxes_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
+    """Silencia cajas de instrumentos de control de tracción (tc) y launch control (lc)
+    en todas las pistas PMLB (incluyendo 'rpms' y 'throttle') para evitar rateos o petardeos
+    continuos en AMS2 que aumentan de ritmo con las revoluciones del motor.
+    """
+    buf = bytearray(proj_payload)
+
+    # 1. Localizar parámetros PRMB relacionados con TC o LC
+    prms_map: dict[bytes, str] = {}
+    tc_param_guids: set[bytes] = set()
+    for cid, ps, pe, _ in iter_riff_chunks(buf, 0, len(buf)):
+        if cid == b"LIST" and buf[ps : ps + 4] == b"PRMS":
+            for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
+                for ccid, cps, cpe, _ in iter_riff_chunks(buf, sps + 4, spe):
+                    if ccid == b"PRMB" and cpe - cps >= 31:
+                        p = buf[cps:cpe]
+                        slen = struct.unpack_from("<H", p, 21)[0]
+                        if 23 + slen + 8 <= len(p):
+                            pname = p[23 : 23 + slen].decode("utf-8", "replace").strip().lower()
+                            prms_map[bytes(p[:16])] = pname
+                            if pname in (
+                                "tc", "traction", "tractioncontrol", "traction_control",
+                                "lc", "launch", "launchcontrol", "launch_control"
+                            ):
+                                tc_param_guids.add(bytes(p[:16]))
+            break
+
+    if not tc_param_guids:
+        return bytes(buf), 0
+
+    # 2. Recolectar GUIDs de instrumentos asociados a estos parámetros en chunks PMLB
+    tc_inst_guids: set[bytes] = set()
+    for cid, ps, pe, _ in iter_riff_chunks(buf, 0, len(buf)):
+        if cid == b"LIST" and buf[ps : ps + 4] == b"PMLS":
+            for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
+                for ccid, cps, cpe, _ in iter_riff_chunks(buf, sps + 4, spe):
+                    if ccid == b"PMLB" and cpe - cps >= 52:
+                        p = buf[cps:cpe]
+                        param_g = bytes(p[16:32])
+                        if param_g in tc_param_guids:
+                            nboxes = struct.unpack_from("<H", p, 48)[0] >> 1
+                            stride = struct.unpack_from("<H", p, 50)[0]
+                            if stride >= 24 and len(p) >= 52 + nboxes * stride:
+                                for bi in range(nboxes):
+                                    boff = 52 + bi * stride
+                                    tc_inst_guids.add(bytes(p[boff : boff + 16]))
+            break
+
+    if not tc_inst_guids:
+        return bytes(buf), 0
+
+    # 3. Poner en cero (v0 = 0.0, vlen = 0.0) todas las cajas que usen estos instrumentos en cualquier PMLB
+    # (en particular las cajas en las pistas 'rpms' y 'throttle' que provocan el rateo continuo)
+    silenced_count = 0
+    for cid, ps, pe, _ in iter_riff_chunks(buf, 0, len(buf)):
+        if cid == b"LIST" and buf[ps : ps + 4] == b"PMLS":
+            for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
+                for ccid, cps, cpe, _ in iter_riff_chunks(buf, sps + 4, spe):
+                    if ccid == b"PMLB" and cpe - cps >= 52:
+                        nboxes = struct.unpack_from("<H", buf, cps + 48)[0] >> 1
+                        stride = struct.unpack_from("<H", buf, cps + 50)[0]
+                        if stride >= 24 and cpe >= cps + 52 + nboxes * stride:
+                            for bi in range(nboxes):
+                                boff = cps + 52 + bi * stride
+                                ig = bytes(buf[boff : boff + 16])
+                                if ig in tc_inst_guids:
+                                    struct.pack_into("<ff", buf, boff + 16, 0.0, 0.0)
+                                    silenced_count += 1
+            break
+
+    return bytes(buf), silenced_count
+
+
 def build_direct_ported_bank_from_ac(
     ac_bank: FmodBank,
     mod_identifier: str = "custom_mod",
@@ -2601,8 +2674,8 @@ def build_direct_ported_bank_from_ac(
 
         # Si se solicita silenciar los petardeos (POPS) en la exportación
         if mute_secondary_pops and (
-            ev.role in ("BackfireExt", "BackfireInt")
-            or "backfire" in p_low
+            ev.role in ("BackfireExt", "BackfireInt", "Limiter")
+            or any(k in p_low for k in ("backfire", "limiter", "tractioncontrol", "tc_ext", "tc_int"))
         ):
             ibg_to_target_bus[ev.ibus_guid_bytes] = MUTE_BUS
             continue
@@ -2631,6 +2704,10 @@ def build_direct_ported_bank_from_ac(
     # Invertir cono espacial 3D si aplica (ajustando la orientación trasera de AC al frente de AMS2)
     if invert_spatial_cone:
         proj_buf = bytearray(invert_event_cone_curves_in_proj(bytes(proj_buf))[0])
+
+    # Silenciar cajas de instrumentos de TC / LC en pistas de RPM si se activa mute_secondary_pops
+    if mute_secondary_pops:
+        proj_buf = bytearray(_silence_tc_and_lc_boxes_in_proj(bytes(proj_buf))[0])
 
     safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_mod"
     guid_map: dict[bytes, bytes] | None = None
@@ -2752,16 +2829,6 @@ def build_direct_ported_bank_from_ac(
                 (ev for ev in ac_bank.events if any(k in (ev.path or "").lower() for k in ("exhaust", "tailpipe", "muffler"))),
                 None,
             )
-            if not ex_ev:
-                ex_ev = next(
-                    (ev for ev in ac_bank.events if ev.role == "BackfireExt" or "backfire_ext" in (ev.path or "").lower()),
-                    None,
-                )
-            if not ex_ev and p_ext:
-                ex_ev = next(
-                    (ev for ev in ext_cands if ev.index != (p_ext.index if p_ext else -1)),
-                    None,
-                )
             if ex_ev and ex_ev.guid_bytes not in guid_map:
                 guid_map[ex_ev.guid_bytes] = ex_bg
                 used_guids.add(ex_bg)
@@ -2769,6 +2836,26 @@ def build_direct_ported_bank_from_ac(
                 ex_path = (target_role_paths or {}).get("Exhaust") or (ex_ev.path or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust")
                 role_to_event_path["Exhaust"] = ex_path
                 stdt_entries.append((ex_path, ex_bg))
+            else:
+                # Si AC no posee un evento de escape dedicado, extraer los chunks nativos de Exhaust
+                # desde el banco base del vehículo para mantener los parámetros originales de AMS2
+                # sin remapear BackfireExt (lo cual causaba petardeos/rateos continuos en loop).
+                ex_evnts = []
+                ex_ibses = []
+                if native_bank_path and Path(native_bank_path).is_file():
+                    ex_evnts, ex_ibses = extract_native_starters(Path(native_bank_path), [ex_bg])
+                if not ex_evnts:
+                    EXHAUST_BUS = guid_str_to_bytes("{ffe57d5c-46ed-4b06-86d5-8fa6f8ffdf07}")
+                    ex_ibg = hashlib.sha256(ex_bg + b"_ibus_ams2").digest()[:16]
+                    ex_evnts.append((ex_bg, _make_trigger_evnt(ex_bg, ex_ibg, EXHAUST_BUS)))
+                    ex_ibses.append((ex_ibg, _make_trigger_ibus(ex_ibg, EXHAUST_BUS)))
+                if ex_evnts:
+                    proj_buf = bytearray(inject_native_chunks_in_proj(bytes(proj_buf), ex_evnts, ex_ibses))
+                    used_guids.add(ex_bg)
+                    role_to_event_guid["Exhaust"] = bytes_to_guid_str(ex_bg)
+                    ex_path = (target_role_paths or {}).get("Exhaust") or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust"
+                    role_to_event_path["Exhaust"] = ex_path
+                    stdt_entries.append((ex_path, ex_bg))
 
         # Asignar resto de eventos secundarios de AC con GUIDs únicos garantizados
         for ev in ac_bank.events:
@@ -3092,6 +3179,7 @@ def export_ams2_mod_package(
             mod_identifier=safe_mod,
             standalone_guids=standalone_guids,
             rpm_bands=rpm_bands,
+            mute_secondary_pops=mute_pops,
             invert_spatial_cone=invert_spatial_cone,
         )
     else:

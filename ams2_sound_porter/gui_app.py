@@ -181,6 +181,7 @@ class SoundPorterApp(tk.Tk):
         )
         self.vanilla_auto_backup_var = tk.BooleanVar(value=True)
         self.vanilla_sync_ai_var = tk.BooleanVar(value=True)
+        self.vanilla_mute_pops_var = tk.BooleanVar(value=True)
         self.mute_all_pops_var = tk.BooleanVar(value=False)
         self.invert_cone_var = tk.BooleanVar(value=True)
         self.vanilla_filtered_vehicles: list[VanillaVehicle] = []
@@ -1403,6 +1404,12 @@ class SoundPorterApp(tk.Tk):
             text="👥 Sincronizar e inyectar también banco de audio de IA (_AI.bank) en un solo paso (Cubre rivales en pista y vistas de Repetición / TV Replay)",
             variable=self.vanilla_sync_ai_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Checkbutton(
+            self.vanilla_cfg_card,
+            text="🔇 Silenciar rateo continuo, petardeos y control de tracción (POPS / TC / Limiter) en Replay y vistas externas (Recomendado)",
+            variable=self.vanilla_mute_pops_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
 
         # Tarjeta 2: Opciones avanzadas de ingeniería FMOD
         self.opts_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
@@ -4502,7 +4509,7 @@ class SoundPorterApp(tk.Tk):
         codec_mode = FSB5_MODE_PCM16 if self.codec_choice_var.get() == "PCM16" else FSB5_MODE_FADPCM
         is_direct = self.is_direct_ac_mode
         sync_ai = self.vanilla_sync_ai_var.get()
-        mute_pops = self.mute_all_pops_var.get()
+        mute_pops = self.vanilla_mute_pops_var.get()
         invert_cone = self.invert_cone_var.get()
 
         def worker() -> None:
@@ -4536,10 +4543,25 @@ class SoundPorterApp(tk.Tk):
                     bank_bytes = direct_res.bank_bytes
                 else:
                     assert self.donor_bank
+                    eff_mappings = self.mappings
+                    if mute_pops and self.mappings:
+                        eff_mappings = []
+                        for i, m in enumerate(self.mappings):
+                            sl = self.donor_bank.slots[m.donor_global_index] if 0 <= m.donor_global_index < len(self.donor_bank.slots) else None
+                            if sl and (sl.load_role in ("pops", "throttle_cut") or "limiter" in sl.name.lower() or "backfire" in sl.name.lower()):
+                                eff_mappings.append(SlotMappingConfig(
+                                    donor_global_index=m.donor_global_index,
+                                    action="silence",
+                                    source_index=None,
+                                    gain_db=-96.0,
+                                    match_reason="Silenciado para Replay / IA limpia",
+                                ))
+                            else:
+                                eff_mappings.append(m)
                     donor_res = build_ported_bank(
                         donor=self.donor_bank,
                         library=self.source_lib,
-                        mappings=self.mappings,
+                        mappings=eff_mappings,
                         mod_identifier=veh.car_name,
                         standalone_guids=False,
                         sync_autopitch=sync_pitch,
