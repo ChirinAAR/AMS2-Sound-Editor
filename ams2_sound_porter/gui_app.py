@@ -181,7 +181,6 @@ class SoundPorterApp(tk.Tk):
         )
         self.vanilla_auto_backup_var = tk.BooleanVar(value=True)
         self.vanilla_sync_ai_var = tk.BooleanVar(value=True)
-        self.vanilla_mute_ai_pops_var = tk.BooleanVar(value=True)
         self.mute_all_pops_var = tk.BooleanVar(value=False)
         self.vanilla_filtered_vehicles: list[VanillaVehicle] = []
         self.vanilla_export_dest_var = tk.StringVar(value="Ningún vehículo vanilla seleccionado.")
@@ -1403,12 +1402,6 @@ class SoundPorterApp(tk.Tk):
             text="👥 Sincronizar e inyectar también banco de audio de IA (_AI.bank) en un solo paso (Cubre rivales en pista y vistas de Repetición / TV Replay)",
             variable=self.vanilla_sync_ai_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
-
-        ttk.Checkbutton(
-            self.vanilla_cfg_card,
-            text="🔇 Silenciar petardeos y rateo (POPS / Limiter) en vistas de Repetición / TV Replay y autos de la IA (Recomendado)",
-            variable=self.vanilla_mute_ai_pops_var,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
 
         # Tarjeta 2: Opciones avanzadas de ingeniería FMOD
         self.opts_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
@@ -4545,51 +4538,9 @@ class SoundPorterApp(tk.Tk):
                     bank_bytes = donor_res.bank_bytes
 
                 # 2. Configurar banco de la IA si está marcado y existe
-                # Genera el banco de IA (_AI.bank) preservando curvas de distancia 3D y silenciando rateos/pops
-                ai_bytes: bytes | None = None
-                if sync_ai and veh.ai_bank_path:
-                    veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
-                    native_ai_p = (
-                        veh_backup_folder / veh.ai_bank_path.name
-                        if (veh_backup_folder / veh.ai_bank_path.name).is_file()
-                        else veh.ai_bank_path
-                    )
-                    mute_ai = self.vanilla_mute_ai_pops_var.get()
-                    if native_ai_p.is_file():
-                        ai_donor = FmodBank(native_ai_p)
-                        ai_mappings = auto_map_samples(ai_donor, self.source_lib) if self.source_lib else []
-                        if mute_ai:
-                            for i, m in enumerate(ai_mappings):
-                                sl = ai_donor.slots[i]
-                                if sl.load_role in ("pops", "throttle_cut") or "limiter" in sl.name.lower():
-                                    m.action = "silence"
-                                    m.gain_db = -96.0
-                                    m.match_reason = "Silenciado para Replay / IA limpia"
-                        ai_donor_res = build_ported_bank(
-                            donor=ai_donor,
-                            mappings=ai_mappings,
-                            library=self.source_lib,
-                            mod_identifier=f"{veh.car_name}_AI",
-                            standalone_guids=False,
-                            sync_autopitch=sync_pitch,
-                            output_codec_mode=codec_mode,
-                        )
-                        ai_bytes = ai_donor_res.bank_bytes
-                    elif is_direct and self.source_lib and self.source_lib.fmod_bank:
-                        ai_direct_res = build_direct_ported_bank_from_ac(
-                            ac_bank=self.source_lib.fmod_bank,
-                            mod_identifier=f"{veh.car_name}_AI",
-                            standalone_guids=False,
-                            target_role_guids=veh.ai_event_guids,
-                            target_role_paths=veh.ai_event_paths,
-                            target_bank_guid=veh.ai_bank_guid or None,
-                            target_param_names=veh.target_parameters,
-                            target_ctrl_params=veh.ctrl_parameters,
-                            target_role_buses=getattr(veh, "ai_event_buses", None),
-                            is_ai_bank=True,
-                            mute_secondary_pops=mute_ai,
-                        )
-                        ai_bytes = ai_direct_res.bank_bytes
+                # Enfoque fiel de v1: el banco de IA comparte el mismo sonido y eventos 1:1, asegurando que suene idéntico
+                # en carreras contra rivales y en cámaras de repetición / TV sin desincronizaciones ni cámaras mudas.
+                ai_bytes: bytes | None = bank_bytes if (sync_ai and veh.ai_bank_path) else None
 
                 # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) si existe
                 csd_bytes: bytes | None = None
