@@ -2320,18 +2320,12 @@ def _patch_prmb_and_ibsb_in_proj(
 
 
 def invert_event_cone_curves_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
-    """Invierte la orientación espacial de los conos de sonido FMOD (Event Cone Angle).
+    """Invierte la orientación espacial de los conos de sonido FMOD (Event Cone Angle)
 
-    En Assetto Corsa, el vector forward del emisor exterior (engine_ext) apunta hacia ATRÁS
-    (0° = escape / chase cam, 180° = frente / trompa).
-    En Automobilista 2 (Madness Engine), el vector forward apunta hacia ADELANTE (0° = frente,
-    180° = escape / chase cam).
-
-    Esta función detecta todas las curvas CURV gobernadas por el parámetro 'Event Cone Angle'
-    a través de chunks CTRL, e invierte horizontalmente su eje de grados (180.0 - x)
-    reordenando los puntos en orden creciente de grados y negando las tangentes de Hermite,
-    garantizando que el sonido del escape suene en la parte trasera (Chase Cam / alejamiento)
-    y la admisión suene en la parte delantera (acercamiento).
+    exclusivamente en las curvas de volumen (Prop 0) de eventos exteriores, preservando
+    intactos los filtros DSP (Prop >= 1000, high-pass, low-pass, EQs y panners 3D)
+    y corrigiendo la posición e inversión de tangentes de Hermite para evitar
+    mutear el vehículo.
     """
     buf = bytearray(proj_payload)
 
@@ -2357,8 +2351,10 @@ def invert_event_cone_curves_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
     if not cone_param_guids:
         return bytes(buf), 0
 
-    # 2. Recolectar GUIDs de curvas CURV vinculadas a esos parámetros vía CTRL
-    cone_curve_guids: set[bytes] = set()
+    # 2. Recolectar ÚNICAMENTE curvas CURV de volumen (prop == 0) gobernadas por 'Event Cone Angle'.
+    # Se ignoran intencionadamente los filtros DSP (prop >= 1000) para evitar damping severo de frecuencias
+    # y distorsión de panners 3D que mutearían el vehículo en pista.
+    cone_vol_curve_guids: set[bytes] = set()
 
     def walk_ctrls(start: int, end: int) -> None:
         for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
@@ -2366,15 +2362,16 @@ def invert_event_cone_curves_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
                 walk_ctrls(ps + 4, pe)
             elif cid == b"CTRL" and pe - ps >= 68:
                 param_g = bytes(buf[ps + 32 : ps + 48])
-                if param_g in cone_param_guids:
+                prop = struct.unpack_from("<I", buf, ps + 64)[0]
+                if param_g in cone_param_guids and prop == 0:
                     curve_g = bytes(buf[ps + 48 : ps + 64])
-                    cone_curve_guids.add(curve_g)
+                    cone_vol_curve_guids.add(curve_g)
 
     walk_ctrls(0, len(buf))
-    if not cone_curve_guids:
+    if not cone_vol_curve_guids:
         return bytes(buf), 0
 
-    # 3. Invertir las curvas CURV correspondientes
+    # 3. Invertir las curvas de volumen en su lugar respetando el modelo de segmentos spline de FMOD Studio
     inverted_count = 0
 
     def walk_curvs(start: int, end: int) -> None:
@@ -2384,28 +2381,36 @@ def invert_event_cone_curves_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
                 walk_curvs(ps + 4, pe)
             elif cid == b"CURV" and pe - ps >= 36:
                 cg = bytes(buf[ps : ps + 16])
-                if cg in cone_curve_guids:
+                if cg in cone_vol_curve_guids:
                     cnt = struct.unpack_from("<H", buf, ps + 32)[0] >> 1
                     stride = struct.unpack_from("<H", buf, ps + 34)[0]
-                    if cnt >= 2 and stride >= 8 and ps + 36 + cnt * stride <= pe:
-                        pts = []
+                    if cnt >= 2 and stride >= 16 and ps + 36 + cnt * stride <= pe:
+                        orig_pts = []
                         for ki in range(cnt):
                             off = ps + 36 + ki * stride
-                            if stride >= 16:
-                                x, y, t1, t2 = struct.unpack_from("<ffff", buf, off)
-                            else:
-                                x, y = struct.unpack_from("<ff", buf, off)
-                                t1, t2 = 0.0, 0.0
-                            new_x = round(max(0.0, min(180.0, 180.0 - x)), 5)
-                            pts.append((new_x, y, -t1, -t2))
+                            x, y, t1, t2 = struct.unpack_from("<ffff", buf, off)
+                            orig_pts.append((x, y, t1, t2))
 
-                        new_pts = sorted(pts, key=lambda p: p[0])
-                        for ki, (nx, ny, nt1, nt2) in enumerate(new_pts):
-                            off = ps + 36 + ki * stride
-                            if stride >= 16:
-                                struct.pack_into("<ffff", buf, off, nx, ny, nt1, nt2)
+                        # Invertir eje horizontal preservando la correspondencia exacta de cada segmento:
+                        # El punto ki del nuevo arreglo corresponde a orig_idx = cnt - 1 - ki
+                        # x' = 180.0 - x[orig_idx]
+                        # y' = y[orig_idx]
+                        # La curvatura t1 (forma del segmento que inicia en ki y termina en ki+1)
+                        # corresponde al segmento invertido que terminaba en orig_idx,
+                        # es decir, el que partía de orig_idx - 1 = cnt - 2 - ki con curvatura -t1.
+                        # El último punto ki = cnt - 1 SIEMPRE debe tener t1 = 0.0 (fin de spline).
+                        for ki in range(cnt):
+                            orig_idx = cnt - 1 - ki
+                            new_x = round(max(0.0, min(180.0, 180.0 - orig_pts[orig_idx][0])), 4)
+                            new_y = orig_pts[orig_idx][1]
+                            if ki < cnt - 1:
+                                prev_orig_idx = cnt - 2 - ki
+                                new_t1 = -orig_pts[prev_orig_idx][2]
                             else:
-                                struct.pack_into("<ff", buf, off, nx, ny)
+                                new_t1 = 0.0
+                            new_t2 = 0.0
+                            off = ps + 36 + ki * stride
+                            struct.pack_into("<ffff", buf, off, new_x, new_y, new_t1, new_t2)
                         inverted_count += 1
 
     walk_curvs(0, len(buf))
