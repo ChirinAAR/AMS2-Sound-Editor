@@ -734,7 +734,32 @@ def main() -> None:
             for role_name, exp_guid in sls_v.event_guids.items():
                 assert exp_guid in reloaded_roles, f"Falta el rol {role_name} ({exp_guid}) en el banco de Mercer V8!"
             assert_sndh_and_fsb_alignment(mercer_sls_res.bank_bytes)
-            print("   Porteo de Mercer V8 verificado: 0 GUIDs duplicados, eventos nativos y parámetros load/rpm sincronizados al 100%!")
+
+            # Verificar inversión de cono espacial 3D (Event Cone Angle)
+            orig_first_cone_x = None
+            for cid, ps, pe, _ in iter_riff_chunks(mercer_b.raw, 12, len(mercer_b.raw)):
+                if cid == b"LIST" and mercer_b.raw[ps : ps + 4] == b"PROJ":
+                    for scid, sps, spe, _ in iter_riff_chunks(mercer_b.raw, ps + 4, pe):
+                        if scid == b"CURV" and spe - sps >= 52:
+                            cg = mercer_b.raw[sps : sps + 16]
+                            if cg == b"\x00\xf5\x7f\xdb\x94\xa9BI\x8azU\x1e\x0c\xb2\xa6\x91":
+                                orig_first_cone_x = struct.unpack_from("<ff", mercer_b.raw, sps + 36)[0]
+                                break
+            if orig_first_cone_x is not None:
+                new_first_cone_x = None
+                for cid, ps, pe, _ in iter_riff_chunks(mercer_sls_res.bank_bytes, 12, len(mercer_sls_res.bank_bytes)):
+                    if cid == b"LIST" and mercer_sls_res.bank_bytes[ps : ps + 4] == b"PROJ":
+                        for scid, sps, spe, _ in iter_riff_chunks(mercer_sls_res.bank_bytes, ps + 4, pe):
+                            if scid == b"CURV" and spe - sps >= 52:
+                                cg = mercer_sls_res.bank_bytes[sps : sps + 16]
+                                if cg == b"\x00\xf5\x7f\xdb\x94\xa9BI\x8azU\x1e\x0c\xb2\xa6\x91":
+                                    stride = struct.unpack_from("<H", mercer_sls_res.bank_bytes, sps + 34)[0]
+                                    new_first_cone_x = struct.unpack_from("<ff", mercer_sls_res.bank_bytes, sps + 36 + stride)[0]
+                                    break
+                assert new_first_cone_x is not None and abs(new_first_cone_x - 97.3) < 0.2, (
+                    f"Fallo en inversión de curva de cono espacial: valor obtenido {new_first_cone_x}"
+                )
+            print("   Porteo de Mercer V8 verificado: 0 GUIDs duplicados, eventos nativos, conos espaciales 3D invertidos y parámetros load/rpm sincronizados al 100%!")
 
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 

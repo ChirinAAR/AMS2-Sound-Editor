@@ -2319,6 +2319,99 @@ def _patch_prmb_and_ibsb_in_proj(
     return bytes(out)
 
 
+def invert_event_cone_curves_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
+    """Invierte la orientación espacial de los conos de sonido FMOD (Event Cone Angle).
+
+    En Assetto Corsa, el vector forward del emisor exterior (engine_ext) apunta hacia ATRÁS
+    (0° = escape / chase cam, 180° = frente / trompa).
+    En Automobilista 2 (Madness Engine), el vector forward apunta hacia ADELANTE (0° = frente,
+    180° = escape / chase cam).
+
+    Esta función detecta todas las curvas CURV gobernadas por el parámetro 'Event Cone Angle'
+    a través de chunks CTRL, e invierte horizontalmente su eje de grados (180.0 - x)
+    reordenando los puntos en orden creciente de grados y negando las tangentes de Hermite,
+    garantizando que el sonido del escape suene en la parte trasera (Chase Cam / alejamiento)
+    y la admisión suene en la parte delantera (acercamiento).
+    """
+    buf = bytearray(proj_payload)
+
+    # 1. Recolectar GUIDs de parámetros 'Event Cone Angle'
+    cone_param_guids: set[bytes] = set()
+
+    def walk_prms(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                walk_prms(ps + 4, pe)
+            elif cid == b"PRMB" and pe - ps >= 31:
+                slen = struct.unpack_from("<H", buf, ps + 21)[0]
+                if ps + 23 + slen <= pe:
+                    name = (
+                        bytes(buf[ps + 23 : ps + 23 + slen])
+                        .decode("latin1", "replace")
+                        .rstrip("\x00")
+                    )
+                    if "cone angle" in name.lower() or "event cone" in name.lower():
+                        cone_param_guids.add(bytes(buf[ps : ps + 16]))
+
+    walk_prms(0, len(buf))
+    if not cone_param_guids:
+        return bytes(buf), 0
+
+    # 2. Recolectar GUIDs de curvas CURV vinculadas a esos parámetros vía CTRL
+    cone_curve_guids: set[bytes] = set()
+
+    def walk_ctrls(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                walk_ctrls(ps + 4, pe)
+            elif cid == b"CTRL" and pe - ps >= 68:
+                param_g = bytes(buf[ps + 32 : ps + 48])
+                if param_g in cone_param_guids:
+                    curve_g = bytes(buf[ps + 48 : ps + 64])
+                    cone_curve_guids.add(curve_g)
+
+    walk_ctrls(0, len(buf))
+    if not cone_curve_guids:
+        return bytes(buf), 0
+
+    # 3. Invertir las curvas CURV correspondientes
+    inverted_count = 0
+
+    def walk_curvs(start: int, end: int) -> None:
+        nonlocal inverted_count
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                walk_curvs(ps + 4, pe)
+            elif cid == b"CURV" and pe - ps >= 36:
+                cg = bytes(buf[ps : ps + 16])
+                if cg in cone_curve_guids:
+                    cnt = struct.unpack_from("<H", buf, ps + 32)[0] >> 1
+                    stride = struct.unpack_from("<H", buf, ps + 34)[0]
+                    if cnt >= 2 and stride >= 8 and ps + 36 + cnt * stride <= pe:
+                        pts = []
+                        for ki in range(cnt):
+                            off = ps + 36 + ki * stride
+                            if stride >= 16:
+                                x, y, t1, t2 = struct.unpack_from("<ffff", buf, off)
+                            else:
+                                x, y = struct.unpack_from("<ff", buf, off)
+                                t1, t2 = 0.0, 0.0
+                            new_x = round(max(0.0, min(180.0, 180.0 - x)), 5)
+                            pts.append((new_x, y, -t1, -t2))
+
+                        new_pts = sorted(pts, key=lambda p: p[0])
+                        for ki, (nx, ny, nt1, nt2) in enumerate(new_pts):
+                            off = ps + 36 + ki * stride
+                            if stride >= 16:
+                                struct.pack_into("<ffff", buf, off, nx, ny, nt1, nt2)
+                            else:
+                                struct.pack_into("<ff", buf, off, nx, ny)
+                        inverted_count += 1
+
+    walk_curvs(0, len(buf))
+    return bytes(buf), inverted_count
+
+
 def _make_trigger_evnt(eguid: bytes, ibg: bytes, bus_guid: bytes) -> bytes:
     obj_guid = hashlib.sha256(eguid + b"_obj").digest()[:16]
     prop_guid = hashlib.sha256(eguid + b"_prop").digest()[:16]
@@ -2472,6 +2565,7 @@ def build_direct_ported_bank_from_ac(
     is_ai_bank: bool = False,
     mute_secondary_pops: bool = False,
     native_bank_path: Path | str | None = None,
+    invert_spatial_cone: bool = True,
 ) -> PortedBankResult:
     """Construye un nuevo archivo .bank para Automobilista 2 directamente desde un banco .bank de Assetto Corsa.
 
@@ -2528,6 +2622,10 @@ def build_direct_ported_bank_from_ac(
 
     # 3. Parcheo binario de PROJ: 'rpms' -> 'rpm' en PRMB e IBSB a buses de AMS2
     proj_buf = bytearray(_patch_prmb_and_ibsb_in_proj(orig_proj_payload, {"rpms": "rpm"}, ibg_to_target_bus))
+
+    # Invertir cono espacial 3D si aplica (ajustando la orientación trasera de AC al frente de AMS2)
+    if invert_spatial_cone:
+        proj_buf = bytearray(invert_event_cone_curves_in_proj(bytes(proj_buf))[0])
 
     safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_mod"
     guid_map: dict[bytes, bytes] | None = None
@@ -2976,6 +3074,7 @@ def export_ams2_mod_package(
     build_ai_bank: bool = True,
     optimize_chase_cam: bool = True,
     mute_pops: bool = False,
+    invert_spatial_cone: bool = True,
 ) -> ModExportSummary:
     """Compila el .bank y el .csdbin listos para copiar en Automobilista 2 / AMS2 Content Manager."""
     output_root = Path(output_root)
@@ -2988,6 +3087,7 @@ def export_ams2_mod_package(
             mod_identifier=safe_mod,
             standalone_guids=standalone_guids,
             rpm_bands=rpm_bands,
+            invert_spatial_cone=invert_spatial_cone,
         )
     else:
         if donor is None:
@@ -3031,6 +3131,7 @@ def export_ams2_mod_package(
                 rpm_bands=rpm_bands,
                 is_ai_bank=True,
                 mute_secondary_pops=mute_pops,
+                invert_spatial_cone=invert_spatial_cone,
             )
         elif donor is not None and donor.source_path is not None:
             companion_ai = donor.source_path.parent / f"{donor.source_path.stem}_AI.bank"
@@ -3055,6 +3156,7 @@ def export_ams2_mod_package(
                     rpm_bands=rpm_bands,
                     is_ai_bank=True,
                     mute_secondary_pops=mute_pops,
+                    invert_spatial_cone=invert_spatial_cone,
                 )
         elif library and library.fmod_bank:
             ai_bank_res = build_direct_ported_bank_from_ac(
@@ -3064,6 +3166,7 @@ def export_ams2_mod_package(
                 rpm_bands=rpm_bands,
                 is_ai_bank=True,
                 mute_secondary_pops=mute_pops,
+                invert_spatial_cone=invert_spatial_cone,
             )
 
         if ai_bank_res is not None:

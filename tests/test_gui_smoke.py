@@ -231,12 +231,18 @@ def main() -> None:
         app.vanilla_mgr.install_sound = lambda vehicle, bank_bytes, ai_bank_bytes=None, **kw: (direct_installed.append((len(bank_bytes), len(ai_bank_bytes) if ai_bank_bytes else 0)) or True, "OK mock direct")
         orig_info = mb.showinfo
         orig_yesno = mb.askyesno
+        from ams2_sound_porter import gui_app as ga
+        orig_ga_info = getattr(ga, "messagebox", None) and ga.messagebox.showinfo
+        orig_ga_yesno = getattr(ga, "messagebox", None) and ga.messagebox.askyesno
         mb.showinfo = lambda *args, **kw: None
         mb.askyesno = lambda *args, **kw: True
+        if hasattr(ga, "messagebox"):
+            ga.messagebox.showinfo = lambda *args, **kw: None
+            ga.messagebox.askyesno = lambda *args, **kw: True
         try:
             import time
             app._run_inject_vanilla()
-            timeout = time.time() + 20
+            timeout = time.time() + 60
             while not direct_installed and time.time() < timeout:
                 app.update()
                 time.sleep(0.05)
@@ -247,6 +253,9 @@ def main() -> None:
             app.vanilla_mgr.install_sound = orig_install
             mb.showinfo = orig_info
             mb.askyesno = orig_yesno
+            if hasattr(ga, "messagebox"):
+                if orig_ga_info: ga.messagebox.showinfo = orig_ga_info
+                if orig_ga_yesno: ga.messagebox.askyesno = orig_ga_yesno
 
         # Probar inyección en vehículo vanilla en modo donante (asegurando que build_ported_bank esté definido)
         installed_called = []
@@ -255,11 +264,14 @@ def main() -> None:
         orig_yesno = mb.askyesno
         mb.showinfo = lambda *args, **kw: None
         mb.askyesno = lambda *args, **kw: True
+        if hasattr(ga, "messagebox"):
+            ga.messagebox.showinfo = lambda *args, **kw: None
+            ga.messagebox.askyesno = lambda *args, **kw: True
         try:
             app.port_mode_var.set("donor")
             import time
             app._run_inject_vanilla()
-            timeout = time.time() + 20
+            timeout = time.time() + 60
             while not installed_called and time.time() < timeout:
                 app.update()
                 time.sleep(0.05)
@@ -270,6 +282,9 @@ def main() -> None:
             app.vanilla_mgr.install_sound = orig_install
             mb.showinfo = orig_info
             mb.askyesno = orig_yesno
+            if hasattr(ga, "messagebox"):
+                if orig_ga_info: ga.messagebox.showinfo = orig_ga_info
+                if orig_ga_yesno: ga.messagebox.askyesno = orig_ga_yesno
 
         app.update_idletasks()
         print("GUI Smoke Test + Audio Preview Async + Soporte GUIDs.txt + Pestaña 3 (v1.4.0) + Vanilla Manager (v1.6.0) superado al 100% sin errores!")

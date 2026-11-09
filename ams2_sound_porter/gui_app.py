@@ -182,6 +182,7 @@ class SoundPorterApp(tk.Tk):
         self.vanilla_auto_backup_var = tk.BooleanVar(value=True)
         self.vanilla_sync_ai_var = tk.BooleanVar(value=True)
         self.mute_all_pops_var = tk.BooleanVar(value=False)
+        self.invert_cone_var = tk.BooleanVar(value=True)
         self.vanilla_filtered_vehicles: list[VanillaVehicle] = []
         self.vanilla_export_dest_var = tk.StringVar(value="Ningún vehículo vanilla seleccionado.")
 
@@ -1415,6 +1416,12 @@ class SoundPorterApp(tk.Tk):
             self.opts_card,
             text="🔇 Silenciar completamente la banda de POPS (Petardeos) en la exportación",
             variable=self.mute_all_pops_var,
+        ).pack(anchor="w", pady=3)
+
+        ttk.Checkbutton(
+            self.opts_card,
+            text="🔄 Invertir Cono Espacial 3D (Event Cone Angle): Corrige la orientación 180° entre Assetto Corsa y Automobilista 2",
+            variable=self.invert_cone_var,
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
@@ -4373,6 +4380,8 @@ class SoundPorterApp(tk.Tk):
                     auto_link_csdbin=True,
                     rpm_bands=bands_to_export,
                     throttle_cut=tcut_cfg,
+                    mute_pops=self.mute_all_pops_var.get(),
+                    invert_spatial_cone=self.invert_cone_var.get(),
                 )
                 self.dispatch_to_ui(self._on_export_success, summary)
             except Exception as exc:
@@ -4493,6 +4502,8 @@ class SoundPorterApp(tk.Tk):
         codec_mode = FSB5_MODE_PCM16 if self.codec_choice_var.get() == "PCM16" else FSB5_MODE_FADPCM
         is_direct = self.is_direct_ac_mode
         sync_ai = self.vanilla_sync_ai_var.get()
+        mute_pops = self.mute_all_pops_var.get()
+        invert_cone = self.invert_cone_var.get()
 
         def worker() -> None:
             try:
@@ -4518,8 +4529,9 @@ class SoundPorterApp(tk.Tk):
                         target_ctrl_params=veh.ctrl_parameters,
                         target_role_buses=getattr(veh, "ai_event_buses", None),
                         rpm_bands=bands_to_export,
-                        mute_secondary_pops=self.mute_all_pops_var.get(),
+                        mute_secondary_pops=mute_pops,
                         native_bank_path=native_p,
+                        invert_spatial_cone=invert_cone,
                     )
                     bank_bytes = direct_res.bank_bytes
                 else:
