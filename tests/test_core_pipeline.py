@@ -964,6 +964,25 @@ def main() -> None:
                         )
             print(f"   Mod {mod_name} (Jugador + IA + .csdbin + protección Vorbis) verificado al 100%!")
 
+    # Verificar que override_root_rpm en Modo Directo AC actualiza INST (+69) en el .bank exportado
+    ap_slot = next((sl for sl in ac_lib.fmod_bank.slots if sl.has_rpm_autopitch and sl.autopitch_ref_rpm and sl.wav_guid), None)
+    assert ap_slot is not None, "No se encontró slot con autopitch en Z4 GT3 para probar override_root_rpm"
+    orig_ap_rpm = float(ap_slot.autopitch_ref_rpm)
+    direct_maps = [SlotMappingConfig(s.global_index, action="keep_donor") for s in ac_lib.fmod_bank.slots]
+    direct_maps[ap_slot.global_index].override_root_rpm = orig_ap_rpm + 300.0
+    res_pitch = build_direct_ported_bank_from_ac(
+        ac_bank=ac_lib.fmod_bank,
+        mod_identifier="z4_pitch_shift",
+        standalone_guids=True,
+        mappings=direct_maps,
+    )
+    reloaded_pitch = FmodBank(raw=res_pitch.bank_bytes)
+    new_ap_rpm = reloaded_pitch.slots[ap_slot.global_index].autopitch_ref_rpm
+    assert new_ap_rpm is not None and abs(new_ap_rpm - (orig_ap_rpm + 300.0)) < 1.0, (
+        f"Autopitch directo esperado {orig_ap_rpm + 300.0}, obtenido {new_ap_rpm}"
+    )
+    print(f"   Override de RPM Raíz (Pitch) en Modo Directo AC verificado: {orig_ap_rpm:.0f} -> {new_ap_rpm:.0f} RPM!")
+
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 
 

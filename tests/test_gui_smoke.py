@@ -139,6 +139,62 @@ def main() -> None:
                 assert "Ganancia ajustada" in app.status_var.get()
                 print("   GUI Batch Gain probado con éxito:", app.status_var.get())
 
+                # 2b. Probar "Modificar todas las RPM" (+450 y -200 RPM en min, fade-in, fade-out y max)
+                vis_batch = [int(iid) for iid in app.rpm_tree.get_children()]
+                app.rpm_tree.selection_set(str(vis_batch[0]))
+                app._on_rpm_band_selected()
+                before_ranges = {
+                    i: (app.rpm_bands[i].rpm_min, app.rpm_bands[i].fade_in_end, app.rpm_bands[i].fade_out_start, app.rpm_bands[i].rpm_max)
+                    for i in vis_batch
+                }
+                app.batch_rpm_var.set("+450")
+                app.cmd_batch_shift_all_rpm()
+                assert "Rangos RPM ajustados (+450 RPM)" in app.status_var.get()
+                for i, (r0, fi0, fo0, rm0) in before_ranges.items():
+                    b_cur = app.rpm_bands[i]
+                    assert (b_cur.rpm_min, b_cur.fade_in_end, b_cur.fade_out_start, b_cur.rpm_max) == (
+                        r0 + 450.0, fi0 + 450.0, fo0 + 450.0, rm0 + 450.0
+                    )
+                assert app.band_rmin_var.get() == f"{app.rpm_bands[vis_batch[0]].rpm_min:.0f}"
+                app.batch_rpm_var.set("-200")
+                app.cmd_batch_shift_all_rpm()
+                for i, (r0, _fi0, _fo0, rm0) in before_ranges.items():
+                    b_cur = app.rpm_bands[i]
+                    assert b_cur.rpm_min >= 0.0 and b_cur.rpm_min <= b_cur.fade_in_end <= b_cur.fade_out_start <= b_cur.rpm_max
+                    assert b_cur.rpm_max == rm0 + 250.0
+                print("   GUI Modificar todas las RPM (+450 / -200) probado con éxito:", app.status_var.get())
+
+                # 2c. Probar "Modificar todos los RPM Raíz" (+300 y -150 RPM sobre pitch raíz)
+                before_roots = {}
+                for i in vis_batch:
+                    g0 = app.rpm_bands[i].donor_slot_indices[0]
+                    before_roots[i] = (
+                        g0,
+                        (app.mappings[g0].override_root_rpm or None) or app.active_engine_bank.slots[g0].autopitch_ref_rpm,
+                    )
+                app.batch_root_rpm_var.set("+300")
+                app.cmd_batch_shift_all_root_rpm()
+                assert "RPM Raíz (Pitch) ajustado (+300 RPM)" in app.status_var.get()
+                seen_batch_slots: set[int] = set()
+                for i, (g0, rr0) in before_roots.items():
+                    if g0 in seen_batch_slots:
+                        continue
+                    seen_batch_slots.add(g0)
+                    if rr0 is not None and rr0 > 0:
+                        assert app.mappings[g0].override_root_rpm == round(rr0 + 300.0, 1)
+                    else:
+                        assert app.mappings[g0].override_root_rpm is None
+                app.batch_root_rpm_var.set("-150")
+                app.cmd_batch_shift_all_root_rpm()
+                seen_batch_slots.clear()
+                for i, (g0, rr0) in before_roots.items():
+                    if g0 in seen_batch_slots:
+                        continue
+                    seen_batch_slots.add(g0)
+                    if rr0 is not None and rr0 > 0:
+                        assert app.mappings[g0].override_root_rpm == max(200.0, round(rr0 + 150.0, 1))
+                print("   GUI Modificar todos los RPM Raíz (+300 / -150) probado con éxito:", app.status_var.get())
+
                 # 3. Probar Auto-Ajustar Escalera RPM sobre la banda seleccionada (selectivo)
                 app.rpm_tree.selection_set(first_band_id)
                 app._on_rpm_band_selected()

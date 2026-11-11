@@ -140,6 +140,8 @@ class SoundPorterApp(tk.Tk):
         self.band_gain_var = tk.StringVar(value="0.0")
         self.band_source_var = tk.StringVar(value="")
         self.band_custom_wav_var = tk.StringVar(value="")
+        self.batch_root_rpm_var = tk.StringVar(value="+300")
+        self.batch_rpm_var = tk.StringVar(value="+450")
         self.batch_gain_var = tk.StringVar(value="+1.5")
 
         self.sim_telemetry_var = tk.StringVar(
@@ -906,25 +908,37 @@ class SoundPorterApp(tk.Tk):
 
         bed_r1 = ttk.Frame(band_ed, style="Card.TFrame")
         bed_r1.pack(fill="x", pady=(0, 5))
-        self.selected_band_lbl = ttk.Label(
-            bed_r1,
-            text="3) Selecciona una banda en la tabla o en el gráfico para ajustar sus RPM y fundidos cruzados:",
-            style="CardSection.TLabel",
-        )
-        self.selected_band_lbl.pack(side="left")
         ttk.Button(
             bed_r1,
             text="▶ Escuchar Muestra de esta Banda",
             command=self.cmd_preview_selected_band_sample,
         ).pack(side="right")
         batch_f = ttk.Frame(bed_r1, style="Card.TFrame")
-        batch_f.pack(side="right", padx=(0, 16))
+        batch_f.pack(side="right", padx=(8, 12))
+        ttk.Button(
+            batch_f,
+            text="Modificar todos los RPM Raíz",
+            command=self.cmd_batch_shift_all_root_rpm,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Entry(batch_f, textvariable=self.batch_root_rpm_var, width=6).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            batch_f,
+            text="Modificar todas las RPM",
+            command=self.cmd_batch_shift_all_rpm,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Entry(batch_f, textvariable=self.batch_rpm_var, width=6).pack(side="left", padx=(0, 8))
         ttk.Button(
             batch_f,
             text="Amplificar todas las bandas",
             command=self.cmd_batch_gain_all_bands,
         ).pack(side="left", padx=(0, 4))
         ttk.Entry(batch_f, textvariable=self.batch_gain_var, width=5).pack(side="left")
+        self.selected_band_lbl = ttk.Label(
+            bed_r1,
+            text="3) Selecciona una banda para ajustar sus RPM:",
+            style="CardSection.TLabel",
+        )
+        self.selected_band_lbl.pack(side="left", fill="x", expand=True)
 
         # Fila de selección y sobreescritura de muestra asignada a la banda
         bed_r_sample = ttk.Frame(band_ed, style="Card.TFrame")
@@ -2482,12 +2496,138 @@ class SoundPorterApp(tk.Tk):
             f"↺ Todas las bandas de la sección {'INTERIOR' if persp == 'int' else 'EXTERIOR'} restauradas a los rangos originales del donante."
         )
 
-    def cmd_batch_gain_all_bands(self) -> None:
-        """Aumenta o disminuye la ganancia (dB) de todas las bandas activas de la vista seleccionada."""
+    def _collect_batch_target_bands(self) -> tuple[str, list[int], list[int]] | None:
+        """Devuelve `(perspectiva, indices_visibles_activos, indices_con_gemelas_aux)` para edición por lotes."""
         bank = self.active_engine_bank
         if not bank or not self.rpm_bands:
             messagebox.showinfo("Cargar banco", "Carga primero un banco .bank de AC o donante de AMS2.")
+            return None
+
+        persp = self.rpm_view_persp_var.get()
+        vis_indices = self._visible_band_indices()
+        active_vis = [
+            idx
+            for idx in vis_indices
+            if not (self._band_is_silenced(self.rpm_bands[idx]) or self.rpm_bands[idx].is_muted_bus)
+        ]
+        if not active_vis:
+            messagebox.showinfo("Sin bandas activas", f"No hay bandas activas en la vista {persp.upper()}.")
+            return None
+
+        target_indices = list(active_vis)
+        target_set = set(target_indices)
+        if persp == "int":
+            eng_sigs = {
+                (
+                    self.rpm_bands[i].load_role,
+                    int(round(self.rpm_bands[i].orig_rpm_min)),
+                    int(round(self.rpm_bands[i].orig_rpm_max)),
+                )
+                for i in active_vis
+                if self.rpm_bands[i].event_role == "EngineInt"
+            }
+            for oidx, other in enumerate(self.rpm_bands):
+                if oidx not in target_set and other.event_role == "AuxInt" and not (
+                    self._band_is_silenced(other) or other.is_muted_bus
+                ):
+                    sig = (other.load_role, int(round(other.orig_rpm_min)), int(round(other.orig_rpm_max)))
+                    if sig in eng_sigs:
+                        target_indices.append(oidx)
+                        target_set.add(oidx)
+        return persp, active_vis, target_indices
+
+    def cmd_batch_shift_all_rpm(self) -> None:
+        """Suma o resta un desplazamiento en RPM a Mín, Fade-In, Fade-Out y Máx de todas las bandas activas."""
+        collected = self._collect_batch_target_bands()
+        if not collected:
             return
+        persp, active_vis, target_indices = collected
+
+        txt = self.batch_rpm_var.get().strip()
+        try:
+            delta_rpm = float(txt)
+        except ValueError:
+            messagebox.showwarning("Valor RPM inválido", "Ingresa un número válido en RPM (ej: +450 o -300).")
+            return
+
+        for idx in target_indices:
+            b = self.rpm_bands[idx]
+            orig_span = b.rpm_max - b.rpm_min
+            new_rmin = max(0.0, round(b.rpm_min + delta_rpm, 1))
+            new_fi = max(new_rmin, round(b.fade_in_end + delta_rpm, 1))
+            new_fo = max(new_fi, round(b.fade_out_start + delta_rpm, 1))
+            new_rmax = max(new_fo, round(b.rpm_max + delta_rpm, 1))
+            if orig_span > 40.0 and new_rmax < new_rmin + 40.0:
+                new_rmax = new_rmin + 40.0
+            b.rpm_min = new_rmin
+            b.fade_in_end = new_fi
+            b.fade_out_start = new_fo
+            b.rpm_max = new_rmax
+
+        if self._selected_band_idx is not None and self._selected_band_idx in target_indices:
+            b_sel = self.rpm_bands[self._selected_band_idx]
+            self.band_rmin_var.set(f"{b_sel.rpm_min:.0f}")
+            self.band_fi_var.set(f"{b_sel.fade_in_end:.0f}")
+            self.band_fo_var.set(f"{b_sel.fade_out_start:.0f}")
+            self.band_rmax_var.set(f"{b_sel.rpm_max:.0f}")
+
+        self._refresh_rpm_tab()
+        sign = "+" if delta_rpm >= 0 else ""
+        self.status_var.set(
+            f"✔ Rangos RPM ajustados ({sign}{delta_rpm:.0f} RPM) para las {len(active_vis)} bandas activas de la vista {persp.upper()}."
+        )
+
+    def cmd_batch_shift_all_root_rpm(self) -> None:
+        """Suma o resta un desplazamiento al RPM Raíz (Pitch) de todas las bandas activas de la vista."""
+        collected = self._collect_batch_target_bands()
+        if not collected:
+            return
+        persp, active_vis, target_indices = collected
+        bank = self.active_engine_bank
+        assert bank is not None
+
+        txt = self.batch_root_rpm_var.get().strip()
+        try:
+            delta_root = float(txt)
+        except ValueError:
+            messagebox.showwarning("RPM Raíz inválido", "Ingresa un número válido en RPM (ej: +300 o -250).")
+            return
+
+        modified_slots: set[int] = set()
+        for idx in target_indices:
+            b = self.rpm_bands[idx]
+            for gidx in b.donor_slot_indices:
+                if gidx in modified_slots or not (0 <= gidx < len(self.mappings)) or not (0 <= gidx < len(bank.slots)):
+                    continue
+                cfg = self.mappings[gidx]
+                sl = bank.slots[gidx]
+                cur_root = cfg.override_root_rpm if (cfg.override_root_rpm and cfg.override_root_rpm > 0.0) else sl.autopitch_ref_rpm
+                if cur_root is None or cur_root <= 0.0:
+                    continue
+                cfg.override_root_rpm = max(200.0, round(cur_root + delta_root, 1))
+                modified_slots.add(gidx)
+
+        if self._selected_band_idx is not None and self._selected_band_idx in target_indices:
+            b_sel = self.rpm_bands[self._selected_band_idx]
+            if b_sel.donor_slot_indices:
+                g0 = b_sel.donor_slot_indices[0]
+                if 0 <= g0 < len(self.mappings) and 0 <= g0 < len(bank.slots):
+                    rr = (self.mappings[g0].override_root_rpm or None) or bank.slots[g0].autopitch_ref_rpm
+                    self.band_root_rpm_var.set(f"{rr:.0f}" if rr else "")
+
+        self._refresh_donor_tree()
+        self._refresh_rpm_tab()
+        sign = "+" if delta_root >= 0 else ""
+        self.status_var.set(
+            f"✔ RPM Raíz (Pitch) ajustado ({sign}{delta_root:.0f} RPM) en {len(modified_slots)} pistas de las {len(active_vis)} bandas de la vista {persp.upper()}."
+        )
+
+    def cmd_batch_gain_all_bands(self) -> None:
+        """Aumenta o disminuye la ganancia (dB) de todas las bandas activas de la vista seleccionada."""
+        collected = self._collect_batch_target_bands()
+        if not collected:
+            return
+        persp, active_vis, target_indices = collected
 
         txt = self.batch_gain_var.get().strip()
         try:
@@ -2496,21 +2636,15 @@ class SoundPorterApp(tk.Tk):
             messagebox.showwarning("Ganancia inválida", "Ingresa un número válido en dB (ej: +2.0 o -1.5).")
             return
 
-        persp = self.rpm_view_persp_var.get()
-        vis_indices = self._visible_band_indices()
-        if not vis_indices:
-            messagebox.showinfo("Sin bandas activas", f"No hay bandas activas en la vista {persp.upper()}.")
-            return
-
         modified_slots: set[int] = set()
-        for idx in vis_indices:
+        for idx in target_indices:
             b = self.rpm_bands[idx]
             for gidx in b.donor_slot_indices:
                 if 0 <= gidx < len(self.mappings) and gidx not in modified_slots:
                     self.mappings[gidx].gain_db = round(self.mappings[gidx].gain_db + delta_db, 1)
                     modified_slots.add(gidx)
 
-        if self._selected_band_idx is not None and self._selected_band_idx in vis_indices:
+        if self._selected_band_idx is not None and self._selected_band_idx in target_indices:
             b_sel = self.rpm_bands[self._selected_band_idx]
             if b_sel.donor_slot_indices:
                 g0 = b_sel.donor_slot_indices[0]
@@ -2521,7 +2655,7 @@ class SoundPorterApp(tk.Tk):
         self._refresh_rpm_tab()
         sign = "+" if delta_db >= 0 else ""
         self.status_var.set(
-            f"✔ Ganancia ajustada ({sign}{delta_db:.1f} dB) para las {len(vis_indices)} bandas activas de la vista {persp.upper()}."
+            f"✔ Ganancia ajustada ({sign}{delta_db:.1f} dB) para las {len(active_vis)} bandas activas de la vista {persp.upper()}."
         )
 
     def cmd_delete_rpm_band(self) -> None:
@@ -4608,6 +4742,7 @@ class SoundPorterApp(tk.Tk):
                         mute_secondary_pops=mute_pops,
                         native_bank_path=native_p,
                         invert_spatial_cone=invert_cone,
+                        mappings=self.mappings,
                     )
                     bank_bytes = direct_res.bank_bytes
                 else:
@@ -4659,6 +4794,7 @@ class SoundPorterApp(tk.Tk):
                             is_ai_bank=True,
                             mute_secondary_pops=mute_pops,
                             invert_spatial_cone=invert_cone,
+                            mappings=self.mappings,
                         )
                         ai_bytes = ai_direct_res.bank_bytes
                     else:

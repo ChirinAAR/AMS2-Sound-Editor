@@ -3099,6 +3099,7 @@ def build_direct_ported_bank_from_ac(
     mute_secondary_pops: bool = False,
     native_bank_path: Path | str | None = None,
     invert_spatial_cone: bool = True,
+    mappings: list[SlotMappingConfig] | None = None,
 ) -> PortedBankResult:
     """Construye un nuevo archivo .bank para Automobilista 2 directamente desde un banco .bank de Assetto Corsa.
 
@@ -3448,10 +3449,21 @@ def build_direct_ported_bank_from_ac(
     new_stdt_payload = build_stdt_chunk(stdt_entries) if stdt_entries else None
 
     # Parchear PROJ
+    autopitch_updates: dict[bytes, float] = {}
+    if mappings:
+        map_by_gidx = {c.donor_global_index: c for c in mappings}
+        for sl in ac_bank.slots:
+            if sl.wav_guid is None:
+                continue
+            cfg = map_by_gidx.get(sl.global_index)
+            if cfg and cfg.override_root_rpm is not None and cfg.override_root_rpm > 100.0:
+                if sl.autopitch_ref_rpm is None or abs(cfg.override_root_rpm - sl.autopitch_ref_rpm) > 0.1:
+                    autopitch_updates[sl.wav_guid] = float(cfg.override_root_rpm)
+
     patched_proj_body = _patch_proj_chunks(
         proj_payload=proj_buf,
         wav_redirects={},
-        autopitch_updates={},
+        autopitch_updates=autopitch_updates,
         guid_map=guid_map,
         rpm_bands=rpm_bands,
     )
@@ -3756,6 +3768,7 @@ def export_ams2_mod_package(
             rpm_bands=rpm_bands,
             mute_secondary_pops=mute_pops,
             invert_spatial_cone=invert_spatial_cone,
+            mappings=mappings,
         )
     else:
         if donor is None:
@@ -3800,6 +3813,7 @@ def export_ams2_mod_package(
                 is_ai_bank=True,
                 mute_secondary_pops=mute_pops,
                 invert_spatial_cone=invert_spatial_cone,
+                mappings=mappings,
             )
         elif donor is not None and donor.source_path is not None:
             companion_ai = donor.source_path.parent / f"{donor.source_path.stem}_AI.bank"
