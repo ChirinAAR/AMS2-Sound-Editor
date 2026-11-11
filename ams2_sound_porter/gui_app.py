@@ -4357,10 +4357,7 @@ class SoundPorterApp(tk.Tk):
         if self.mute_all_pops_var.get() and bands_to_export:
             clean_bands: list[RpmBandConfig] = []
             for b in bands_to_export:
-                is_tc_band = (
-                    getattr(b, "load_role", "") in ("pops", "throttle_cut")
-                    or any(s in (13, 25, 129) for s in getattr(b, "donor_slot_indices", []))
-                )
+                is_tc_band = getattr(b, "load_role", "") in ("pops", "throttle_cut")
                 if is_tc_band:
                     clean_bands.append(
                         RpmBandConfig(
@@ -4552,10 +4549,7 @@ class SoundPorterApp(tk.Tk):
         if mute_pops and bands_to_export:
             clean_bands: list[RpmBandConfig] = []
             for b in bands_to_export:
-                is_tc_band = (
-                    getattr(b, "load_role", "") in ("pops", "throttle_cut")
-                    or any(s in (13, 25, 129) for s in getattr(b, "donor_slot_indices", []))
-                )
+                is_tc_band = getattr(b, "load_role", "") in ("pops", "throttle_cut")
                 if is_tc_band:
                     clean_bands.append(
                         RpmBandConfig(

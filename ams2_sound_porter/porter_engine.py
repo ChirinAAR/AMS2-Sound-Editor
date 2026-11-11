@@ -2311,7 +2311,7 @@ def _patch_prmb_and_ibsb_in_proj(
         elif cid == b"IBSB" and len(pay) >= 34:
             new_pay = bytearray(pay)
             ig = bytes(pay[:16])
-            if ig in ibg_to_target_bus:
+            if ig in ibg_to_target_bus and bytes(pay[18:34]) != b"\x00" * 16:
                 new_pay[18:34] = ibg_to_target_bus[ig]
             out += _riff_chunk(b"IBSB", bytes(new_pay))
         else:
@@ -2556,11 +2556,196 @@ def inject_native_chunks_in_proj(
     return bytes(buf)
 
 
+_TC_LC_PARAM_NAMES = frozenset({
+    "tc", "traction", "tractioncontrol", "traction_control",
+    "lc", "launch", "launchcontrol", "launch_control",
+})
+_MUTED_SEC_EVENT_ROLES = frozenset({"BackfireExt", "BackfireInt", "Limiter"})
+_MUTED_SEC_PATH_KEYWORDS = ("tractioncontrol", "tc_ext", "tc_int", "limiter", "backfire")
+
+
+def _compute_sparse_pop_locs(
+    ac_bank: FmodBank,
+) -> tuple[set[tuple[int, int]], dict[tuple[int, int], float], set[tuple[int, int]]]:
+    """Detecta muestras cortas sin loop en pistas de motor/escape con envolvente esparsa de petardeos."""
+    sparse_locs: set[tuple[int, int]] = set()
+    dip_ratios: dict[tuple[int, int], float] = {}
+    non_sustained_locs: set[tuple[int, int]] = set()
+
+    for sl in ac_bank.slots:
+        if not sl.can_decode_audio or sl.loop is not None or not (0.02 < sl.duration_sec <= 1.85):
+            continue
+        if sl.event_roles and not any(
+            r in ("EngineExt", "EngineInt", "BackfireExt", "BackfireInt", "Limiter")
+            for r in sl.event_roles
+        ):
+            continue
+        loc = (sl.subbank_index, sl.sample_index)
+        non_sustained_locs.add(loc)
+        try:
+            buf = ac_bank.decode_slot_to_buffer(sl)
+        except Exception:
+            continue
+        mono = buf.pcm.astype(np.float32) / 32768.0
+        if mono.ndim == 2:
+            mono = mono.mean(axis=1)
+        win = max(1, int(buf.sample_rate * 0.010))
+        nwin = len(mono) // win
+        if nwin < 4:
+            continue
+        rms = np.sqrt(np.mean(mono[: nwin * win].reshape(nwin, win) ** 2, axis=1))
+        pk = float(rms.max())
+        dip = float((rms < 0.08 * pk).mean()) if pk > 1e-6 else 1.0
+        dip_ratios[loc] = dip
+        if dip >= 0.55:
+            sparse_locs.add(loc)
+
+    return sparse_locs, dip_ratios, non_sustained_locs
+
+
+def _collect_proj_tc_and_pop_graph(
+    proj_buf: bytes | bytearray,
+    muted_ev_guids_in: set[bytes] | None = None,
+    sparse_locs: set[tuple[int, int]] | None = None,
+    loc_dip_ratios: dict[tuple[int, int], float] | None = None,
+    non_sustained_locs: set[tuple[int, int]] | None = None,
+) -> tuple[set[bytes], set[tuple[int, int]]]:
+    """Resuelve todas las cajas/instrumentos (WAIT, MUIT, SPIT, EVIT) y samples de TC/LC y pops esparsos."""
+    tc_param_guids: set[bytes] = set()
+    muted_ev_guids: set[bytes] = set(muted_ev_guids_in or ())
+    pmls_records: list[tuple[bytes, bytes, list[bytes]]] = []
+    waib_to_wav: dict[bytes, bytes] = {}
+    wav_to_waibs: dict[bytes, list[bytes]] = {}
+    wav_to_loc: dict[bytes, tuple[int, int]] = {}
+    multi_children: dict[bytes, list[bytes]] = {}
+    evit_target: dict[bytes, bytes] = {}
+
+    def scan(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(proj_buf, start, end):
+            if cid == b"PRMB" and pe - ps >= 31:
+                p = proj_buf[ps:pe]
+                slen = struct.unpack_from("<H", p, 21)[0]
+                if 23 + slen + 8 <= len(p):
+                    pname = bytes(p[23 : 23 + slen]).decode("utf-8", "replace").strip().lower()
+                    if pname in _TC_LC_PARAM_NAMES:
+                        tc_param_guids.add(bytes(p[:16]))
+            elif cid == b"PMLB" and pe - ps >= 52:
+                nboxes = struct.unpack_from("<H", proj_buf, ps + 48)[0] >> 1
+                stride = struct.unpack_from("<H", proj_buf, ps + 50)[0]
+                if stride >= 24 and pe >= ps + 52 + nboxes * stride:
+                    boxes = [
+                        bytes(proj_buf[ps + 52 + bi * stride : ps + 52 + bi * stride + 16])
+                        for bi in range(nboxes)
+                    ]
+                    pmls_records.append((bytes(proj_buf[ps + 16 : ps + 32]), bytes(proj_buf[ps + 32 : ps + 48]), boxes))
+            elif cid == b"WAV " and pe - ps >= 30:
+                _, sb_i, _, smp_i, _ = struct.unpack_from("<HHHII", proj_buf, ps + 16)
+                wav_to_loc[bytes(proj_buf[ps : ps + 16])] = (sb_i, smp_i)
+            elif cid == b"LIST":
+                ltype = bytes(proj_buf[ps : ps + 4])
+                if ltype == b"WAIT":
+                    wg_self = wg_target = None
+                    for scid, sps, spe, _ in iter_riff_chunks(proj_buf, ps + 4, pe):
+                        if scid == b"WAIB" and spe - sps >= 32:
+                            wg_self = bytes(proj_buf[sps : sps + 16])
+                            wg_target = bytes(proj_buf[sps + 16 : sps + 32])
+                    if wg_self and wg_target:
+                        waib_to_wav[wg_self] = wg_target
+                        wav_to_waibs.setdefault(wg_target, []).append(wg_self)
+                elif ltype in (b"MUIT", b"SPIT"):
+                    mg_self = None
+                    ch_guids: list[bytes] = []
+                    for scid, sps, spe, _ in iter_riff_chunks(proj_buf, ps + 4, pe):
+                        if scid in (b"MUIB", b"SPIB") and spe - sps >= 16:
+                            mg_self = bytes(proj_buf[sps : sps + 16])
+                        elif scid == b"PLST" and spe - sps >= 10:
+                            nc = struct.unpack_from("<H", proj_buf, sps + 8)[0] >> 1
+                            stride = struct.unpack_from("<H", proj_buf, sps + 10)[0]
+                            if nc > 0 and stride >= 16:
+                                for bi in range(nc):
+                                    coff = sps + 12 + bi * stride
+                                    if coff + 16 <= spe:
+                                        ch_guids.append(bytes(proj_buf[coff : coff + 16]))
+                    if mg_self:
+                        multi_children[mg_self] = ch_guids
+                elif ltype == b"EVIT":
+                    eg_self = ev_tgt = None
+                    for scid, sps, spe, _ in iter_riff_chunks(proj_buf, ps + 4, pe):
+                        if scid == b"EVIB" and spe - sps >= 32:
+                            eg_self = bytes(proj_buf[sps : sps + 16])
+                            ev_tgt = bytes(proj_buf[sps + 16 : sps + 32])
+                    if eg_self and ev_tgt:
+                        evit_target[eg_self] = ev_tgt
+                else:
+                    scan(ps + 4, pe)
+
+    scan(0, len(proj_buf))
+
+    muted_inst_guids: set[bytes] = set()
+    if sparse_locs:
+        for wg, loc in wav_to_loc.items():
+            if loc in sparse_locs:
+                muted_inst_guids.update(wav_to_waibs.get(wg, ()))
+
+    changed = True
+    while changed:
+        changed = False
+        for param_g, ev_g, boxes in pmls_records:
+            if param_g in tc_param_guids or ev_g in muted_ev_guids:
+                for bg in boxes:
+                    if bg not in muted_inst_guids:
+                        muted_inst_guids.add(bg)
+                        changed = True
+        for ig in list(muted_inst_guids):
+            if ig in evit_target and evit_target[ig] not in muted_ev_guids:
+                muted_ev_guids.add(evit_target[ig])
+                changed = True
+            for cg in multi_children.get(ig, ()):
+                if cg not in muted_inst_guids:
+                    muted_inst_guids.add(cg)
+                    changed = True
+
+        # Promoción ascendente: si >=50% de un MUIT/SPIT son pops esparsos y ninguno es una capa sostenida
+        for mg_self, children in multi_children.items():
+            if not children or mg_self in muted_inst_guids:
+                continue
+            child_locs = [wav_to_loc.get(waib_to_wav.get(cg, b"")) for cg in children]
+            if non_sustained_locs is not None and not all(
+                loc in non_sustained_locs for loc in child_locs if loc is not None
+            ):
+                continue
+            n_muted = sum(1 for cg in children if cg in muted_inst_guids)
+            if n_muted >= max(1, (len(children) + 1) // 2):
+                if loc_dip_ratios is not None:
+                    dips = [loc_dip_ratios.get(loc, 0.0) if loc is not None else 0.0 for loc in child_locs]
+                    if (sum(dips) / len(dips)) < 0.48:
+                        continue
+                elif non_sustained_locs is None and n_muted < len(children):
+                    continue
+                muted_inst_guids.add(mg_self)
+                for cg in children:
+                    muted_inst_guids.add(cg)
+                changed = True
+
+    muted_locs: set[tuple[int, int]] = set(sparse_locs or ())
+    for ig in muted_inst_guids:
+        wg = waib_to_wav.get(ig)
+        if wg and wg in wav_to_loc:
+            muted_locs.add(wav_to_loc[wg])
+    return muted_inst_guids, muted_locs
+
+
+def _muted_event_guids_for_bank(ac_bank: FmodBank) -> set[bytes]:
+    out: set[bytes] = set()
+    for ev in ac_bank.events:
+        p_low = (ev.path or "").lower()
+        if ev.role in _MUTED_SEC_EVENT_ROLES or any(k in p_low for k in _MUTED_SEC_PATH_KEYWORDS):
+            out.add(ev.guid_bytes)
+    return out
+
+
 def _find_tc_and_lc_slots_in_bank(ac_bank: FmodBank) -> list[FsbSampleSlot]:
-    """Identifica las ranuras (FsbSampleSlot) asociadas a control de tracción (tc),
-    launch control (lc) o petardeos en un banco de Assetto Corsa para su enmudecimiento
-    directo a nivel de flujo de audio PCM en FSB5.
-    """
+    """Identifica las ranuras (FsbSampleSlot) asociadas a TC/LC y petardeos esparsos de un banco AC."""
     proj = None
     for cid, ps, pe, _ in iter_riff_chunks(ac_bank.raw, 12, len(ac_bank.raw)):
         if cid == b"LIST" and ac_bank.raw[ps : ps + 4] == b"PROJ":
@@ -2569,143 +2754,41 @@ def _find_tc_and_lc_slots_in_bank(ac_bank: FmodBank) -> list[FsbSampleSlot]:
     if not proj:
         return []
 
-    # 1. PRMB TC / LC params
-    tc_param_guids: set[bytes] = set()
-    for cid, ps, pe, _ in iter_riff_chunks(proj, 0, len(proj)):
-        if cid == b"LIST" and proj[ps : ps + 4] == b"PRMS":
-            for scid, sps, spe, _ in iter_riff_chunks(proj, ps + 4, pe):
-                for ccid, cps, cpe, _ in iter_riff_chunks(proj, sps + 4, spe):
-                    if ccid == b"PRMB" and cpe - cps >= 31:
-                        p = proj[cps:cpe]
-                        slen = struct.unpack_from("<H", p, 21)[0]
-                        if 23 + slen + 8 <= len(p):
-                            pname = p[23 : 23 + slen].decode("utf-8", "replace").strip().lower()
-                            if pname in (
-                                "tc", "traction", "tractioncontrol", "traction_control",
-                                "lc", "launch", "launchcontrol", "launch_control"
-                            ):
-                                tc_param_guids.add(bytes(p[:16]))
-            break
-
-    # 2. Eventos dedicados a silenciar (tractioncontrol, limiter, backfire)
-    muted_ev_guids: set[bytes] = set()
-    for ev in ac_bank.events:
-        p_low = (ev.path or "").lower()
-        if ev.role in ("BackfireExt", "BackfireInt", "Limiter") or any(
-            k in p_low for k in ("tractioncontrol", "tc_ext", "tc_int", "limiter", "backfire")
-        ):
-            muted_ev_guids.add(ev.guid_bytes)
-
-    # 3. PMLB instruments
-    tc_inst_guids: set[bytes] = set()
-    for cid, ps, pe, _ in iter_riff_chunks(proj, 0, len(proj)):
-        if cid == b"LIST" and proj[ps : ps + 4] == b"PMLS":
-            for scid, sps, spe, _ in iter_riff_chunks(proj, ps + 4, pe):
-                for ccid, cps, cpe, _ in iter_riff_chunks(proj, sps + 4, spe):
-                    if ccid == b"PMLB" and cpe - cps >= 52:
-                        p = proj[cps:cpe]
-                        param_g = bytes(p[16:32])
-                        ev_g = bytes(p[32:48])
-                        if param_g in tc_param_guids or ev_g in muted_ev_guids:
-                            nboxes = struct.unpack_from("<H", p, 48)[0] >> 1
-                            stride = struct.unpack_from("<H", p, 50)[0]
-                            if stride >= 24 and len(p) >= 52 + nboxes * stride:
-                                for bi in range(nboxes):
-                                    boff = 52 + bi * stride
-                                    tc_inst_guids.add(bytes(p[boff : boff + 16]))
-            break
-
-    if not tc_inst_guids:
+    sparse_locs, dip_ratios, non_sustained_locs = _compute_sparse_pop_locs(ac_bank)
+    _, muted_locs = _collect_proj_tc_and_pop_graph(
+        proj,
+        muted_ev_guids_in=_muted_event_guids_for_bank(ac_bank),
+        sparse_locs=sparse_locs,
+        loc_dip_ratios=dip_ratios,
+        non_sustained_locs=non_sustained_locs,
+    )
+    if not muted_locs:
         return []
-
-    # 4. WAIB / MUIS: rastrear WAV GUIDs
-    target_wav_guids: set[bytes] = set()
-    def walk_tree(start: int, end: int) -> None:
-        for cid, ps, pe, _ in iter_riff_chunks(proj, start, end):
-            if cid == b"LIST":
-                ltype = proj[ps : ps + 4]
-                if ltype == b"WAIT":
-                    wg_self = None
-                    wg_target = None
-                    for scid, sps, spe, _ in iter_riff_chunks(proj, ps + 4, pe):
-                        if scid == b"WAIB" and spe - sps >= 32:
-                            wg_self = bytes(proj[sps : sps + 16])
-                            wg_target = bytes(proj[sps + 16 : sps + 32])
-                    if wg_self and wg_self in tc_inst_guids and wg_target:
-                        target_wav_guids.add(wg_target)
-                elif ltype in (b"MUIT", b"SPIT"):
-                    mg_self = None
-                    ch_guids: list[bytes] = []
-                    for scid, sps, spe, _ in iter_riff_chunks(proj, ps + 4, pe):
-                        if scid == b"MUIB" and spe - sps >= 16:
-                            mg_self = bytes(proj[sps : sps + 16])
-                        elif scid == b"MUIT" and spe - sps >= 20:
-                            cnt = struct.unpack_from("<H", proj, sps + 16)[0]
-                            for bi in range(cnt):
-                                ch_guids.append(bytes(proj[sps + 20 + bi * 16 : sps + 36 + bi * 16]))
-                    if mg_self and mg_self in tc_inst_guids:
-                        for cg in ch_guids:
-                            tc_inst_guids.add(cg)
-                else:
-                    walk_tree(ps + 4, pe)
-
-    walk_tree(0, len(proj))
-    return [sl for sl in ac_bank.slots if sl.wav_guid and sl.wav_guid in target_wav_guids]
+    return [sl for sl in ac_bank.slots if (sl.subbank_index, sl.sample_index) in muted_locs]
 
 
-def _silence_tc_and_lc_boxes_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
-    """Silencia cajas de instrumentos de control de tracción (tc) y launch control (lc)
-    en todas las pistas PMLB (incluyendo 'rpms' y 'throttle') y reduce la ganancia en INST
-    para evitar rateos o petardeos continuos en AMS2 que aumentan de ritmo con las revoluciones del motor.
-    """
+def _silence_tc_and_lc_boxes_in_proj(
+    proj_payload: bytes,
+    muted_ev_guids_in: set[bytes] | None = None,
+    sparse_locs: set[tuple[int, int]] | None = None,
+    loc_dip_ratios: dict[tuple[int, int], float] | None = None,
+    non_sustained_locs: set[tuple[int, int]] | None = None,
+    out_muted_locs: set[tuple[int, int]] | None = None,
+) -> tuple[bytes, int]:
+    """Silencia cajas de TC/LC y capas esparsas de petardeo en pistas PMLB y ganancia INST (-96 dB)."""
     buf = bytearray(proj_payload)
-
-    # 1. Localizar parámetros PRMB relacionados con TC o LC
-    prms_map: dict[bytes, str] = {}
-    tc_param_guids: set[bytes] = set()
-    for cid, ps, pe, _ in iter_riff_chunks(buf, 0, len(buf)):
-        if cid == b"LIST" and buf[ps : ps + 4] == b"PRMS":
-            for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
-                for ccid, cps, cpe, _ in iter_riff_chunks(buf, sps + 4, spe):
-                    if ccid == b"PRMB" and cpe - cps >= 31:
-                        p = buf[cps:cpe]
-                        slen = struct.unpack_from("<H", p, 21)[0]
-                        if 23 + slen + 8 <= len(p):
-                            pname = p[23 : 23 + slen].decode("utf-8", "replace").strip().lower()
-                            prms_map[bytes(p[:16])] = pname
-                            if pname in (
-                                "tc", "traction", "tractioncontrol", "traction_control",
-                                "lc", "launch", "launchcontrol", "launch_control"
-                            ):
-                                tc_param_guids.add(bytes(p[:16]))
-            break
-
-    if not tc_param_guids:
-        return bytes(buf), 0
-
-    # 2. Recolectar GUIDs de instrumentos asociados a estos parámetros en chunks PMLB
-    tc_inst_guids: set[bytes] = set()
-    for cid, ps, pe, _ in iter_riff_chunks(buf, 0, len(buf)):
-        if cid == b"LIST" and buf[ps : ps + 4] == b"PMLS":
-            for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
-                for ccid, cps, cpe, _ in iter_riff_chunks(buf, sps + 4, spe):
-                    if ccid == b"PMLB" and cpe - cps >= 52:
-                        p = buf[cps:cpe]
-                        param_g = bytes(p[16:32])
-                        if param_g in tc_param_guids:
-                            nboxes = struct.unpack_from("<H", p, 48)[0] >> 1
-                            stride = struct.unpack_from("<H", p, 50)[0]
-                            if stride >= 24 and len(p) >= 52 + nboxes * stride:
-                                for bi in range(nboxes):
-                                    boff = 52 + bi * stride
-                                    tc_inst_guids.add(bytes(p[boff : boff + 16]))
-            break
-
+    tc_inst_guids, muted_locs = _collect_proj_tc_and_pop_graph(
+        buf,
+        muted_ev_guids_in=muted_ev_guids_in,
+        sparse_locs=sparse_locs,
+        loc_dip_ratios=loc_dip_ratios,
+        non_sustained_locs=non_sustained_locs,
+    )
+    if out_muted_locs is not None:
+        out_muted_locs.update(muted_locs)
     if not tc_inst_guids:
         return bytes(buf), 0
 
-    # 3. Poner en cero (v0 = 0.0, vlen = 0.0) todas las cajas que usen estos instrumentos en cualquier PMLB
-    # (en particular las cajas en las pistas 'rpms' y 'throttle' que provocan el rateo continuo)
     silenced_count = 0
     for cid, ps, pe, _ in iter_riff_chunks(buf, 0, len(buf)):
         if cid == b"LIST" and buf[ps : ps + 4] == b"PMLS":
@@ -2717,33 +2800,29 @@ def _silence_tc_and_lc_boxes_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
                         if stride >= 24 and cpe >= cps + 52 + nboxes * stride:
                             for bi in range(nboxes):
                                 boff = cps + 52 + bi * stride
-                                ig = bytes(buf[boff : boff + 16])
-                                if ig in tc_inst_guids:
+                                if bytes(buf[boff : boff + 16]) in tc_inst_guids:
                                     struct.pack_into("<ff", buf, boff + 16, 0.0, 0.0)
                                     silenced_count += 1
             break
 
-    # 4. Enmudecer los chunks INST de estos instrumentos a ganancia mínima (-96.0 dB)
     def mute_inst_gain(start: int, end: int) -> None:
         for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
             if cid == b"LIST":
                 ltype = buf[ps : ps + 4]
-                if ltype == b"WAIT":
-                    wg_self = None
+                if ltype in (b"WAIT", b"MUIT", b"SPIT", b"EVIT"):
+                    self_g = None
                     inst_range = None
                     for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
-                        if scid == b"WAIB" and spe - sps >= 32:
-                            wg_self = bytes(buf[sps : sps + 16])
+                        if scid in (b"WAIB", b"MUIB", b"SPIB", b"EVIB") and spe - sps >= 16:
+                            self_g = bytes(buf[sps : sps + 16])
                         elif scid == b"INST" and spe - sps >= 20:
                             inst_range = (sps, spe)
-                    if wg_self and wg_self in tc_inst_guids and inst_range:
-                        sps, spe = inst_range
+                    if self_g and self_g in tc_inst_guids and inst_range:
+                        sps, _ = inst_range
                         struct.pack_into("<f", buf, sps + 16, -96.0)
-                else:
-                    mute_inst_gain(ps + 4, pe)
+                mute_inst_gain(ps + 4, pe)
 
     mute_inst_gain(0, len(buf))
-
     return bytes(buf), silenced_count
 
 
@@ -2899,20 +2978,29 @@ def clone_event_deep_in_proj(proj_buf: bytes, src_event_guid: bytes, dst_event_g
 
 def set_event_instance_limits_in_proj(
     proj_buf: bytes,
-    event_guids: set[bytes],
+    event_guids: set[bytes] | None,
     max_instances: int,
     steal_flags: int = AI_EVENT_STEAL_VIRTUALIZE,
 ) -> bytes:
-    """Fija el límite de instancias (EVTB +80) y el modo de robo (EVTB +84, bits 5-7) de los eventos indicados."""
+    """Fija el límite de instancias (EVTB +80) y el modo de robo (EVTB +84, bits 5-7).
+
+    Si `event_guids` es None, limita únicamente los eventos sin límite acotado (<0 o > max_instances).
+    """
     buf = bytearray(proj_buf)
 
     def walk(start: int, end: int) -> None:
         for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
             if cid == b"LIST":
                 walk(ps + 4, pe)
-            elif cid == b"EVTB" and pe - ps >= 88 and bytes(buf[ps : ps + 16]) in event_guids:
-                flags = struct.unpack_from("<I", buf, ps + 84)[0]
-                struct.pack_into("<iI", buf, ps + 80, int(max_instances), (flags & ~0xE0) | (steal_flags & 0xE0))
+            elif cid == b"EVTB" and pe - ps >= 88:
+                ev_g = bytes(buf[ps : ps + 16])
+                cur_max, flags = struct.unpack_from("<iI", buf, ps + 80)
+                if event_guids is not None:
+                    should_patch = ev_g in event_guids
+                else:
+                    should_patch = cur_max < 0 or cur_max > max_instances
+                if should_patch:
+                    struct.pack_into("<iI", buf, ps + 80, int(max_instances), (flags & ~0xE0) | (steal_flags & 0xE0))
 
     walk(0, len(buf))
     return bytes(buf)
@@ -2982,7 +3070,7 @@ def _patch_throttle_params_in_proj(proj_payload: bytes, rename_to_load: bool) ->
                 if name == "throttle" and len(tail) >= 12:
                     pmin, pmax = struct.unpack_from("<ff", tail, 0)
                     struct.pack_into("<f", tail, 8, float(max(pmin, min(pmax, 1.0))))
-                    if do_rename and pmax <= 1.0001:
+                    if do_rename and pmin >= -0.0001 and pmax <= 2.0001:
                         new_n = b"load"
                         out += _riff_chunk(b"PRMB", pay[:21] + struct.pack("<H", len(new_n)) + new_n + bytes(tail))
                     else:
@@ -3072,9 +3160,9 @@ def build_direct_ported_bank_from_ac(
     if invert_spatial_cone:
         proj_buf = bytearray(invert_event_cone_curves_in_proj(bytes(proj_buf))[0])
 
-    # 'throttle' de AC: AMS2 no lo alimenta en repeticiones / IA (usa 'load'). Default 1.0 evita que el motor
-    # quede en capas de 'pie levantado' (rateo / crackle constante que acelera con las RPM).
-    proj_buf = bytearray(_patch_throttle_params_in_proj(bytes(proj_buf), rename_to_load=is_ai_bank))
+    # 'throttle' de AC: AMS2 no lo alimenta en repeticiones / IA (usa 'load'). Renombrar a 'load' en bancos
+    # directos (Jugador e IA) cuando el banco no tenga ya 'load', y fijar default=1.0 por seguridad.
+    proj_buf = bytearray(_patch_throttle_params_in_proj(bytes(proj_buf), rename_to_load=True))
 
     p_ext_sel, p_int_sel = _select_primary_engine_events(ac_bank)
     # Clones profundos a generar tras el parcheo: (guid_origen_ya_remapeado, guid_destino, bus_destino | None)
@@ -3372,28 +3460,51 @@ def build_direct_ported_bank_from_ac(
     for src_g, dst_g, _bus in pending_clones:
         src_final = guid_map.get(src_g, src_g) if guid_map else src_g
         patched_proj_body = clone_event_deep_in_proj(patched_proj_body, src_final, dst_g, safe_mod.encode("utf-8"))
-    if is_ai_bank and ai_event_outputs:
+    if is_ai_bank:
         for ev_g, bus_g in ai_event_outputs.items():
             if bus_g is not None:
                 patched_proj_body = set_event_output_bus_in_proj(patched_proj_body, ev_g, bus_g)
         # Limitar instancias simultáneas (modo virtualizar como la IA nativa de AMS2): evita la saturación
         # del mezclador de FMOD con 15-20 rivales, causa del audio entrecortado en carreras contra la IA.
+        if ai_event_outputs:
+            patched_proj_body = set_event_instance_limits_in_proj(
+                patched_proj_body, set(ai_event_outputs.keys()), AI_EVENT_MAX_INSTANCES
+            )
         patched_proj_body = set_event_instance_limits_in_proj(
-            patched_proj_body, set(ai_event_outputs.keys()), AI_EVENT_MAX_INSTANCES
+            patched_proj_body, None, 16, AI_EVENT_STEAL_VIRTUALIZE
         )
         patched_proj_body = _sort_evts_in_proj_payload(bytearray(patched_proj_body))
         patched_proj_body = bytes(patched_proj_body)
+    else:
+        patched_proj_body = set_event_instance_limits_in_proj(
+            patched_proj_body, None, 4, AI_EVENT_STEAL_VIRTUALIZE
+        )
 
-    # Silenciar cajas de instrumentos de TC / LC en pistas de RPM si se activa mute_secondary_pops
-    # (Se ejecuta DESPUÉS de _patch_proj_chunks para garantizar que rpm_bands no reabra las cajas de TC/LC)
+    # Silenciar cajas de TC / LC y capas esparsas de petardeo en pistas PMLB y ganancia INST
+    # (Se ejecuta DESPUÉS de _patch_proj_chunks para garantizar que rpm_bands no reabra las cajas)
+    muted_locs: set[tuple[int, int]] = set()
     if mute_secondary_pops:
-        patched_proj_body, _ = _silence_tc_and_lc_boxes_in_proj(patched_proj_body)
+        sparse_locs, dip_ratios, non_sustained_locs = _compute_sparse_pop_locs(ac_bank)
+        mapped_muted_evs = {
+            (guid_map.get(g, g) if guid_map else g)
+            for g in _muted_event_guids_for_bank(ac_bank)
+        }
+        patched_proj_body, _ = _silence_tc_and_lc_boxes_in_proj(
+            patched_proj_body,
+            muted_ev_guids_in=mapped_muted_evs,
+            sparse_locs=sparse_locs,
+            loc_dip_ratios=dip_ratios,
+            non_sustained_locs=non_sustained_locs,
+            out_muted_locs=muted_locs,
+        )
 
     final_fsb_blobs = [bytearray(sb.raw_fsb_bytes) for sb in ac_bank.subbanks]
-    if mute_secondary_pops:
-        muted_tc_slots = _find_tc_and_lc_slots_in_bank(ac_bank)
-        for sl in muted_tc_slots:
-            if sl.subbank_index < len(final_fsb_blobs):
+    if mute_secondary_pops and muted_locs:
+        for sl in ac_bank.slots:
+            if (sl.subbank_index, sl.sample_index) not in muted_locs:
+                continue
+            # Sólo en PCM16 sin compresión para no corromper flujos Vorbis
+            if sl.mode == FSB5_MODE_PCM16 and sl.subbank_index < len(final_fsb_blobs):
                 fbuf = final_fsb_blobs[sl.subbank_index]
                 if len(fbuf) >= 20:
                     shdr_size, name_size = struct.unpack_from("<II", fbuf, 12)

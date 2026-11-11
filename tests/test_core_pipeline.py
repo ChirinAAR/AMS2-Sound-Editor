@@ -30,6 +30,7 @@ from ams2_sound_porter.fmod_bank import (
 from ams2_sound_porter.fmod_stdt import lookup_stdt_id, parse_stdt_all_paths
 from ams2_sound_porter.omvt_csdbin import CsdbinDocument
 from ams2_sound_porter.porter_engine import (
+    AMS2_AI_ENGINE_BUS,
     LOCAL_OBJECT_BASE_CHUNKS,
     RpmBandConfig,
     SlotMappingConfig,
@@ -790,35 +791,178 @@ def main() -> None:
             eng_int = next((e for e in reloaded_macca.events if e.role == "EngineInt" and len(e.linked_samples) >= 5), None)
             assert eng_ext is not None and eng_int is not None, "EngineExt o EngineInt perdieron sus muestras de sonido!"
             
-            # Verificar que las muestras de audio de TC y LC (sample_13, sample_25, sample_129) están enmudecidas a ceros directos en FSB5
-            sl13 = reloaded_macca.slots[13]
-            assert sl13.data_bytes == b"\x00" * len(sl13.data_bytes), "El audio FSB5 de sample_13 (TC chatter) no fue silenciado!"
-            sl0 = reloaded_macca.slots[0]
-            assert sl0.data_bytes != b"\x00" * len(sl0.data_bytes), "Una muestra de motor normal fue enmudecida por error!"
+            # Verificar que ningún vehículo vanilla hereda .csdbin de mod por coincidencia parcial de marca
+            assert mclaren_v.csdbin_path is None, f"Falso positivo de .csdbin vanilla detectado: {mclaren_v.csdbin_path}"
+
+            # Verificar que las muestras de TC/LC y pops esparsos (MUIT + WAIT) quedaron silenciadas en FSB5 PCM16,
+            # mientras que las capas sostenidas principales de motor permanecen intactas.
+            for muted_idx in (13, 18, 21, 25, 49, 58, 70, 85, 93, 96, 129, 197, 198, 208, 235):
+                sl_m = reloaded_macca.slots[muted_idx]
+                assert sl_m.data_bytes == b"\x00" * len(sl_m.data_bytes), (
+                    f"El audio FSB5 de sample_{muted_idx} (TC/pop esparso) no fue silenciado!"
+                )
+            for alive_idx in (0, 175, 223, 187, 101, 234):
+                sl_a = reloaded_macca.slots[alive_idx]
+                assert sl_a.data_bytes != b"\x00" * len(sl_a.data_bytes), (
+                    f"Muestra de motor sostenida sample_{alive_idx} enmudecida por error!"
+                )
 
             # Verificar que las cajas de TC chatter (inst b9c38884 en rpms 2100..7400) quedaron silenciadas a 0.0..0.0 incluso pasando rpm_bands
             tc_ext_inst = guid_str_to_bytes("{b9c38884-ac8b-4be6-bc69-048ce4c26e93}")
             tc_boxes_checked = 0
+            pnames_player: set[str] = set()
+            ev_limits_player: list[tuple[int, int]] = []
             for cid, ps, pe, _ in iter_riff_chunks(macca_res.bank_bytes, 12, len(macca_res.bank_bytes)):
                 if cid == b"LIST" and macca_res.bank_bytes[ps : ps + 4] == b"PROJ":
-                    for scid, sps, spe, _ in iter_riff_chunks(macca_res.bank_bytes, ps + 4, pe):
-                        if scid == b"LIST" and macca_res.bank_bytes[sps : sps + 4] == b"PMLS":
-                            for ccid, cps, cpe, _ in iter_riff_chunks(macca_res.bank_bytes, sps + 4, spe):
-                                for sccid, scps, scpe, _ in iter_riff_chunks(macca_res.bank_bytes, cps + 4, cpe):
-                                    if sccid == b"PMLB" and scpe - scps >= 52:
-                                        p = macca_res.bank_bytes[scps:scpe]
-                                        nboxes = struct.unpack_from("<H", p, 48)[0] >> 1
-                                        stride = struct.unpack_from("<H", p, 50)[0]
-                                        if stride >= 24 and len(p) >= 52 + nboxes * stride:
-                                            for bi in range(nboxes):
-                                                boff = 52 + bi * stride
-                                                ig = p[boff : boff + 16]
-                                                if ig == tc_ext_inst:
-                                                    v0, vlen = struct.unpack_from("<ff", p, boff + 16)
-                                                    assert v0 == 0.0 and vlen == 0.0, f"Caja de TC {bi} no fue silenciada: [{v0}..{v0+vlen}]"
-                                                    tc_boxes_checked += 1
+                    def walk_check(s: int, e: int) -> None:
+                        nonlocal tc_boxes_checked
+                        for scid, sps, spe, _ in iter_riff_chunks(macca_res.bank_bytes, s, e):
+                            if scid == b"LIST":
+                                walk_check(sps + 4, spe)
+                            elif scid == b"PRMB" and spe - sps >= 23:
+                                sl = struct.unpack_from("<H", macca_res.bank_bytes, sps + 21)[0]
+                                pnames_player.add(
+                                    macca_res.bank_bytes[sps + 23 : sps + 23 + sl].decode("latin1", "replace").rstrip("\x00")
+                                )
+                            elif scid == b"EVTB" and spe - sps >= 88:
+                                ev_limits_player.append(struct.unpack_from("<iI", macca_res.bank_bytes, sps + 80))
+                            elif scid == b"PMLB" and spe - sps >= 52:
+                                p = macca_res.bank_bytes[sps:spe]
+                                nboxes = struct.unpack_from("<H", p, 48)[0] >> 1
+                                stride = struct.unpack_from("<H", p, 50)[0]
+                                if stride >= 24 and len(p) >= 52 + nboxes * stride:
+                                    for bi in range(nboxes):
+                                        boff = 52 + bi * stride
+                                        if p[boff : boff + 16] == tc_ext_inst:
+                                            v0, vlen = struct.unpack_from("<ff", p, boff + 16)
+                                            assert v0 == 0.0 and vlen == 0.0, f"Caja de TC {bi} no fue silenciada: [{v0}..{v0+vlen}]"
+                                            tc_boxes_checked += 1
+                    walk_check(ps + 4, pe)
             assert tc_boxes_checked > 0, "No se encontraron cajas de TC en el banco para verificar"
-            print(f"   Silenciamiento directo FSB5 y PMLB verificado: audio silenciado y {tc_boxes_checked} cajas neutralizadas a 0.0..0.0!")
+            assert "load" in pnames_player and "throttle" not in pnames_player, (
+                f"Parámetro throttle no renombrado a load en banco jugador: {pnames_player}"
+            )
+            assert max(mi for mi, _ in ev_limits_player) <= 4, f"Evento sin límite en Jugador: {ev_limits_player}"
+
+            # Verificar compilación dedicada de banco _AI.bank para 720S (rivales + TV Replay)
+            if mclaren_v.ai_bank_path and mclaren_v.ai_event_guids:
+                macca_ai_res = build_direct_ported_bank_from_ac(
+                    ac_bank=macca_b,
+                    mod_identifier=f"{mclaren_v.car_name}_AI",
+                    target_role_guids=mclaren_v.ai_event_guids,
+                    target_role_paths=mclaren_v.ai_event_paths,
+                    target_bank_guid=mclaren_v.ai_bank_guid or None,
+                    target_role_buses=getattr(mclaren_v, "ai_event_buses", None),
+                    rpm_bands=macca_b.rpm_bands,
+                    is_ai_bank=True,
+                    mute_secondary_pops=True,
+                    invert_spatial_cone=True,
+                )
+                assert macca_ai_res.new_bank_guid.lower() != macca_res.new_bank_guid.lower()
+                assert_sndh_and_fsb_alignment(macca_ai_res.bank_bytes)
+                assert_proj_tables_sorted(macca_ai_res.bank_bytes)
+                reloaded_macca_ai = FmodBank(raw=macca_ai_res.bank_bytes)
+                ai_ev_guids_present = {e.guid_str.lower() for e in reloaded_macca_ai.events}
+                for ai_r, ai_g in mclaren_v.ai_event_guids.items():
+                    assert ai_g.lower() in ai_ev_guids_present, f"Falta evento IA {ai_r} ({ai_g}) en 720S_AI.bank!"
+                ai_limits: list[tuple[int, int]] = []
+                ai_ibsb: dict[bytes, bytes] = {}
+                ai_evtb_ibg: dict[bytes, bytes] = {}
+                ai_pnames: set[str] = set()
+                for cid, ps, pe, _ in iter_riff_chunks(macca_ai_res.bank_bytes, 12, len(macca_ai_res.bank_bytes)):
+                    if cid == b"LIST" and macca_ai_res.bank_bytes[ps : ps + 4] == b"PROJ":
+                        def walk_ai(s: int, e: int) -> None:
+                            for scid, sps, spe, _ in iter_riff_chunks(macca_ai_res.bank_bytes, s, e):
+                                if scid == b"LIST":
+                                    walk_ai(sps + 4, spe)
+                                elif scid == b"PRMB" and spe - sps >= 23:
+                                    sl = struct.unpack_from("<H", macca_ai_res.bank_bytes, sps + 21)[0]
+                                    ai_pnames.add(
+                                        macca_ai_res.bank_bytes[sps + 23 : sps + 23 + sl].decode("latin1", "replace").rstrip("\x00")
+                                    )
+                                elif scid == b"EVTB" and spe - sps >= 88:
+                                    ai_limits.append(struct.unpack_from("<iI", macca_ai_res.bank_bytes, sps + 80))
+                                    ai_evtb_ibg[bytes(macca_ai_res.bank_bytes[sps : sps + 16])] = bytes(
+                                        macca_ai_res.bank_bytes[sps + 48 : sps + 64]
+                                    )
+                                elif scid == b"IBSB" and spe - sps >= 34:
+                                    ai_ibsb[bytes(macca_ai_res.bank_bytes[sps : sps + 16])] = bytes(
+                                        macca_ai_res.bank_bytes[sps + 18 : sps + 34]
+                                    )
+                        walk_ai(ps + 4, pe)
+                assert "load" in ai_pnames and "throttle" not in ai_pnames
+                assert all(0 < mi <= 16 and (fl & 0xE0) == 0x40 for mi, fl in ai_limits), (
+                    f"Eventos en 720S_AI.bank sin virtualización 0x40 o sin límite: {ai_limits}"
+                )
+                ai_bus_bytes = guid_str_to_bytes(AMS2_AI_ENGINE_BUS)
+                for main_role in ("ai_engine_main", "ai_engine_live"):
+                    if main_role in mclaren_v.ai_event_guids:
+                        ev_b = guid_str_to_bytes(mclaren_v.ai_event_guids[main_role])
+                        assert ai_ibsb.get(ai_evtb_ibg.get(ev_b, b"")) == ai_bus_bytes, (
+                            f"{main_role} no apunta a bus 3_AI_PLAYER_ENG!"
+                        )
+            print(f"   Silenciamiento FSB5/PMLB/MUIT, throttle->load y banco IA virtualizado verificados ({tc_boxes_checked} cajas TC neutralizadas)!")
+
+    print("17. Probando exportación Mod AC directa con virtualización IA y protección Vorbis (Macca + Bentley)...")
+    mod_cases = [
+        (
+            "mcl650s_reg",
+            Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_gtm_macca_72_evo_v8\sfx\rss_gtm_macca_72_evo_v8.bank"),
+            Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2\Vehicles\mclaren_650s_gt3\Mcl650sGT3.csdbin"),
+        ),
+        (
+            "bentley_reg",
+            Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\cf_bentley_continental_gt3_2018\sfx\cf_bentley_continental_gt3_2018.bank"),
+            Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2\Vehicles\bentley_continental_gt3\bentleygt3.csdbin"),
+        ),
+    ]
+    for mod_name, ac_fp, csd_fp in mod_cases:
+        if not ac_fp.is_file():
+            continue
+        ac_mod_b = FmodBank(ac_fp)
+        csd_mod = CsdbinDocument.from_file(csd_fp) if csd_fp.is_file() else None
+        with tempfile.TemporaryDirectory() as tmp_mod_dir:
+            s_mod = export_ams2_mod_package(
+                output_root=Path(tmp_mod_dir),
+                mod_identifier=mod_name,
+                vehicle_folder_name=mod_name,
+                direct_ac_bank=ac_mod_b,
+                csd_doc=csd_mod,
+                standalone_guids=True,
+                mute_pops=True,
+                invert_spatial_cone=True,
+            )
+            assert s_mod.ai_bank_file and s_mod.ai_bank_file.is_file()
+            assert s_mod.ai_bank_result is not None
+            assert s_mod.bank_result.new_bank_guid != s_mod.ai_bank_result.new_bank_guid
+            if s_mod.csdbin_file:
+                csd_res = CsdbinDocument.from_file(s_mod.csdbin_file)
+                assert "EngineExt_34" not in csd_res.links.get("engine_ext", "")
+                assert csd_res.links.get("ai_engine_bank") != csd_res.links.get("engine_bank")
+                assert "AI_EngineMAIN" in csd_res.links.get("ai_engine_ext", "")
+                assert "AI_EngineMAIN_LIVE" in csd_res.links.get("ai_engine_live", "")
+
+            for role_lbl, b_path, max_cap in (("P", s_mod.bank_file, 4), ("AI", s_mod.ai_bank_file, 16)):
+                parsed_b = FmodBank(b_path)
+                lims: list[tuple[int, int]] = []
+                for cid, ps, pe, _ in iter_riff_chunks(parsed_b.raw, 12, len(parsed_b.raw)):
+                    if cid == b"LIST" and parsed_b.raw[ps : ps + 4] == b"PROJ":
+                        def walk_ev(s: int, e: int) -> None:
+                            for scid, sps, spe, _ in iter_riff_chunks(parsed_b.raw, s, e):
+                                if scid == b"LIST":
+                                    walk_ev(sps + 4, spe)
+                                elif scid == b"EVTB" and spe - sps >= 88:
+                                    lims.append(struct.unpack_from("<iI", parsed_b.raw, sps + 80))
+                        walk_ev(ps + 4, pe)
+                assert max(mi for mi, _ in lims) <= max_cap, f"{mod_name} {role_lbl} max_instances excedido: {lims}"
+                if role_lbl == "AI":
+                    assert all((fl & 0xE0) == 0x40 for _, fl in lims), f"{mod_name} AI sin flags 0x40: {lims}"
+                for sl in parsed_b.slots:
+                    if sl.mode != FSB5_MODE_PCM16:
+                        assert sl.data_bytes != b"\x00" * len(sl.data_bytes), (
+                            f"{mod_name} flujo Vorbis dañado en slot {sl.global_index}"
+                        )
+            print(f"   Mod {mod_name} (Jugador + IA + .csdbin + protección Vorbis) verificado al 100%!")
 
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 
