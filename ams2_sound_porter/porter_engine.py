@@ -2747,6 +2747,255 @@ def _silence_tc_and_lc_boxes_in_proj(proj_payload: bytes) -> tuple[bytes, int]:
     return bytes(buf), silenced_count
 
 
+AMS2_AI_ENGINE_BUS = "{27ec50dd-048b-4f5d-88f7-481c376f3b1c}"  # bus:/.../PLAYER_EngExh_GROUP/3_AI_PLAYER_ENG
+AI_EVENT_MAX_INSTANCES = 10  # Límite de instancias simultáneas para eventos de motor de IA porteados desde AC
+AI_EVENT_STEAL_VIRTUALIZE = 0x40  # Modo de robo usado por los eventos de IA nativos de AMS2 (32/24 + 0x40)
+
+
+def _select_primary_engine_events(ac_bank: FmodBank) -> tuple[FmodEventInfo | None, FmodEventInfo | None]:
+    """Selecciona los eventos de motor principales (exterior, interior) de un banco de AC.
+
+    Descarta 'engine_extra' y prioriza eventos con ruta real (no sub-eventos anidados sin nombre)
+    con parámetro de RPM y el mayor número de muestras enlazadas.
+    """
+
+    def _is_engine_cand(ev: FmodEventInfo) -> bool:
+        p_text = (ev.path or "").lower()
+        if "engine_extra" in p_text:
+            return False
+        has_rpm = any(p[0].lower() in ("rpm", "rpms") for p in ev.parameters)
+        return has_rpm and len(ev.linked_samples) >= 5
+
+    def _pick(role: str, keys: tuple[str, ...]) -> FmodEventInfo | None:
+        cands = [
+            e for e in ac_bank.events
+            if _is_engine_cand(e) and (e.role == role or any(k in (e.path or "").lower() for k in keys))
+        ]
+        cands.sort(key=lambda x: (0 if x.path else 1, -len(x.linked_samples)))
+        if cands:
+            return cands[0]
+        named = [e for e in ac_bank.events if e.role == role]
+        named.sort(key=lambda x: (0 if x.path else 1, -len(x.linked_samples)))
+        return named[0] if named else None
+
+    p_ext = _pick("EngineExt", ("_ext", "ext_", "exterior", "chase"))
+    p_int = _pick("EngineInt", ("_int", "int_", "cockpit", "cabin"))
+    return p_ext, p_int
+
+
+def _iter_proj_table_items(buf: bytes):
+    """Itera las tablas LIST de primer nivel de PROJ devolviendo (tipo, items).
+
+    Cada item es (clave_guid, bytes_completos_con_padding, chunk_base, payload_base).
+    """
+    for cid, ps, pe, pos in iter_riff_chunks(buf, 0, len(buf)):
+        if cid != b"LIST":
+            continue
+        lt = bytes(buf[ps : ps + 4])
+        items: list[tuple[bytes, bytes, bytes, bytes]] = []
+        for scid, sps, spe, spos in iter_riff_chunks(buf, ps + 4, pe):
+            if scid == b"LCNT":
+                continue
+            full = bytes(buf[spos : spe + ((spe - sps) & 1)])
+            if scid == b"LIST":
+                for c2, a2, z2, _ in iter_riff_chunks(buf, sps + 4, spe):
+                    if z2 - a2 >= 16:
+                        items.append((bytes(buf[a2 : a2 + 16]), full, c2, bytes(buf[a2:z2])))
+                    break
+            elif spe - sps >= 16:
+                items.append((bytes(buf[sps : sps + 16]), full, scid, bytes(buf[sps:spe])))
+        yield lt, items
+
+
+def clone_event_deep_in_proj(proj_buf: bytes, src_event_guid: bytes, dst_event_guid: bytes, salt: bytes) -> bytes:
+    """Clona en profundidad un evento FMOD (timeline, pistas, instrumentos, curvas, parámetros locales, buses).
+
+    Calcula el grafo de objetos propiedad del evento siguiendo referencias en ambos sentidos
+    (los hijos referencian a su padre), excluyendo objetos compartidos (WAV, MAP, VCA, otros
+    eventos anidados y parámetros de otros eventos). Cada objeto clonado recibe una GUID nueva
+    y única, de modo que FMOD lo trata como un evento independiente con su propia máquina de estados.
+    """
+    buf = bytes(proj_buf)
+    tables = list(_iter_proj_table_items(buf))
+
+    index: dict[bytes, list[tuple[bytes, bytes, bytes]]] = {}
+    for _lt, items in tables:
+        for key, full, base, bpay in items:
+            index.setdefault(key, []).append((full, base, bpay))
+    if src_event_guid not in index:
+        return buf
+
+    refs: dict[bytes, set[bytes]] = {}
+    for g, parts in index.items():
+        s: set[bytes] = set()
+        for full, _b, _p in parts:
+            for i in range(0, len(full) - 15):
+                w = full[i : i + 16]
+                if w != g and w in index:
+                    s.add(w)
+        refs[g] = s
+    rev: dict[bytes, set[bytes]] = {g: set() for g in index}
+    for g, s in refs.items():
+        for w in s:
+            rev[w].add(g)
+
+    shared_bases = {b"VCAB", b"BNKI", b"WAV ", b"MAP "}
+
+    def _owned(w: bytes) -> bool:
+        for _full, base, bpay in index[w]:
+            if base in shared_bases:
+                return False
+            if base == b"EVTB" and w != src_event_guid:
+                return False
+            if base == b"PMLB" and bpay[32:48] != src_event_guid:
+                return False
+        return True
+
+    closure = {src_event_guid}
+    frontier = [src_event_guid]
+    while frontier:
+        g = frontier.pop()
+        for w in refs[g] | rev[g]:
+            if w not in closure and _owned(w):
+                closure.add(w)
+                frontier.append(w)
+
+    remap = {g: hashlib.sha256(g + salt + dst_event_guid).digest()[:16] for g in closure}
+    remap[src_event_guid] = dst_event_guid
+
+    def _remap_bytes(data: bytes) -> bytes:
+        out = bytearray(data)
+        i = 8  # saltar cabecera RIFF del item
+        limit = len(out) - 16
+        while i <= limit:
+            rep = remap.get(bytes(out[i : i + 16]))
+            if rep is not None:
+                out[i : i + 16] = rep
+                i += 16
+            else:
+                i += 1
+        return bytes(out)
+
+    out = bytearray()
+    for cid, ps, pe, pos in iter_riff_chunks(buf, 0, len(buf)):
+        pad_end = pe + ((pe - ps) & 1)
+        if cid != b"LIST":
+            out += buf[pos:pad_end]
+            continue
+        lt = buf[ps : ps + 4]
+        items = next((it for t, it in tables if t == lt), None)
+        cloned = [(remap[k], _remap_bytes(full)) for k, full, _b, _p in (items or []) if k in closure]
+        if not cloned:
+            out += buf[pos:pad_end]
+            continue
+        keys = [k for k, _f, _b, _p in items]
+        combined = [(k, full) for k, full, _b, _p in items] + cloned
+        if keys == sorted(keys):
+            combined.sort(key=lambda x: x[0])
+        body = lt + _riff_chunk(b"LCNT", struct.pack("<I", len(combined))) + b"".join(f for _, f in combined)
+        out += _riff_chunk(b"LIST", body)
+    return bytes(out)
+
+
+def set_event_instance_limits_in_proj(
+    proj_buf: bytes,
+    event_guids: set[bytes],
+    max_instances: int,
+    steal_flags: int = AI_EVENT_STEAL_VIRTUALIZE,
+) -> bytes:
+    """Fija el límite de instancias (EVTB +80) y el modo de robo (EVTB +84, bits 5-7) de los eventos indicados."""
+    buf = bytearray(proj_buf)
+
+    def walk(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                walk(ps + 4, pe)
+            elif cid == b"EVTB" and pe - ps >= 88 and bytes(buf[ps : ps + 16]) in event_guids:
+                flags = struct.unpack_from("<I", buf, ps + 84)[0]
+                struct.pack_into("<iI", buf, ps + 80, int(max_instances), (flags & ~0xE0) | (steal_flags & 0xE0))
+
+    walk(0, len(buf))
+    return bytes(buf)
+
+
+def set_event_output_bus_in_proj(proj_buf: bytes, event_guid: bytes, bus_guid: bytes) -> bytes:
+    """Re-enruta el bus de instancia (IBSB) del evento indicado hacia un bus del mixer de AMS2."""
+    buf = bytearray(proj_buf)
+    ibg: bytes | None = None
+
+    def find_evtb(start: int, end: int) -> None:
+        nonlocal ibg
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if ibg is not None:
+                return
+            if cid == b"LIST":
+                find_evtb(ps + 4, pe)
+            elif cid == b"EVTB" and pe - ps >= 64 and bytes(buf[ps : ps + 16]) == event_guid:
+                ibg = bytes(buf[ps + 48 : ps + 64])
+
+    def patch_ibsb(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                patch_ibsb(ps + 4, pe)
+            elif cid == b"IBSB" and pe - ps >= 34 and bytes(buf[ps : ps + 16]) == ibg:
+                buf[ps + 18 : ps + 34] = bus_guid
+
+    find_evtb(0, len(buf))
+    if ibg is not None:
+        patch_ibsb(0, len(buf))
+    return bytes(buf)
+
+
+def _patch_throttle_params_in_proj(proj_payload: bytes, rename_to_load: bool) -> bytes:
+    """Corrige el parámetro 'throttle' de AC, que AMS2 no alimenta en repeticiones ni en autos de la IA.
+
+    - Su valor por defecto pasa a 1.0 (acelerador a fondo) para que, si el juego no lo alimenta,
+      el motor no quede atrapado en las capas de 'pie levantado' (petardeos / crackle en bucle).
+    - Opcionalmente (bancos de IA) se renombra a 'load', el parámetro que AMS2 sí alimenta a la IA,
+      sólo cuando su rango es 0..1 y el banco no posee ya un parámetro 'load'.
+    """
+    has_load = False
+
+    def scan(start: int, end: int) -> None:
+        nonlocal has_load
+        for cid, ps, pe, _ in iter_riff_chunks(proj_payload, start, end):
+            if cid == b"LIST":
+                scan(ps + 4, pe)
+            elif cid == b"PRMB" and pe - ps >= 23:
+                slen = struct.unpack_from("<H", proj_payload, ps + 21)[0]
+                if proj_payload[ps + 23 : ps + 23 + slen].decode("latin1", "replace").rstrip("\x00") == "load":
+                    has_load = True
+
+    scan(0, len(proj_payload))
+    do_rename = rename_to_load and not has_load
+
+    def rebuild(data: bytes) -> bytes:
+        out = bytearray()
+        for cid, ps, pe, _ in iter_riff_chunks(data, 0, len(data)):
+            pay = data[ps:pe]
+            if cid == b"LIST":
+                out += _riff_list(pay[:4], rebuild(pay[4:]))
+            elif cid == b"PRMB" and len(pay) >= 23:
+                slen = struct.unpack_from("<H", pay, 21)[0]
+                name = pay[23 : 23 + slen].decode("latin1", "replace").rstrip("\x00")
+                tail = bytearray(pay[23 + slen :])
+                if name == "throttle" and len(tail) >= 12:
+                    pmin, pmax = struct.unpack_from("<ff", tail, 0)
+                    struct.pack_into("<f", tail, 8, float(max(pmin, min(pmax, 1.0))))
+                    if do_rename and pmax <= 1.0001:
+                        new_n = b"load"
+                        out += _riff_chunk(b"PRMB", pay[:21] + struct.pack("<H", len(new_n)) + new_n + bytes(tail))
+                    else:
+                        out += _riff_chunk(b"PRMB", pay[: 23 + slen] + bytes(tail))
+                else:
+                    out += _riff_chunk(cid, pay)
+            else:
+                out += _riff_chunk(cid, pay)
+        return bytes(out)
+
+    return rebuild(proj_payload)
+
+
 def build_direct_ported_bank_from_ac(
     ac_bank: FmodBank,
     mod_identifier: str = "custom_mod",
@@ -2823,6 +3072,22 @@ def build_direct_ported_bank_from_ac(
     if invert_spatial_cone:
         proj_buf = bytearray(invert_event_cone_curves_in_proj(bytes(proj_buf))[0])
 
+    # 'throttle' de AC: AMS2 no lo alimenta en repeticiones / IA (usa 'load'). Default 1.0 evita que el motor
+    # quede en capas de 'pie levantado' (rateo / crackle constante que acelera con las RPM).
+    proj_buf = bytearray(_patch_throttle_params_in_proj(bytes(proj_buf), rename_to_load=is_ai_bank))
+
+    p_ext_sel, p_int_sel = _select_primary_engine_events(ac_bank)
+    # Clones profundos a generar tras el parcheo: (guid_origen_ya_remapeado, guid_destino, bus_destino | None)
+    pending_clones: list[tuple[bytes, bytes, bytes | None]] = []
+    # Eventos de IA a los que se aplica límite de instancias y bus de salida: guid_final -> bus | None
+    ai_event_outputs: dict[bytes, bytes | None] = {}
+
+    def _bus_for(role: str, default: str | None) -> bytes | None:
+        raw_b = (target_role_buses or {}).get(role) or default
+        if raw_b is None:
+            return None
+        return guid_str_to_bytes(raw_b) if isinstance(raw_b, str) else bytes(raw_b)
+
     safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_mod"
     guid_map: dict[bytes, bytes] | None = None
     event_guid_map: dict[str, str] = {}
@@ -2876,14 +3141,32 @@ def build_direct_ported_bank_from_ac(
             role_to_event_path["EngineInt"] = ei_path
             stdt_entries.append((ei_path, ei_bg))
 
-        # Mapeo de roles de IA en vehiculos vanilla si aplica (ai_engine_*)
+        # Mapeo de roles de IA en vehiculos vanilla (ai_engine_*):
+        # AMS2 resuelve cada ruta (MAIN, MAIN_LIVE, ext_AI) por su GUID en MasterBank.strings, así que CADA GUID
+        # debe existir como evento real en el banco. El evento exterior de AC se asigna al primer rol y se clona
+        # en profundidad (con GUIDs propias) para los demás, evitando eventos inexistentes -> IA muda.
         if is_ai_bank:
-            for ai_role in ("ai_engine_ext", "ai_engine_main", "ai_engine_live"):
-                if ai_role in target_role_guids and p_ext:
+            ai_default_bus = {
+                "ai_engine_main": AMS2_AI_ENGINE_BUS,
+                "ai_engine_live": AMS2_AI_ENGINE_BUS,
+                "ai_engine_ext": None,
+            }
+            if p_ext:
+                first_assigned = False
+                for ai_role in ("ai_engine_main", "ai_engine_live", "ai_engine_ext"):
+                    if ai_role not in target_role_guids:
+                        continue
                     ai_bg = guid_str_to_bytes(target_role_guids[ai_role])
-                    if p_ext.guid_bytes not in guid_map:
+                    if ai_bg in used_guids:
+                        continue
+                    if not first_assigned and p_ext.guid_bytes not in guid_map:
                         guid_map[p_ext.guid_bytes] = ai_bg
+                        event_guid_map[p_ext.guid_str] = bytes_to_guid_str(ai_bg)
+                    else:
+                        pending_clones.append((p_ext.guid_bytes, ai_bg, None))
+                    first_assigned = True
                     used_guids.add(ai_bg)
+                    ai_event_outputs[ai_bg] = _bus_for(ai_role, ai_default_bus[ai_role])
                     role_to_event_guid[ai_role] = bytes_to_guid_str(ai_bg)
                     ai_p = (target_role_paths or {}).get(ai_role) or f"event:/AMS2/Vehicles/{safe_mod}/{ai_role}"
                     role_to_event_path[ai_role] = ai_p
@@ -2892,7 +3175,11 @@ def build_direct_ported_bank_from_ac(
                 ai_int_bg = guid_str_to_bytes(target_role_guids["ai_engine_int"])
                 if p_int.guid_bytes not in guid_map:
                     guid_map[p_int.guid_bytes] = ai_int_bg
+                    event_guid_map[p_int.guid_str] = bytes_to_guid_str(ai_int_bg)
+                else:
+                    pending_clones.append((p_int.guid_bytes, ai_int_bg, None))
                 used_guids.add(ai_int_bg)
+                ai_event_outputs[ai_int_bg] = _bus_for("ai_engine_int", None)
                 role_to_event_guid["ai_engine_int"] = bytes_to_guid_str(ai_int_bg)
                 ai_int_p = (target_role_paths or {}).get("ai_engine_int") or f"event:/AMS2/Vehicles/{safe_mod}/ai_engine_int"
                 role_to_event_path["ai_engine_int"] = ai_int_p
@@ -3007,33 +3294,62 @@ def build_direct_ported_bank_from_ac(
             stdt_entries.append((f"bank:/{safe_mod}_Engine", new_bank_guid_bytes))
 
         used_paths: set[str] = set()
+        ev_final_path: dict[bytes, str] = {}
         for ev in ac_bank.events:
             ng_bytes = guid_map.get(ev.guid_bytes, ev.guid_bytes)
             ng = bytes_to_guid_str(ng_bytes)
             event_guid_map[ev.guid_str] = ng
-            role_to_event_guid[ev.role] = ng
+            role_to_event_guid.setdefault(ev.role, ng)
 
-            if is_ai_bank and ev.role == "EngineExt":
-                live_path = f"event:/AMS2/Vehicles/Mods/{mod_prefix}/AI_EngineMAIN_LIVE"
+            is_main_ext = p_ext_sel is not None and ev.guid_bytes == p_ext_sel.guid_bytes
+            is_main_int = p_int_sel is not None and ev.guid_bytes == p_int_sel.guid_bytes
+
+            if is_ai_bank and is_main_ext:
+                # Evento real para rivales (MAIN) + clon profundo independiente para TV Replays (MAIN_LIVE),
+                # cada uno con su propia GUID (sin alias duplicados que dejen rutas huérfanas en STDT).
                 main_path = f"event:/AMS2/Vehicles/Mods/{mod_prefix}/AI_EngineMAIN"
-                stdt_entries.append((live_path, ng_bytes))
+                live_path = f"event:/AMS2/Vehicles/Mods/{mod_prefix}/AI_EngineMAIN_LIVE"
+                live_bytes = hashlib.sha256(ng_bytes + b"_ai_engine_live").digest()[:16]
                 stdt_entries.append((main_path, ng_bytes))
-                role_to_event_path["EngineExt"] = main_path
-                role_to_event_path["ai_engine_ext"] = main_path
+                stdt_entries.append((live_path, live_bytes))
+                pending_clones.append((ev.guid_bytes, live_bytes, None))
+                ev_final_path[ev.guid_bytes] = main_path
+                ai_event_outputs[ng_bytes] = guid_str_to_bytes(AMS2_AI_ENGINE_BUS)
+                ai_event_outputs[live_bytes] = guid_str_to_bytes(AMS2_AI_ENGINE_BUS)
                 role_to_event_path["ai_engine_live"] = live_path
-            elif is_ai_bank and ev.role == "EngineInt":
+                role_to_event_guid["ai_engine_live"] = bytes_to_guid_str(live_bytes)
+            elif is_ai_bank and is_main_int:
                 int_path = f"event:/AMS2/Vehicles/Mods/{mod_prefix}/AI_EngineInt"
                 stdt_entries.append((int_path, ng_bytes))
-                role_to_event_path["EngineInt"] = int_path
-                role_to_event_path["ai_engine_int"] = int_path
+                ev_final_path[ev.guid_bytes] = int_path
+                ai_event_outputs[ng_bytes] = None
             else:
                 last_part = ev.path.split("/")[-1] if ev.path else ev.role
                 clean_ev_path = f"event:/AMS2/Vehicles/Mods/{safe_mod}/{last_part}"
                 if clean_ev_path.lower() in used_paths:
                     clean_ev_path = f"{clean_ev_path}_{ev.index}"
                 used_paths.add(clean_ev_path.lower())
-                role_to_event_path[ev.role] = clean_ev_path
+                ev_final_path[ev.guid_bytes] = clean_ev_path
+                role_to_event_path.setdefault(ev.role, clean_ev_path)
                 stdt_entries.append((clean_ev_path, ng_bytes))
+
+        # Los roles de motor SIEMPRE apuntan al evento principal (no a sub-eventos anidados sin nombre)
+        if p_ext_sel is not None and p_ext_sel.guid_bytes in ev_final_path:
+            ext_p = ev_final_path[p_ext_sel.guid_bytes]
+            ext_g = event_guid_map[p_ext_sel.guid_str]
+            role_to_event_path["EngineExt"] = ext_p
+            role_to_event_guid["EngineExt"] = ext_g
+            if is_ai_bank:
+                role_to_event_path["ai_engine_ext"] = ext_p
+                role_to_event_guid["ai_engine_ext"] = ext_g
+        if p_int_sel is not None and p_int_sel.guid_bytes in ev_final_path:
+            int_p = ev_final_path[p_int_sel.guid_bytes]
+            int_g = event_guid_map[p_int_sel.guid_str]
+            role_to_event_path["EngineInt"] = int_p
+            role_to_event_guid["EngineInt"] = int_g
+            if is_ai_bank:
+                role_to_event_path["ai_engine_int"] = int_p
+                role_to_event_guid["ai_engine_int"] = int_g
     else:
         new_bank_guid = bytes_to_guid_str(ac_bank.bank_guid)
         for ev in ac_bank.events:
@@ -3051,6 +3367,22 @@ def build_direct_ported_bank_from_ac(
         guid_map=guid_map,
         rpm_bands=rpm_bands,
     )
+
+    # Clones profundos de eventos (roles de IA vanilla con GUIDs propias) y límites/buses de IA
+    for src_g, dst_g, _bus in pending_clones:
+        src_final = guid_map.get(src_g, src_g) if guid_map else src_g
+        patched_proj_body = clone_event_deep_in_proj(patched_proj_body, src_final, dst_g, safe_mod.encode("utf-8"))
+    if is_ai_bank and ai_event_outputs:
+        for ev_g, bus_g in ai_event_outputs.items():
+            if bus_g is not None:
+                patched_proj_body = set_event_output_bus_in_proj(patched_proj_body, ev_g, bus_g)
+        # Limitar instancias simultáneas (modo virtualizar como la IA nativa de AMS2): evita la saturación
+        # del mezclador de FMOD con 15-20 rivales, causa del audio entrecortado en carreras contra la IA.
+        patched_proj_body = set_event_instance_limits_in_proj(
+            patched_proj_body, set(ai_event_outputs.keys()), AI_EVENT_MAX_INSTANCES
+        )
+        patched_proj_body = _sort_evts_in_proj_payload(bytearray(patched_proj_body))
+        patched_proj_body = bytes(patched_proj_body)
 
     # Silenciar cajas de instrumentos de TC / LC en pistas de RPM si se activa mute_secondary_pops
     # (Se ejecuta DESPUÉS de _patch_proj_chunks para garantizar que rpm_bands no reabra las cajas de TC/LC)

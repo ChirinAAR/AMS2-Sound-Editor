@@ -4647,9 +4647,45 @@ class SoundPorterApp(tk.Tk):
                     bank_bytes = donor_res.bank_bytes
 
                 # 2. Configurar banco de la IA si está marcado y existe
-                # Enfoque fiel de v1: el banco de IA comparte el mismo sonido y eventos 1:1, asegurando que suene idéntico
-                # en carreras contra rivales y en cámaras de repetición / TV sin desincronizaciones ni cámaras mudas.
-                ai_bytes: bytes | None = bank_bytes if (sync_ai and veh.ai_bank_path) else None
+                # El _AI.bank debe conservar la GUID de banco y las GUIDs de eventos nativas de la IA
+                # (MAIN, MAIN_LIVE, ext_AI, int_AI). Copiar el banco del jugador duplicaba la GUID de banco
+                # (FMOD rechaza el segundo banco) y dejaba a los rivales y repeticiones sin eventos -> mudos.
+                ai_bytes: bytes | None = None
+                if sync_ai and veh.ai_bank_path and veh.ai_event_guids:
+                    if is_direct:
+                        ai_direct_res = build_direct_ported_bank_from_ac(
+                            ac_bank=self.source_lib.fmod_bank,
+                            mod_identifier=f"{veh.car_name}_AI",
+                            standalone_guids=False,
+                            target_role_guids=veh.ai_event_guids,
+                            target_role_paths=veh.ai_event_paths,
+                            target_bank_guid=veh.ai_bank_guid or None,
+                            target_role_buses=getattr(veh, "ai_event_buses", None),
+                            rpm_bands=bands_to_export,
+                            is_ai_bank=True,
+                            mute_secondary_pops=mute_pops,
+                            invert_spatial_cone=invert_cone,
+                        )
+                        ai_bytes = ai_direct_res.bank_bytes
+                    else:
+                        veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
+                        native_ai_p = (
+                            veh_backup_folder / veh.ai_bank_path.name
+                            if (veh_backup_folder / veh.ai_bank_path.name).is_file()
+                            else veh.ai_bank_path
+                        )
+                        if native_ai_p.is_file() and self.source_lib:
+                            ai_donor = FmodBank(native_ai_p)
+                            ai_donor_res = build_ported_bank(
+                                donor=ai_donor,
+                                mappings=auto_map_samples(ai_donor, self.source_lib),
+                                library=self.source_lib,
+                                mod_identifier=f"{veh.car_name}_AI",
+                                standalone_guids=False,
+                                sync_autopitch=sync_pitch,
+                                output_codec_mode=codec_mode,
+                            )
+                            ai_bytes = ai_donor_res.bank_bytes
 
                 # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) si existe
                 csd_bytes: bytes | None = None

@@ -262,12 +262,14 @@ class VanillaVehicleManager:
             veh_dir = self.ams2_root / "Vehicles"
             if veh_dir.is_dir():
                 c_clean = vehicle.car_name.lower().replace("_", "").replace("-", "")
-                b_clean = vehicle.brand.lower().replace("_", "").replace("-", "")
-                for csd in veh_dir.rglob("*.csdbin"):
-                    rel = str(csd.relative_to(veh_dir)).lower().replace("\\", "/").replace("_", "").replace("-", "")
-                    if c_clean in rel or (b_clean in rel and len(b_clean) > 3):
-                        vehicle.csdbin_path = csd
-                        break
+                # Sólo coincidencia por nombre del auto (nunca sólo por marca: 'mclaren' enlazaba
+                # el .csdbin de un MOD como 'mclaren_650s_gt3' al vanilla 'mclaren_720s').
+                if len(c_clean) >= 3:
+                    for csd in veh_dir.rglob("*.csdbin"):
+                        rel = str(csd.relative_to(veh_dir)).lower().replace("\\", "/").replace("_", "").replace("-", "")
+                        if c_clean in rel:
+                            vehicle.csdbin_path = csd
+                            break
 
         if vehicle.event_roles and vehicle.target_parameters and (vehicle.ai_event_roles or not vehicle.ai_bank_path):
             return
