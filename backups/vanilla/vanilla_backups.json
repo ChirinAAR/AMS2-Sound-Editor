@@ -13,7 +13,7 @@
     "original_size": 9906208,
     "backup_timestamp": "2026-11-07T15:17:45.731599",
     "is_modified": false,
-    "modified_timestamp": "2026-11-07T21:23:05.552211"
+    "modified_timestamp": "2026-11-11T02:32:10.106819"
   },
   "mercedes_sls_gt3": {
     "vehicle_id": "mercedes_sls_gt3",
@@ -29,7 +29,7 @@
     "original_size": 3584608,
     "backup_timestamp": "2026-11-07T15:18:15.897895",
     "is_modified": false,
-    "modified_timestamp": "2026-11-07T15:26:27.413069"
+    "modified_timestamp": "2026-11-11T02:31:52.333043"
   },
   "porsche_991_rsr_gte": {
     "vehicle_id": "porsche_991_rsr_gte",
@@ -44,7 +44,23 @@
     "original_ai_sha256": "ae03cd66529c6bbf547a7c681ace80b3d285999c1daf07eb1184cd7f00ad3799",
     "original_size": 4348096,
     "backup_timestamp": "2026-11-09T15:22:32.828854",
+    "is_modified": true,
+    "modified_timestamp": "2026-11-11T02:31:15.882096"
+  },
+  "f_ultimate_f_ultimate_2022": {
+    "vehicle_id": "f_ultimate_f_ultimate_2022",
+    "display_name": "F Ultimate 2022",
+    "bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\F\\F_Ultimate\\F_Ultimate_2022.bank",
+    "ai_bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\F\\F_Ultimate\\F_Ultimate_2022_AI.bank",
+    "csdbin_path": null,
+    "backup_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\f_ultimate_f_ultimate_2022\\F_Ultimate_2022.bank",
+    "backup_ai_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\f_ultimate_f_ultimate_2022\\F_Ultimate_2022_AI.bank",
+    "backup_csd_file": null,
+    "original_sha256": "c63906b2a5094635e6ce611cfc05b596327a9cc98385a4d8f4d1ef0aead1eb6c",
+    "original_ai_sha256": "1c32ec90462daf771cb5668074196b05ba8ed2ab7fc0672dcec856aa563e9648",
+    "original_size": 24082464,
+    "backup_timestamp": "2026-11-11T02:32:49.510889",
     "is_modified": false,
-    "modified_timestamp": "2026-11-11T02:15:40.827589"
+    "modified_timestamp": "2026-11-11T02:32:49.966091"
   }
 }
