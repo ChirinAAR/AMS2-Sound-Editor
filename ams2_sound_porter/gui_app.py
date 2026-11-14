@@ -78,9 +78,9 @@ class SoundPorterApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("AMS2 Sound Porter Studio — Porteo Gráfico AC -> Automobilista 2 (con motor OMVT)")
-        self.geometry("1380x880")
-        self.minsize(1140, 740)
+        self.title("AMS 2 Sound Importer")
+        self.geometry("1240x780")
+        self.minsize(1060, 680)
         self.configure(bg=BG_DARK)
 
         # Estado de datos en memoria
@@ -103,7 +103,7 @@ class SoundPorterApp(tk.Tk):
 
         # Variables de control Tk
         self.status_var = tk.StringVar(
-            value="Listo. Paso 1: Carga un archivo .bank de Assetto Corsa (o carpeta WAV) y un .bank donante de AMS2."
+            value="Ready. Select 'Edit custom car sounds' or 'Edit vanilla car sounds'."
         )
         self.src_filter_var = tk.StringVar()
         self.src_info_var = tk.StringVar(value="Ningún origen cargado")
@@ -147,7 +147,7 @@ class SoundPorterApp(tk.Tk):
         self.sim_telemetry_var = tk.StringVar(
             value="Simulador listo — Prueba la pasada en 5 etapas (Idle -> Corte 1ª -> Cambio + Subida 2ª -> 3s Corte + 3s Desacel -> Rebaje Auto-Blip -> Idle)."
         )
-        self.sim_stage_var = tk.StringVar(value="Etapa actual: En espera")
+        self.sim_stage_var = tk.StringVar(value="Stage: Idle")
 
         # Controles de metadatos .csdbin (Pestaña 3)
         self.csd_id_var = tk.StringVar(value="0000000000000000")
@@ -184,15 +184,27 @@ class SoundPorterApp(tk.Tk):
         self.vanilla_auto_backup_var = tk.BooleanVar(value=True)
         self.vanilla_sync_ai_var = tk.BooleanVar(value=True)
         self.vanilla_mute_pops_var = tk.BooleanVar(value=True)
-        self.mute_all_pops_var = tk.BooleanVar(value=False)
+        self.mute_all_pops_var = tk.BooleanVar(value=True)
         self.invert_cone_var = tk.BooleanVar(value=True)
         self.vanilla_filtered_vehicles: list[VanillaVehicle] = []
         self.vanilla_export_dest_var = tk.StringVar(value="Ningún vehículo vanilla seleccionado.")
 
+        # Estado de navegación y vista simplificada (4 vistas)
+        self._current_view: str = "menu"
+        self._test_return_view: str = "custom"
+        self._pending_guids_path: Path | None = None
+        self.ui_bank_check_var = tk.StringVar(value="○")
+        self.ui_bank_status_var = tk.StringVar(value=".bank : Not selected")
+        self.ui_guids_check_var = tk.StringVar(value="○")
+        self.ui_guids_status_var = tk.StringVar(value="GUIDs : Not selected")
+        self.ui_csdbin_check_var = tk.StringVar(value="○")
+        self.ui_csdbin_status_var = tk.StringVar(value=".csdbin : Not selected")
+
         self._configure_styles()
-        self._build_header()
-        self._build_notebook()
+        self._build_legacy_notebook_hidden()
+        self._build_new_views()
         self._build_statusbar()
+        self.show_view("menu")
 
         # Inicializar catálogo de vehículos vanilla
         self._populate_vanilla_vehicles_list()
@@ -415,9 +427,25 @@ class SoundPorterApp(tk.Tk):
             return self.source_lib.fmod_bank  # type: ignore[union-attr]
         return self.donor_bank
 
-    def _build_notebook(self) -> None:
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=(6, 6))
+    def _build_new_views(self) -> None:
+        """Construye las 4 vistas principales del nuevo flujo AMS 2 Sound Importer."""
+        self.view_container = ttk.Frame(self, style="TFrame")
+        self.view_container.pack(fill="both", expand=True)
+
+        self.view_menu = ttk.Frame(self.view_container, style="TFrame")
+        self.view_custom = ttk.Frame(self.view_container, style="TFrame")
+        self.view_vanilla = ttk.Frame(self.view_container, style="TFrame")
+        self.view_test_edit = ttk.Frame(self.view_container, style="TFrame")
+
+        self._build_view_menu()
+        self._build_view_custom()
+        self._build_view_vanilla()
+        self._build_view_test_edit()
+
+    def _build_legacy_notebook_hidden(self) -> None:
+        """Mantiene inicializados los componentes internos legados (incluido modo donante) sin mostrarlos."""
+        self._legacy_host = ttk.Frame(self)
+        self.notebook = ttk.Notebook(self._legacy_host)
 
         self.tab_source = ttk.Frame(self.notebook, style="Panel.TFrame", padding=12)
         self.tab_donor = ttk.Frame(self.notebook, style="Panel.TFrame", padding=12)
@@ -433,9 +461,741 @@ class SoundPorterApp(tk.Tk):
 
         self._build_tab_source()
         self._build_tab_donor()
-        self._build_tab_rpm_sim()
         self._build_tab_csdbin()
         self._build_tab_export()
+
+    def show_view(self, view_name: str) -> None:
+        """Cambia la vista activa entre 'menu', 'custom', 'vanilla' y 'test_edit'."""
+        self._current_view = view_name
+        for vf in (self.view_menu, self.view_custom, self.view_vanilla, self.view_test_edit):
+            vf.pack_forget()
+
+        if view_name == "menu":
+            self.view_menu.pack(fill="both", expand=True)
+        elif view_name == "custom":
+            self.target_mode_var.set("mod")
+            self.port_mode_var.set("direct")
+            self._on_target_mode_changed()
+            self.view_custom.pack(fill="both", expand=True)
+        elif view_name == "vanilla":
+            self.target_mode_var.set("vanilla")
+            self.port_mode_var.set("direct")
+            self._on_target_mode_changed()
+            self.view_vanilla.pack(fill="both", expand=True)
+        elif view_name == "test_edit":
+            self.view_test_edit.pack(fill="both", expand=True)
+            self._refresh_rpm_tab()
+            self.after(20, self._draw_rpm_bands_canvas)
+
+    def _build_view_menu(self) -> None:
+        outer = ttk.Frame(self.view_menu, style="TFrame")
+        outer.place(relx=0.5, rely=0.47, anchor="center")
+
+        tk.Label(
+            outer,
+            text="AMS 2 Sound Importer",
+            bg=BG_DARK,
+            fg="#ffffff",
+            font=("Segoe UI", 32, "bold"),
+        ).pack(pady=(0, 38))
+
+        btn_opts = {
+            "bg": BG_CARD,
+            "fg": "#f1f5f9",
+            "activebackground": "#25344d",
+            "activeforeground": "#ffffff",
+            "font": ("Segoe UI", 13),
+            "bd": 1,
+            "relief": "solid",
+            "highlightthickness": 1,
+            "highlightbackground": "#94a3b8",
+            "cursor": "hand2",
+            "pady": 8,
+        }
+
+        tk.Button(
+            outer,
+            text="Edit custom car sounds",
+            width=30,
+            command=lambda: self.show_view("custom"),
+            **btn_opts,
+        ).pack(pady=(0, 26))
+
+        tk.Button(
+            outer,
+            text="Edit vanilla car sounds",
+            width=30,
+            command=lambda: self.show_view("vanilla"),
+            **btn_opts,
+        ).pack(pady=(0, 34))
+
+        tk.Button(
+            outer,
+            text="Close",
+            width=18,
+            command=self._on_close,
+            **btn_opts,
+        ).pack()
+
+    def _build_source_step_rows(self, container: ttk.Frame) -> None:
+        """Construye las filas 1) .bank y 2) GUIDs compartidas entre Custom y Vanilla."""
+        step_font = ("Segoe UI", 15)
+        status_font = ("Segoe UI", 12)
+        check_font = ("Segoe UI", 14, "bold")
+        btn_cfg = {
+            "bg": BG_CARD,
+            "fg": "#f1f5f9",
+            "activebackground": "#25344d",
+            "activeforeground": "#ffffff",
+            "font": ("Segoe UI", 11),
+            "bd": 1,
+            "relief": "solid",
+            "cursor": "hand2",
+            "width": 24,
+            "pady": 6,
+        }
+
+        # Fila 1: Select sounds .bank
+        tk.Label(container, text="1)", bg=BG_DARK, fg="#f1f5f9", font=step_font).grid(
+            row=0, column=0, sticky="w", padx=(0, 12), pady=12
+        )
+        tk.Button(container, text="Select sounds .bank", command=self.cmd_load_ac_bank, **btn_cfg).grid(
+            row=0, column=1, sticky="w", padx=(0, 26), pady=12
+        )
+        st1 = ttk.Frame(container, style="TFrame")
+        st1.grid(row=0, column=2, sticky="w", pady=12)
+        tk.Label(st1, textvariable=self.ui_bank_check_var, bg=BG_DARK, fg="#ffffff", font=check_font).pack(
+            side="left", padx=(0, 8)
+        )
+        tk.Label(st1, textvariable=self.ui_bank_status_var, bg=BG_DARK, fg="#e2e8f0", font=status_font).pack(
+            side="left"
+        )
+
+        # Fila 2: Select GUIDs
+        tk.Label(container, text="2)", bg=BG_DARK, fg="#f1f5f9", font=step_font).grid(
+            row=1, column=0, sticky="w", padx=(0, 12), pady=12
+        )
+        tk.Button(container, text="Select GUIDs", command=self.cmd_load_ac_guids_txt, **btn_cfg).grid(
+            row=1, column=1, sticky="w", padx=(0, 26), pady=12
+        )
+        st2 = ttk.Frame(container, style="TFrame")
+        st2.grid(row=1, column=2, sticky="w", pady=12)
+        tk.Label(st2, textvariable=self.ui_guids_check_var, bg=BG_DARK, fg="#ffffff", font=check_font).pack(
+            side="left", padx=(0, 8)
+        )
+        tk.Label(st2, textvariable=self.ui_guids_status_var, bg=BG_DARK, fg="#e2e8f0", font=status_font).pack(
+            side="left"
+        )
+
+    def _build_view_custom(self) -> None:
+        hdr = tk.Frame(self.view_custom, bg="#080c13", padx=20, pady=14)
+        hdr.pack(fill="x", side="top")
+        tk.Label(
+            hdr,
+            text="Custom Car sound",
+            bg="#080c13",
+            fg="#ffffff",
+            font=("Segoe UI", 22, "bold"),
+        ).pack(side="left")
+        ttk.Button(
+            hdr,
+            text="← Menu",
+            command=lambda: self.show_view("menu"),
+        ).pack(side="right", pady=2)
+
+        body = ttk.Frame(self.view_custom, style="TFrame", padding=(56, 36))
+        body.pack(fill="both", expand=True)
+
+        rows = ttk.Frame(body, style="TFrame")
+        rows.pack(anchor="w")
+        self._build_source_step_rows(rows)
+
+        # Fila 3: Select car .csdbin
+        tk.Label(rows, text="3)", bg=BG_DARK, fg="#f1f5f9", font=("Segoe UI", 15)).grid(
+            row=2, column=0, sticky="w", padx=(0, 12), pady=12
+        )
+        tk.Button(
+            rows,
+            text="Select car .csdbin",
+            command=self.cmd_open_csdbin,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 11),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=24,
+            pady=6,
+        ).grid(row=2, column=1, sticky="w", padx=(0, 26), pady=12)
+        st3 = ttk.Frame(rows, style="TFrame")
+        st3.grid(row=2, column=2, sticky="w", pady=12)
+        tk.Label(st3, textvariable=self.ui_csdbin_check_var, bg=BG_DARK, fg="#ffffff", font=("Segoe UI", 14, "bold")).pack(
+            side="left", padx=(0, 8)
+        )
+        tk.Label(st3, textvariable=self.ui_csdbin_status_var, bg=BG_DARK, fg="#e2e8f0", font=("Segoe UI", 12)).pack(
+            side="left"
+        )
+
+        # Acciones inferiores
+        actions = ttk.Frame(body, style="TFrame")
+        actions.pack(anchor="w", pady=(34, 0))
+        self.btn_custom_import = tk.Button(
+            actions,
+            text="Import sound",
+            command=lambda: self.cmd_import_sound("mod"),
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 14),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=24,
+            pady=6,
+        )
+        self.btn_custom_import.pack(side="left", padx=(0, 32))
+
+        tk.Button(
+            actions,
+            text="Test/edit sounds",
+            command=lambda: self.cmd_open_test_edit("custom"),
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 13),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=22,
+            pady=6,
+        ).pack(side="left")
+
+    def _build_view_vanilla(self) -> None:
+        hdr = tk.Frame(self.view_vanilla, bg="#080c13", padx=20, pady=14)
+        hdr.pack(fill="x", side="top")
+        tk.Label(
+            hdr,
+            text="Vanilla car sounds",
+            bg="#080c13",
+            fg="#ffffff",
+            font=("Segoe UI", 22, "bold"),
+        ).pack(side="left")
+
+        right_hdr = tk.Frame(hdr, bg="#080c13")
+        right_hdr.pack(side="right")
+        tk.Label(
+            right_hdr,
+            text="Game directory:",
+            bg="#080c13",
+            fg="#f1f5f9",
+            font=("Segoe UI", 11),
+        ).pack(side="left", padx=(0, 8))
+        ttk.Entry(right_hdr, textvariable=self.vanilla_ams2_path_var, width=42).pack(side="left", padx=(0, 8))
+        tk.Button(
+            right_hdr,
+            text="Browse...",
+            command=self.cmd_browse_ams2_path,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            padx=12,
+            pady=3,
+        ).pack(side="left", padx=(0, 12))
+        ttk.Button(
+            right_hdr,
+            text="← Menu",
+            command=lambda: self.show_view("menu"),
+        ).pack(side="left")
+
+        body = ttk.Frame(self.view_vanilla, style="TFrame", padding=(56, 36))
+        body.pack(fill="both", expand=True)
+
+        rows = ttk.Frame(body, style="TFrame")
+        rows.pack(anchor="w")
+        self._build_source_step_rows(rows)
+
+        # Fila 3: Select car + combobox vehículo vanilla
+        tk.Label(rows, text="3)", bg=BG_DARK, fg="#f1f5f9", font=("Segoe UI", 15)).grid(
+            row=2, column=0, sticky="w", padx=(0, 12), pady=12
+        )
+        tk.Button(
+            rows,
+            text="Select car",
+            command=self.cmd_open_vanilla_car_picker,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 11),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=24,
+            pady=6,
+        ).grid(row=2, column=1, sticky="w", padx=(0, 26), pady=12)
+
+        self.vanilla_combo = ttk.Combobox(
+            rows,
+            textvariable=self.vanilla_selected_id_var,
+            state="readonly",
+            width=36,
+        )
+        self.vanilla_combo.grid(row=2, column=2, sticky="w", pady=12)
+        self.vanilla_combo.bind("<<ComboboxSelected>>", self._on_vanilla_vehicle_selected)
+
+        # Acciones inferiores
+        actions = ttk.Frame(body, style="TFrame")
+        actions.pack(anchor="w", pady=(34, 0))
+        self.btn_vanilla_import = tk.Button(
+            actions,
+            text="Import sound",
+            command=lambda: self.cmd_import_sound("vanilla"),
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 14),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=24,
+            pady=6,
+        )
+        self.btn_vanilla_import.pack(side="left", padx=(0, 24))
+
+        tk.Button(
+            actions,
+            text="Test/edit sounds",
+            command=lambda: self.cmd_open_test_edit("vanilla"),
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 13),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=20,
+            pady=6,
+        ).pack(side="left", padx=(0, 24))
+
+        tk.Button(
+            actions,
+            text="Restore original sounds",
+            command=self.cmd_open_vanilla_restore_dialog,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 13),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=22,
+            pady=6,
+        ).pack(side="left")
+
+    def _build_view_test_edit(self) -> None:
+        hdr = tk.Frame(self.view_test_edit, bg="#080c13", padx=16, pady=10)
+        hdr.pack(fill="x", side="top")
+        tk.Label(
+            hdr,
+            text="Test/edit Sounds",
+            bg="#080c13",
+            fg="#ffffff",
+            font=("Segoe UI", 22, "bold"),
+        ).pack(side="left")
+        tk.Button(
+            hdr,
+            text="Finish",
+            command=self.cmd_finish_test_edit,
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 14),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=18,
+            pady=4,
+        ).pack(side="right")
+
+        content = ttk.Frame(self.view_test_edit, style="Panel.TFrame", padding=(10, 6))
+        content.pack(fill="both", expand=True)
+
+        # Barra de vistas: Views: (o) Interior  ( ) Exterior  [+] [-]
+        view_bar = ttk.Frame(content, style="Panel.TFrame", padding=(4, 4))
+        view_bar.pack(fill="x", side="top", pady=(0, 4))
+        ttk.Label(view_bar, text="Views:", style="Section.TLabel").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            view_bar,
+            text="🎧 Interior (EngineInt + Cockpit)",
+            variable=self.rpm_view_persp_var,
+            value="int",
+            command=self._refresh_rpm_tab,
+        ).pack(side="left", padx=(0, 14))
+        ttk.Radiobutton(
+            view_bar,
+            text="🔊 Exterior (EngineExt)",
+            variable=self.rpm_view_persp_var,
+            value="ext",
+            command=self._refresh_rpm_tab,
+        ).pack(side="left", padx=(0, 14))
+        ttk.Button(view_bar, text="+", width=3, command=self.cmd_add_rpm_band).pack(side="left", padx=(0, 4))
+        ttk.Button(view_bar, text="-", width=3, command=self.cmd_delete_rpm_band).pack(side="left")
+
+        # Canvas RPM
+        self.rpm_canvas = tk.Canvas(
+            content,
+            height=136,
+            bg=BG_INPUT,
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+            cursor="hand2",
+        )
+        self.rpm_canvas.pack(fill="x", side="top", pady=(0, 6))
+        self.rpm_canvas.bind("<Configure>", lambda _e: self._draw_rpm_bands_canvas())
+        self.rpm_canvas.bind("<Button-1>", self._on_rpm_canvas_click)
+
+        # Panel inferior: Simulador + Throttle Cut
+        sim_tcut_f = ttk.Frame(content, style="Panel.TFrame", padding=(4, 6))
+        sim_tcut_f.pack(fill="x", side="bottom")
+
+        sim_btns = ttk.Frame(sim_tcut_f, style="Panel.TFrame")
+        sim_btns.pack(fill="x", pady=(0, 8))
+        self.btn_sim_int = tk.Button(
+            sim_btns,
+            text="Test interior sound",
+            command=self.cmd_simulate_pass_int,
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 12),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=20,
+            pady=4,
+        )
+        self.btn_sim_int.pack(side="left", padx=(0, 8))
+
+        self.btn_sim_ext = tk.Button(
+            sim_btns,
+            text="Test exterior sound",
+            command=self.cmd_simulate_pass_ext,
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 12),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=20,
+            pady=4,
+        )
+        self.btn_sim_ext.pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            sim_btns,
+            text="Stop",
+            command=self.stop_audio_preview,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 12),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=12,
+            pady=4,
+        ).pack(side="left", padx=(0, 14))
+
+        ttk.Label(sim_btns, textvariable=self.sim_stage_var, style="Muted.TLabel").pack(side="left")
+
+        # Bloque Throttle Cut debajo de botones del simulador
+        tc_box = ttk.Frame(sim_tcut_f, style="Card.TFrame", padding=(8, 6))
+        tc_box.pack(anchor="w")
+
+        tc_r1 = ttk.Frame(tc_box, style="Card.TFrame")
+        tc_r1.pack(anchor="w", pady=(0, 6))
+        ttk.Checkbutton(
+            tc_r1,
+            text="Inject Throttle Cut into engine",
+            variable=self.tcut_enabled_var,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Entry(tc_r1, textvariable=self.tcut_gain_var, width=5).pack(side="left", padx=(0, 8))
+        ttk.Label(tc_r1, text="Gain (dB):", style="Card.TLabel").pack(side="left")
+
+        tc_r2 = ttk.Frame(tc_box, style="Card.TFrame")
+        tc_r2.pack(anchor="w")
+        ttk.Label(tc_r2, text="Cut INT:", style="Card.TLabel").pack(side="left", padx=(0, 4))
+        self.tcut_int_combo = ttk.Combobox(tc_r2, textvariable=self.tcut_int_combo_var, state="readonly", width=26)
+        self.tcut_int_combo.pack(side="left", padx=(0, 4))
+        self.tcut_int_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_tcut_combo_selected("int"))
+        ttk.Button(tc_r2, text="▶", width=3, command=lambda: self.cmd_preview_throttle_cut("int")).pack(
+            side="left", padx=(0, 3)
+        )
+        ttk.Button(tc_r2, text="📂", width=3, command=lambda: self.cmd_pick_tcut_wav("int")).pack(
+            side="left", padx=(0, 14)
+        )
+
+        ttk.Label(tc_r2, text="Cut EXT:", style="Card.TLabel").pack(side="left", padx=(0, 4))
+        self.tcut_ext_combo = ttk.Combobox(tc_r2, textvariable=self.tcut_ext_combo_var, state="readonly", width=26)
+        self.tcut_ext_combo.pack(side="left", padx=(0, 4))
+        self.tcut_ext_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_tcut_combo_selected("ext"))
+        ttk.Button(tc_r2, text="▶", width=3, command=lambda: self.cmd_preview_throttle_cut("ext")).pack(
+            side="left", padx=(0, 3)
+        )
+        ttk.Button(tc_r2, text="📂", width=3, command=lambda: self.cmd_pick_tcut_wav("ext")).pack(side="left")
+
+        # Panel de edición numérica de bandas (encima del simulador)
+        band_ed = ttk.Frame(content, style="Card.TFrame", padding=(10, 7))
+        band_ed.pack(fill="x", side="bottom", pady=(0, 6))
+
+        bed_r1 = ttk.Frame(band_ed, style="Card.TFrame")
+        bed_r1.pack(fill="x", pady=(0, 5))
+        ttk.Button(
+            bed_r1,
+            text="Shift all Root RPM",
+            command=self.cmd_batch_shift_all_root_rpm,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Entry(bed_r1, textvariable=self.batch_root_rpm_var, width=6).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            bed_r1,
+            text="Shift all RPM",
+            command=self.cmd_batch_shift_all_rpm,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Entry(bed_r1, textvariable=self.batch_rpm_var, width=6).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            bed_r1,
+            text="Amplify all bands",
+            command=self.cmd_batch_gain_all_bands,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Entry(bed_r1, textvariable=self.batch_gain_var, width=5).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            bed_r1,
+            text="▶ Preview Band Sample",
+            command=self.cmd_preview_selected_band_sample,
+        ).pack(side="left")
+
+        self.selected_band_lbl = ttk.Label(bed_r1, text="", style="CardMuted.TLabel")
+        self.selected_band_lbl.pack(side="right")
+
+        bed_r_sample = ttk.Frame(band_ed, style="Card.TFrame")
+        bed_r_sample.pack(fill="x", pady=(0, 5))
+        ttk.Label(bed_r_sample, text="Assigned Sample / Replacement:", style="Card.TLabel").pack(side="left", padx=(0, 6))
+        self.band_source_combo = ttk.Combobox(
+            bed_r_sample,
+            textvariable=self.band_source_var,
+            state="readonly",
+            width=48,
+        )
+        self.band_source_combo.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.band_source_combo.bind("<<ComboboxSelected>>", self._on_band_source_combo_selected)
+        ttk.Button(bed_r_sample, text="📂 WAV...", width=8, command=self.cmd_pick_band_custom_wav).pack(
+            side="left", padx=(0, 6)
+        )
+        self.btn_overwrite_sample = ttk.Button(
+            bed_r_sample,
+            text="🔁 Overwrite Sample",
+            command=self.cmd_overwrite_selected_band_sample,
+        )
+        self.btn_overwrite_sample.pack(side="left", padx=(0, 6))
+        self.btn_reactivate_band = ttk.Button(
+            bed_r_sample,
+            text="♻ Reactivate Band",
+            command=self.cmd_reactivate_selected_band,
+        )
+        self.btn_reactivate_band.pack(side="left")
+
+        bed_r2 = ttk.Frame(band_ed, style="Card.TFrame")
+        bed_r2.pack(fill="x")
+        ed_fields = [
+            ("Min RPM:", self.band_rmin_var, 7),
+            ("Fade-In End:", self.band_fi_var, 7),
+            ("Fade-Out Start:", self.band_fo_var, 7),
+            ("Max RPM:", self.band_rmax_var, 7),
+            ("Root RPM (Pitch):", self.band_root_rpm_var, 8),
+            ("Gain (dB):", self.band_gain_var, 6),
+        ]
+        for col_idx, (lbl_t, tk_v, w_ch) in enumerate(ed_fields):
+            ttk.Label(bed_r2, text=lbl_t, style="Card.TLabel").grid(
+                row=0, column=col_idx * 2, sticky="w", padx=(0, 4)
+            )
+            ttk.Entry(bed_r2, textvariable=tk_v, width=w_ch).grid(
+                row=0, column=col_idx * 2 + 1, sticky="w", padx=(0, 10)
+            )
+        ttk.Button(
+            bed_r2,
+            text="✔ Apply Band Changes",
+            style="Primary.TButton",
+            command=self.cmd_apply_band_edit,
+        ).grid(row=0, column=len(ed_fields) * 2, sticky="e", padx=(6, 0))
+
+        # Tabla central de Bandas RPM
+        b_tree_frame = ttk.Frame(content, style="Panel.TFrame")
+        b_tree_frame.pack(fill="both", expand=True, pady=(0, 6))
+        bcols = ("idx", "role", "sample", "rmin", "fi", "fo", "rmax", "root_rpm", "gain", "status")
+        self.rpm_tree = ttk.Treeview(b_tree_frame, columns=bcols, show="headings", selectmode="browse", height=6)
+        bheadings = {
+            "idx": ("Band", 62),
+            "role": ("Layer / Role", 96),
+            "sample": ("Currently Assigned Sample", 265),
+            "rmin": ("Min RPM", 84),
+            "fi": ("Fade-In End", 92),
+            "fo": ("Fade-Out Start", 104),
+            "rmax": ("Max RPM", 84),
+            "root_rpm": ("Root RPM (Pitch)", 106),
+            "gain": ("Gain", 78),
+            "status": ("Status / Overlap", 195),
+        }
+        for c, (txt, w) in bheadings.items():
+            self.rpm_tree.heading(c, text=txt)
+            self.rpm_tree.column(c, width=w, anchor="w" if c in ("sample", "status") else "center")
+        self.rpm_tree.tag_configure("band_ok", foreground="#f1f5f9")
+        self.rpm_tree.tag_configure("band_replaced", foreground="#86efac")
+        self.rpm_tree.tag_configure("band_overlap", foreground="#fbbf24")
+        self.rpm_tree.tag_configure("band_muted", foreground="#64748b")
+        b_vsb = ttk.Scrollbar(b_tree_frame, orient="vertical", command=self.rpm_tree.yview)
+        self.rpm_tree.configure(yscrollcommand=b_vsb.set)
+        self.rpm_tree.pack(side="left", fill="both", expand=True)
+        b_vsb.pack(side="right", fill="y")
+        self.rpm_tree.bind("<<TreeviewSelect>>", self._on_rpm_band_selected)
+        self.rpm_tree.bind("<Double-1>", lambda _e: self.cmd_preview_selected_band_sample())
+
+    def _refresh_ui_file_statuses(self) -> None:
+        if self.source_lib is not None and self.source_lib.source_path:
+            self.ui_bank_check_var.set("✔")
+            self.ui_bank_status_var.set(f".bank :  {self.source_lib.source_path.name}")
+            if self.source_lib.guids_path is not None and self.source_lib.matched_guids_count > 0:
+                self.ui_guids_check_var.set("✔")
+                self.ui_guids_status_var.set("GUIDs")
+            else:
+                self.ui_guids_check_var.set("○")
+                self.ui_guids_status_var.set("GUIDs : Not selected (optional)")
+        else:
+            self.ui_bank_check_var.set("○")
+            self.ui_bank_status_var.set(".bank : Not selected")
+            if self._pending_guids_path is not None:
+                self.ui_guids_check_var.set("✔")
+                self.ui_guids_status_var.set(f"GUIDs :  {self._pending_guids_path.name}")
+            else:
+                self.ui_guids_check_var.set("○")
+                self.ui_guids_status_var.set("GUIDs : Not selected")
+
+        if self.csd_doc is not None and self.csd_doc.source_path:
+            self.ui_csdbin_check_var.set("✔")
+            self.ui_csdbin_status_var.set(f".csdbin :  {self.csd_doc.source_path.name}")
+        else:
+            self.ui_csdbin_check_var.set("○")
+            self.ui_csdbin_status_var.set(".csdbin : Not selected")
+
+    def _set_import_buttons_state(self, state: str) -> None:
+        for attr in ("btn_export", "btn_custom_import", "btn_vanilla_import"):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.config(state=state)
+
+    def _enforce_locked_export_options(self) -> None:
+        """Aplica y bloquea todas las opciones de exportación por defecto en modo directo."""
+        self.port_mode_var.set("direct")
+        self.standalone_var.set(True)
+        self.sync_pitch_var.set(True)
+        self.auto_link_csd_var.set(True)
+        self.open_folder_after_var.set(True)
+        self.codec_choice_var.set("PCM16")
+        self.vanilla_auto_backup_var.set(True)
+        self.vanilla_sync_ai_var.set(True)
+        self.vanilla_mute_pops_var.set(True)
+        self.mute_all_pops_var.set(True)
+        self.invert_cone_var.set(True)
+
+    def cmd_import_sound(self, mode: str) -> None:
+        self._enforce_locked_export_options()
+        self.target_mode_var.set(mode)
+        self.cmd_run_export()
+
+    def cmd_open_test_edit(self, return_view: str) -> None:
+        if self.source_lib is None or self.source_lib.fmod_bank is None:
+            messagebox.showwarning(
+                "No sound bank loaded",
+                "Please select an Assetto Corsa .bank file first (Step 1).",
+            )
+            return
+        self._test_return_view = return_view
+        self.show_view("test_edit")
+
+    def cmd_finish_test_edit(self) -> None:
+        self.stop_audio_preview()
+        self.show_view(self._test_return_view or "menu")
+
+    def cmd_open_vanilla_car_picker(self) -> None:
+        """Abre un selector rápido con búsqueda para elegir el vehículo vanilla de AMS2."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Select vanilla car")
+        dlg.geometry("520x460")
+        dlg.configure(bg=BG_DARK)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        top = ttk.Frame(dlg, style="Panel.TFrame", padding=10)
+        top.pack(fill="x")
+        ttk.Label(top, text="Search:", style="Panel.TLabel").pack(side="left", padx=(0, 8))
+        ent = ttk.Entry(top, textvariable=self.vanilla_search_var)
+        ent.pack(side="left", fill="x", expand=True)
+
+        lb = tk.Listbox(
+            dlg,
+            bg=BG_INPUT,
+            fg="#f1f5f9",
+            selectbackground=ACCENT_BLUE,
+            selectforeground="#ffffff",
+            font=("Segoe UI", 10),
+            relief="flat",
+        )
+        lb.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+
+        def _populate_lb(*_args: Any) -> None:
+            self._filter_vanilla_vehicles()
+            lb.delete(0, "end")
+            for val in self.vanilla_combo["values"]:
+                lb.insert("end", val)
+
+        def _confirm_sel(_ev: Any = None) -> None:
+            sel = lb.curselection()
+            if sel:
+                idx = sel[0]
+                if 0 <= idx < len(self.vanilla_filtered_vehicles):
+                    v = self.vanilla_filtered_vehicles[idx]
+                    self.vanilla_selected_id_var.set(self.vanilla_combo["values"][idx])
+                    self._on_vanilla_vehicle_selected()
+            dlg.destroy()
+
+        ent.bind("<KeyRelease>", _populate_lb)
+        lb.bind("<Double-1>", _confirm_sel)
+        _populate_lb()
+        ent.focus_set()
+
+        bot = ttk.Frame(dlg, style="Panel.TFrame", padding=(10, 6))
+        bot.pack(fill="x")
+        ttk.Button(bot, text="Select", style="Primary.TButton", command=_confirm_sel).pack(side="right")
+        ttk.Button(bot, text="Cancel", command=dlg.destroy).pack(side="right", padx=(0, 8))
+
+    def _build_notebook(self) -> None:
+        self._build_legacy_notebook_hidden()
 
     def _build_statusbar(self) -> None:
         bar = ttk.Frame(self, style="Panel.TFrame", padding=(14, 7))
@@ -1103,13 +1863,14 @@ class SoundPorterApp(tk.Tk):
         ttk.Label(sel_card, text="Vehículo Oficial / Vanilla:", style="Card.TLabel").grid(
             row=0, column=2, sticky="w", padx=(0, 8), pady=4
         )
-        self.vanilla_combo = ttk.Combobox(
-            sel_card,
-            textvariable=self.vanilla_selected_id_var,
-            state="readonly",
-        )
-        self.vanilla_combo.grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=4)
-        self.vanilla_combo.bind("<<ComboboxSelected>>", self._on_vanilla_vehicle_selected)
+        if not hasattr(self, "vanilla_combo"):
+            self.vanilla_combo = ttk.Combobox(
+                sel_card,
+                textvariable=self.vanilla_selected_id_var,
+                state="readonly",
+            )
+            self.vanilla_combo.grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=4)
+            self.vanilla_combo.bind("<<ComboboxSelected>>", self._on_vanilla_vehicle_selected)
 
         # Botones de acción directa
         btn_bar = ttk.Frame(sel_card, style="Card.TFrame")
@@ -1411,21 +2172,24 @@ class SoundPorterApp(tk.Tk):
             self.vanilla_cfg_card,
             text="🛡️ Respaldo Preventivo Garantizado: Crear copia segura del archivo original (.orig y almacén con hash SHA256) antes de modificar nada",
             variable=self.vanilla_auto_backup_var,
+            state="disabled",
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
 
         ttk.Checkbutton(
             self.vanilla_cfg_card,
             text="👥 Sincronizar e inyectar también banco de audio de IA (_AI.bank) en un solo paso (Cubre rivales en pista y vistas de Repetición / TV Replay)",
             variable=self.vanilla_sync_ai_var,
+            state="disabled",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
 
         ttk.Checkbutton(
             self.vanilla_cfg_card,
             text="🔇 Silenciar rateo continuo, petardeos y control de tracción (POPS / TC / Limiter) en Replay y vistas externas (Recomendado)",
             variable=self.vanilla_mute_pops_var,
+            state="disabled",
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
 
-        # Tarjeta 2: Opciones avanzadas de ingeniería FMOD
+        # Tarjeta 2: Opciones avanzadas de ingeniería FMOD (bloqueadas por defecto)
         self.opts_card = ttk.Frame(self.tab_export, style="Card.TFrame", padding=16)
         self.opts_card.pack(fill="x", pady=(0, 12))
 
@@ -1437,36 +2201,42 @@ class SoundPorterApp(tk.Tk):
             self.opts_card,
             text="🔇 Silenciar completamente la banda de POPS (Petardeos) en la exportación",
             variable=self.mute_all_pops_var,
+            state="disabled",
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
             self.opts_card,
             text="🔄 Invertir Cono Espacial 3D (Event Cone Angle): Corrige la orientación 180° entre Assetto Corsa y Automobilista 2",
             variable=self.invert_cone_var,
+            state="disabled",
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
             self.opts_card,
             text="Modo Standalone con Tabla STDT (Recomendado): Regenera GUIDs únicos e incrusta rutas 'event:/...' dentro del .bank sin tocar MasterBank.strings.bank",
             variable=self.standalone_var,
+            state="disabled",
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
             self.opts_card,
             text="Sincronizar Auto-Pitch RPM automáticamente en FMOD (INST): Ajusta la referencia de RPM de cada capa para que la afinación del motor sea exacta",
             variable=self.sync_pitch_var,
+            state="disabled",
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
             self.opts_card,
             text="Vincular y compilar automáticamente el archivo .csdbin cargado junto con el banco .bank",
             variable=self.auto_link_csd_var,
+            state="disabled",
         ).pack(anchor="w", pady=3)
 
         ttk.Checkbutton(
             self.opts_card,
             text="Abrir la carpeta de salida en el Explorador de Windows al finalizar",
             variable=self.open_folder_after_var,
+            state="disabled",
         ).pack(anchor="w", pady=3)
 
         codec_row = ttk.Frame(self.opts_card, style="Card.TFrame")
@@ -1477,12 +2247,14 @@ class SoundPorterApp(tk.Tk):
             text="PCM16 Sin Pérdida (Recomendado — Máxima calidad de sonido y compilación ultrarrápida)",
             variable=self.codec_choice_var,
             value="PCM16",
+            state="disabled",
         ).pack(side="left", padx=(0, 18))
         ttk.Radiobutton(
             codec_row,
             text="FADPCM Comprimido Nativo FMOD (~3.6x menor tamaño de archivo .bank)",
             variable=self.codec_choice_var,
             value="FADPCM",
+            state="disabled",
         ).pack(side="left")
 
         # Botón principal de compilación
@@ -1588,32 +2360,36 @@ class SoundPorterApp(tk.Tk):
     # ========================================================================
     def cmd_load_ac_bank(self) -> None:
         p = filedialog.askopenfilename(
-            title="Seleccionar banco FMOD (.bank) de Assetto Corsa",
-            filetypes=[("Bancos FMOD Studio", "*.bank"), ("Todos los archivos", "*.*")],
+            title="Select Assetto Corsa FMOD sound bank (.bank)",
+            filetypes=[("FMOD Studio Banks", "*.bank"), ("All files", "*.*")],
         )
         if not p:
             return
         self._load_source_library_from_bank(Path(p))
 
     def cmd_load_ac_guids_txt(self) -> None:
-        if self.source_lib is None or not str(self.source_lib.source_path).lower().endswith(".bank"):
-            messagebox.showinfo(
-                "Cargar .bank primero",
-                "Carga primero el archivo .bank de Assetto Corsa y luego selecciona su archivo GUIDs.txt.",
-            )
-            return
-        init_dir = str(self.source_lib.source_path.parent)
+        has_bank = self.source_lib is not None and str(self.source_lib.source_path).lower().endswith(".bank")
+        init_dir = str(self.source_lib.source_path.parent) if has_bank and self.source_lib else ""
         p = filedialog.askopenfilename(
-            title="Seleccionar archivo GUIDs.txt del sonido de Assetto Corsa",
-            initialdir=init_dir,
-            filetypes=[("Archivos GUIDs de FMOD", "*.txt"), ("Todos los archivos", "*.*")],
+            title="Select Assetto Corsa GUIDs.txt file",
+            initialdir=init_dir or None,
+            filetypes=[("FMOD GUIDs files", "*.txt"), ("All files", "*.*")],
         )
         if not p:
             return
-        self._load_source_library_from_bank(self.source_lib.source_path, guids_path=Path(p))
+        gp = Path(p)
+        if has_bank and self.source_lib is not None:
+            self._pending_guids_path = None
+            self._load_source_library_from_bank(self.source_lib.source_path, guids_path=gp)
+        else:
+            self._pending_guids_path = gp
+            self._refresh_ui_file_statuses()
 
     def _load_source_library_from_bank(self, path: Path, guids_path: Path | None = None) -> None:
         try:
+            if guids_path is None and self._pending_guids_path is not None:
+                guids_path = self._pending_guids_path
+                self._pending_guids_path = None
             lib = SourceAudioLibrary.from_bank(path, guids_path=guids_path)
             if guids_path is not None and lib.matched_guids_count == 0:
                 messagebox.showwarning(
@@ -1624,6 +2400,7 @@ class SoundPorterApp(tk.Tk):
             self.source_lib = lib
             self._selected_band_idx = None
             self._selected_donor_gidx = None
+            self._refresh_ui_file_statuses()
             if lib.guids_path is not None and lib.matched_guids_count > 0:
                 self.src_info_var.set(
                     f"✔ {lib.source_label} ({len(lib.items)} muestras | {lib.total_events_count} eventos)"
@@ -2957,7 +3734,7 @@ class SoundPorterApp(tk.Tk):
 
         # Crear diálogo modal
         dlg = tk.Toplevel(self)
-        dlg.title(f"Añadir Banda de Sonido ({'Interior' if persp == 'int' else 'Exterior'}) desde AC")
+        dlg.title(f"Add Sound Band ({'Interior' if persp == 'int' else 'Exterior'}) from AC")
         dlg.geometry("590x510")
         dlg.configure(bg=BG_DARK)
         dlg.transient(self)
@@ -2968,7 +3745,7 @@ class SoundPorterApp(tk.Tk):
 
         ttk.Label(
             card,
-            text=f"➕ Añadir Banda de RPM a la vista {'INTERIOR (Cabina)' if persp == 'int' else 'EXTERIOR'}:",
+            text=f"➕ Add RPM Band to {'INTERIOR (Cockpit)' if persp == 'int' else 'EXTERIOR'} view:",
             style="CardSection.TLabel",
         ).pack(anchor="w", pady=(0, 6))
 
@@ -2976,13 +3753,13 @@ class SoundPorterApp(tk.Tk):
         free_b = next((b for b in self.rpm_bands if b.perspective == persp and (b.is_muted_bus or self._band_is_silenced(b))), None)
         if free_b:
             free_idx = self.rpm_bands.index(free_b)
-            info_txt = f"ℹ Se reutilizará la pista física libre #{free_idx:02d} [{free_b.load_role.upper()}] para que el motor en AMS2 la reproduzca sin zonas mudas."
+            info_txt = f"ℹ Free physical track #{free_idx:02d} [{free_b.load_role.upper()}] will be reused so AMS2 plays it without silent gaps."
         else:
-            info_txt = "ℹ Todas las pistas están activas. Se reasignará la banda más cercana o seleccionada manteniendo la estructura FMOD intacta."
+            info_txt = "ℹ All tracks are active. The closest or selected band will be reassigned while keeping the FMOD structure intact."
         ttk.Label(card, text=info_txt, style="CardMuted.TLabel", wraplength=530).pack(anchor="w", pady=(0, 10))
 
         # 1. Selector de muestra de Assetto Corsa
-        ttk.Label(card, text="Muestra de origen (Assetto Corsa / WAV):", style="Card.TLabel").pack(anchor="w")
+        ttk.Label(card, text="Source Sample (Assetto Corsa / WAV):", style="Card.TLabel").pack(anchor="w")
         src_row = ttk.Frame(card, style="Card.TFrame")
         src_row.pack(fill="x", pady=(2, 10))
 
@@ -3017,12 +3794,12 @@ class SoundPorterApp(tk.Tk):
         f_grid.columnconfigure(3, weight=1)
 
         add_role_var = tk.StringVar(value="on")
-        ttk.Label(f_grid, text="Capa / Rol:", style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(f_grid, text="Layer / Role:", style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=4)
         role_cb = ttk.Combobox(f_grid, textvariable=add_role_var, values=["on", "off", "idle", "pops"], state="readonly", width=12)
         role_cb.grid(row=0, column=1, sticky="w", pady=4, padx=(0, 12))
 
         add_gain_var = tk.StringVar(value="0.0")
-        ttk.Label(f_grid, text="Ganancia (dB):", style="Card.TLabel").grid(row=0, column=2, sticky="w", pady=4)
+        ttk.Label(f_grid, text="Gain (dB):", style="Card.TLabel").grid(row=0, column=2, sticky="w", pady=4)
         ttk.Entry(f_grid, textvariable=add_gain_var, width=8).grid(row=0, column=3, sticky="w", pady=4)
 
         add_rmin_var = tk.StringVar(value="3000")
@@ -3064,8 +3841,8 @@ class SoundPorterApp(tk.Tk):
         _on_source_change()
 
         row_defs = [
-            ("RPM Mín:", add_rmin_var, "Fin Fade-In:", add_fi_var),
-            ("Inicio Fade-Out:", add_fo_var, "RPM Máx:", add_rmax_var),
+            ("Min RPM:", add_rmin_var, "Fade-In End:", add_fi_var),
+            ("Fade-Out Start:", add_fo_var, "Max RPM:", add_rmax_var),
         ]
         for r_idx, (l1, v1, l2, v2) in enumerate(row_defs, start=1):
             ttk.Label(f_grid, text=l1, style="Card.TLabel").grid(row=r_idx, column=0, sticky="w", pady=4)
@@ -3073,7 +3850,7 @@ class SoundPorterApp(tk.Tk):
             ttk.Label(f_grid, text=l2, style="Card.TLabel").grid(row=r_idx, column=2, sticky="w", pady=4)
             ttk.Entry(f_grid, textvariable=v2, width=12).grid(row=r_idx, column=3, sticky="w", pady=4)
 
-        ttk.Label(f_grid, text="RPM Raíz (Pitch):", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(f_grid, text="Root RPM (Pitch):", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=4)
         ttk.Entry(f_grid, textvariable=add_root_var, width=12).grid(row=3, column=1, sticky="w", pady=4, padx=(0, 12))
 
         # Preescucha
@@ -3098,7 +3875,7 @@ class SoundPorterApp(tk.Tk):
 
         act_bar = ttk.Frame(card, style="Card.TFrame")
         act_bar.pack(fill="x", pady=(10, 0))
-        ttk.Button(act_bar, text="▶ Escuchar Muestra", command=_preview_add_sample).pack(side="left")
+        ttk.Button(act_bar, text="▶ Preview Sample", command=_preview_add_sample).pack(side="left")
 
         def _do_confirm_add() -> None:
             try:
@@ -3217,8 +3994,8 @@ class SoundPorterApp(tk.Tk):
                 f"✔ Banda #{target_idx:02d} [{target_band.load_role.upper()}] asignada exitosamente con '{sample_name}' ({rmin:.0f} - {rmax:.0f} RPM)."
             )
 
-        ttk.Button(act_bar, text="✔ Añadir Banda al Motor", style="Primary.TButton", command=_do_confirm_add).pack(side="right")
-        ttk.Button(act_bar, text="Cancelar", command=dlg.destroy).pack(side="right", padx=(0, 8))
+        ttk.Button(act_bar, text="✔ Add Band to Engine", style="Primary.TButton", command=_do_confirm_add).pack(side="right")
+        ttk.Button(act_bar, text="Cancel", command=dlg.destroy).pack(side="right", padx=(0, 8))
 
 
     def _band_is_silenced(self, b: RpmBandConfig) -> bool:
@@ -3866,12 +4643,12 @@ class SoundPorterApp(tk.Tk):
     # ========================================================================
     def cmd_open_csdbin(self) -> None:
         p = filedialog.askopenfilename(
-            title="Abrir archivo .csdbin o .csd de Automobilista 2",
+            title="Select Automobilista 2 .csdbin or .csd file",
             filetypes=[
-                ("Archivos Sonido Vehículo AMS2", "*.csdbin *.csd"),
-                ("Binario CSDBIN", "*.csdbin"),
-                ("Texto OMVT CSD", "*.csd"),
-                ("Todos los archivos", "*.*"),
+                ("AMS2 Vehicle Sound Files", "*.csdbin *.csd"),
+                ("CSDBIN Binary", "*.csdbin"),
+                ("OMVT CSD Text", "*.csd"),
+                ("All files", "*.*"),
             ],
         )
         if not p:
@@ -3883,6 +4660,7 @@ class SoundPorterApp(tk.Tk):
             doc = CsdbinDocument.from_file(path)
             self.csd_doc = doc
             self.csd_info_var.set(f"✔ {path.name} ({len(doc.links)} enlaces, {len(doc.fields)} parámetros)")
+            self._refresh_ui_file_statuses()
             self._populate_visual_csd_from_doc()
             self.raw_csd_text.delete("1.0", "end")
             self.raw_csd_text.insert("1.0", doc.to_csd_text())
@@ -4335,7 +5113,7 @@ class SoundPorterApp(tk.Tk):
 
     def cmd_open_vanilla_restore_dialog(self) -> None:
         dlg = tk.Toplevel(self)
-        dlg.title("Gestor de Restauración de Sonidos Vanilla — Automobilista 2")
+        dlg.title("Vanilla Sound Restore Manager — Automobilista 2")
         dlg.geometry("860x520")
         dlg.minsize(700, 420)
         dlg.configure(bg=BG_DARK)
@@ -4346,12 +5124,12 @@ class SoundPorterApp(tk.Tk):
         top_f.pack(fill="x")
         ttk.Label(
             top_f,
-            text="🛡️  Restauración Garantizada de Vehículos Vanilla de Steam",
+            text="🛡️  Restore Original Steam Vanilla Car Sounds",
             style="HeaderTitle.TLabel",
         ).pack(anchor="w")
         ttk.Label(
             top_f,
-            text="Restaura cualquier vehículo base modificado a sus archivos originales de Steam con un solo clic, sin reparar en Steam.",
+            text="Restore any modified official car back to its original Steam files in one click.",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -4360,10 +5138,10 @@ class SoundPorterApp(tk.Tk):
 
         cols = ("veh", "path", "date", "sha")
         tree = ttk.Treeview(mid_f, columns=cols, show="headings", selectmode="browse")
-        tree.heading("veh", text="Vehículo Oficial")
-        tree.heading("path", text="Archivo en Juego")
-        tree.heading("date", text="Fecha Respaldo")
-        tree.heading("sha", text="SHA256 Original")
+        tree.heading("veh", text="Official Vehicle")
+        tree.heading("path", text="Game File")
+        tree.heading("date", text="Backup Date")
+        tree.heading("sha", text="Original SHA256")
         tree.column("veh", width=240)
         tree.column("path", width=280)
         tree.column("date", width=150)
@@ -4379,11 +5157,11 @@ class SoundPorterApp(tk.Tk):
                 tree.delete(item)
             mod_list = self.vanilla_mgr.get_modified_vehicles()
             if not mod_list:
-                tree.insert("", "end", values=("(Ningún vehículo modificado — Todo original de fábrica)", "—", "—", "—"))
+                tree.insert("", "end", values=("(No modified vehicles — All factory original)", "—", "—", "—"))
                 return
             for v in mod_list:
-                sha_short = (v.original_sha256[:12] + "...") if v.original_sha256 else "Archivo .orig"
-                date_str = (v.backup_timestamp[:19].replace("T", " ")) if v.backup_timestamp else "Disponible"
+                sha_short = (v.original_sha256[:12] + "...") if v.original_sha256 else ".orig file"
+                date_str = (v.backup_timestamp[:19].replace("T", " ")) if v.backup_timestamp else "Available"
                 tree.insert(
                     "", "end", iid=v.vehicle_id, values=(v.display_name, v.bank_path.name, date_str, sha_short)
                 )
@@ -4397,7 +5175,7 @@ class SoundPorterApp(tk.Tk):
             sel = tree.selection()
             if not sel or sel[0].startswith("("):
                 messagebox.showwarning(
-                    "Sin Selección", "Selecciona un vehículo de la lista para restaurar.", parent=dlg
+                    "No Selection", "Please select a vehicle from the list to restore.", parent=dlg
                 )
                 return
             veh_id = sel[0]
@@ -4405,7 +5183,7 @@ class SoundPorterApp(tk.Tk):
             if veh:
                 ok, msg = self.vanilla_mgr.restore_vehicle(veh)
                 if ok:
-                    messagebox.showinfo("Restaurado", msg, parent=dlg)
+                    messagebox.showinfo("Restored", msg, parent=dlg)
                     refresh_tree()
                     self._populate_vanilla_vehicles_list()
                 else:
@@ -4414,27 +5192,27 @@ class SoundPorterApp(tk.Tk):
         def do_restore_all() -> None:
             mod_list = self.vanilla_mgr.get_modified_vehicles()
             if not mod_list:
-                messagebox.showinfo("Sin Vehículos", "No hay ningún vehículo vanilla modificado.", parent=dlg)
+                messagebox.showinfo("No Modified Vehicles", "There are no modified vanilla vehicles.", parent=dlg)
                 return
             if not messagebox.askyesno(
-                "Confirmar Restauración Total",
-                "¿Deseas restaurar TODOS los vehículos vanilla modificados a su estado original de Steam?",
+                "Confirm Full Restore",
+                "Do you want to restore ALL modified vanilla vehicles back to their original Steam state?",
                 parent=dlg,
             ):
                 return
             s_cnt, f_cnt, msgs = self.vanilla_mgr.restore_all()
             refresh_tree()
             self._populate_vanilla_vehicles_list()
-            messagebox.showinfo("Finalizado", f"Se restauraron {s_cnt} vehículo(s) con éxito.", parent=dlg)
+            messagebox.showinfo("Done", f"Successfully restored {s_cnt} vehicle(s).", parent=dlg)
 
         ttk.Button(
             bot_f,
-            text="🔄 Restaurar Seleccionado",
+            text="🔄 Restore Selected",
             style="Primary.TButton",
             command=do_restore_selected,
         ).pack(side="left", padx=(0, 8))
-        ttk.Button(bot_f, text="🛡️ Restaurar TODOS", command=do_restore_all).pack(side="left", padx=(0, 8))
-        ttk.Button(bot_f, text="Cerrar", command=dlg.destroy).pack(side="right")
+        ttk.Button(bot_f, text="🛡️ Restore ALL", command=do_restore_all).pack(side="left", padx=(0, 8))
+        ttk.Button(bot_f, text="Close", command=dlg.destroy).pack(side="right")
 
     # ========================================================================
     # Acciones de Pestaña 5 (Compilación en segundo plano y Exportación / Inyección)
@@ -4524,7 +5302,7 @@ class SoundPorterApp(tk.Tk):
             bands_to_export = clean_bands
         is_direct = self.is_direct_ac_mode
 
-        self.btn_export.config(state="disabled")
+        self._set_import_buttons_state("disabled")
         self.progress.start(12)
         mode_label = (
             "Transmutación Directa (Sin Donante - 100% Fiel AC)"
@@ -4567,7 +5345,7 @@ class SoundPorterApp(tk.Tk):
 
     def _on_export_success(self, summary: ModExportSummary) -> None:
         self.progress.stop()
-        self.btn_export.config(state="normal")
+        self._set_import_buttons_state("normal")
         if self.csd_doc is not None:
             self._populate_visual_csd_from_doc()
             self._sync_visual_to_raw_csd_editor()
@@ -4599,68 +5377,64 @@ class SoundPorterApp(tk.Tk):
             self._append_log(f"✔ Respaldo .csd (OMVT):      {summary.csd_text_file}")
         self._append_log(f"✔ Guía de instalación:       {summary.readme_file}")
 
-        self.status_var.set(f"✅ ¡Exportación exitosa en {summary.output_root}!")
+        self.status_var.set(f"✅ Export succeeded in {summary.output_root}!")
         if self.open_folder_after_var.get() and os.name == "nt":
             try:
                 subprocess.Popen(["explorer", str(summary.output_root)])
             except Exception:
                 pass
         messagebox.showinfo(
-            "¡Paquete Mod Generado con Éxito!",
-            f"El banco FMOD y la configuración del vehículo se compilaron correctamente en:\n\n{summary.output_root}",
+            "Mod Package Generated Successfully!",
+            f"The FMOD bank and vehicle configuration were compiled successfully in:\n\n{summary.output_root}",
         )
 
     def _on_export_error(self, err_msg: str) -> None:
         self.progress.stop()
-        self.btn_export.config(state="normal")
-        self._append_log(f"❌ ERROR DE COMPILACIÓN: {err_msg}")
-        self.status_var.set("❌ Error durante la compilación.")
-        messagebox.showerror("Error durante la exportación", err_msg)
+        self._set_import_buttons_state("normal")
+        self._append_log(f"❌ BUILD ERROR: {err_msg}")
+        self.status_var.set("❌ Error during compilation.")
+        messagebox.showerror("Export Error", err_msg)
 
     def _run_inject_vanilla(self) -> None:
         veh = self.vanilla_selected_vehicle
         if not veh:
             messagebox.showwarning(
-                "Sin Vehículo Vanilla Seleccionado",
-                "Por favor selecciona un vehículo oficial / vanilla de la lista en el Paso 4 antes de inyectar.",
+                "No Vanilla Vehicle Selected",
+                "Please select an official / vanilla vehicle from the list before importing.",
             )
-            self.notebook.select(self.tab_csdbin)
             return
 
         if self.is_direct_ac_mode:
             if not self.source_lib or not self.source_lib.fmod_bank:
                 messagebox.showwarning(
-                    "Falta Banco de Assetto Corsa",
-                    "Por favor carga un archivo .bank de Assetto Corsa en el Paso 1 antes de inyectar.",
+                    "Missing Assetto Corsa Bank",
+                    "Please select an Assetto Corsa .bank file in Step 1 before importing.",
                 )
-                self.notebook.select(self.tab_source)
                 return
         else:
             if not self.donor_bank:
                 ans = messagebox.askyesno(
-                    "Cargar Banco Donante Automáticamente",
-                    f"No has cargado ningún banco donante en el Paso 2.\n\n"
-                    f"¿Deseas cargar el banco original de '{veh.display_name}' como donante?",
+                    "Load Donor Bank Automatically",
+                    f"No donor bank is loaded.\n\n"
+                    f"Do you want to load '{veh.display_name}' original bank as donor?",
                 )
                 if ans:
                     self.cmd_load_vanilla_as_donor()
-                else:
-                    self.notebook.select(self.tab_donor)
                 return
 
         ans_confirm = messagebox.askyesno(
-            "Confirmar Inyección en Vehículo Vanilla",
-            f"¿Deseas inyectar el nuevo sonido en el vehículo oficial:\n\n"
+            "Confirm Vanilla Sound Import",
+            f"Do you want to import the new sound into the official vehicle:\n\n"
             f"'{veh.display_name}'?\n\n"
-            f"• Archivo: {veh.bank_path}\n"
-            f"• Modo: {'Transmutación Directa AC (100% Fiel)' if self.is_direct_ac_mode else 'Mapeo sobre Donante'}\n\n"
-            f"🛡️ Se creará automáticamente un respaldo seguro (SHA256) antes de modificar nada.\n"
-            f"Podrás restaurar el sonido original de Steam en cualquier momento con un clic.",
+            f"• File: {veh.bank_path}\n"
+            f"• Mode: {'Direct AC Transmutation (100% Faithful)' if self.is_direct_ac_mode else 'Donor Mapping'}\n\n"
+            f"🛡️ A safe backup (SHA256) will be created automatically before modifying anything.\n"
+            f"You can restore the original Steam sound at any time with one click.",
         )
         if not ans_confirm:
             return
 
-        self.btn_export.config(state="disabled")
+        self._set_import_buttons_state("disabled")
         self.progress.start(12)
         mode_label = (
             "Transmutación Directa (Sin Donante - 100% Fiel AC)"
@@ -4793,7 +5567,7 @@ class SoundPorterApp(tk.Tk):
                             rpm_bands=bands_to_export,
                             is_ai_bank=True,
                             mute_secondary_pops=mute_pops,
-                            invert_spatial_cone=invert_cone,
+                            invert_spatial_cone=False,
                             mappings=self.mappings,
                         )
                         ai_bytes = ai_direct_res.bank_bytes
@@ -4855,23 +5629,23 @@ class SoundPorterApp(tk.Tk):
 
     def _on_inject_vanilla_success(self, veh: VanillaVehicle, byte_count: int, msg: str) -> None:
         self.progress.stop()
-        self.btn_export.config(state="normal")
+        self._set_import_buttons_state("normal")
         self._append_log(f"✔ ¡Inyección exitosa en vehículo vanilla '{veh.display_name}'!")
         self._append_log(f"  Ruta en juego: {veh.bank_path} ({byte_count / (1024*1024):.2f} MB)")
         self._append_log(f"  Respaldo seguro original: {veh.original_sha256}")
         self._append_log(f"  Estado de restauración: Listo para restaurar con 1 clic sin Steam.")
-        self.status_var.set(f"✅ ¡Sonido inyectado con éxito en '{veh.display_name}'!")
+        self.status_var.set(f"✅ Sound successfully imported into '{veh.display_name}'!")
 
         self._populate_vanilla_vehicles_list(select_id=veh.vehicle_id)
         messagebox.showinfo(
-            "¡Sonido Inyectado con Éxito en Vehículo Oficial!",
-            f"El nuevo sonido ha sido instalado y activado en '{veh.display_name}'.\n\n"
-            f"• Archivo: {veh.bank_path.name}\n"
-            f"• Tamaño: {byte_count:,} bytes\n"
-            f"• Respaldo original: Protegido (SHA256)\n\n"
-            f"El vehículo ya usará este sonido cuando entres a pista en Automobilista 2.\n"
-            f"Puedes restaurar el sonido original de Steam en cualquier momento desde esta herramienta "
-            f"sin necesidad de realizar una comprobación de archivos en Steam.",
+            "Sound Successfully Imported into Official Vehicle!",
+            f"The new sound has been installed and activated for '{veh.display_name}'.\n\n"
+            f"• File: {veh.bank_path.name}\n"
+            f"• Size: {byte_count:,} bytes\n"
+            f"• Original backup: Protected (SHA256)\n\n"
+            f"This vehicle will now use the imported sound in Automobilista 2.\n"
+            f"You can restore the original Steam sound at any time from this tool "
+            f"without needing to verify game files in Steam.",
         )
 
 

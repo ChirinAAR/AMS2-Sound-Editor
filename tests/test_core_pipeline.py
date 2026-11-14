@@ -46,6 +46,39 @@ from ams2_sound_porter.porter_engine import (
     export_ams2_mod_package,
 )
 
+def _extract_cone_vol_endpoints(bank_data: bytes) -> list[tuple[float, float, float, float]]:
+    """Extrae pares (x0, y0, xN, yN) de curvas CURV prop==0 asociadas a parámetros Event Cone Angle."""
+    cone_pgs: set[bytes] = set()
+    cone_cgs: set[bytes] = set()
+    out_pairs: list[tuple[float, float, float, float]] = []
+    for cid, ps, pe, _ in iter_riff_chunks(bank_data, 12, len(bank_data)):
+        if cid == b"LIST" and bank_data[ps : ps + 4] == b"PROJ":
+            def _walk(s: int, e: int, phase: int) -> None:
+                for scid, sps, spe, _ in iter_riff_chunks(bank_data, s, e):
+                    if scid == b"LIST":
+                        _walk(sps + 4, spe, phase)
+                    elif phase == 0 and scid == b"PRMB" and spe - sps >= 31:
+                        sl = struct.unpack_from("<H", bank_data, sps + 21)[0]
+                        nm = bank_data[sps + 23 : sps + 23 + sl].decode("latin1", "replace").rstrip("\x00").lower()
+                        if "cone angle" in nm or "event cone" in nm:
+                            cone_pgs.add(bytes(bank_data[sps : sps + 16]))
+                    elif phase == 1 and scid == b"CTRL" and spe - sps >= 68:
+                        if bytes(bank_data[sps + 32 : sps + 48]) in cone_pgs and struct.unpack_from("<I", bank_data, sps + 64)[0] == 0:
+                            cone_cgs.add(bytes(bank_data[sps + 48 : sps + 64]))
+                    elif phase == 2 and scid == b"CURV" and spe - sps >= 36:
+                        if bytes(bank_data[sps : sps + 16]) in cone_cgs:
+                            cnt = struct.unpack_from("<H", bank_data, sps + 32)[0] >> 1
+                            st = struct.unpack_from("<H", bank_data, sps + 34)[0]
+                            if cnt >= 2 and st >= 16 and sps + 36 + cnt * st <= spe:
+                                x0, y0 = struct.unpack_from("<ff", bank_data, sps + 36)
+                                x1, y1 = struct.unpack_from("<ff", bank_data, sps + 36 + (cnt - 1) * st)
+                                if abs(y0 - y1) >= 5.0:
+                                    out_pairs.append((round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)))
+            for ph in (0, 1, 2):
+                _walk(ps + 4, pe, ph)
+    return sorted(set(out_pairs))
+
+
 REF_DIR = Path(
     r"C:\Users\Usuario\.gemini\antigravity\brain\f847d4e0-8cea-412c-a1b6-15d13cc65709\scratch\sonidos"
 )
@@ -901,7 +934,16 @@ def main() -> None:
                         assert ai_ibsb.get(ai_evtb_ibg.get(ev_b, b"")) == ai_bus_bytes, (
                             f"{main_role} no apunta a bus 3_AI_PLAYER_ENG!"
                         )
-            print(f"   Silenciamiento FSB5/PMLB/MUIT, throttle->load y banco IA virtualizado verificados ({tc_boxes_checked} cajas TC neutralizadas)!")
+
+                orig_cones = _extract_cone_vol_endpoints(macca_b.raw)
+                player_cones = _extract_cone_vol_endpoints(macca_res.bank_bytes)
+                ai_cones = _extract_cone_vol_endpoints(macca_ai_res.bank_bytes)
+                assert orig_cones, "Se esperaban curvas direccionales Event Cone Angle en Macca 720S AC"
+                assert player_cones != orig_cones, "El banco del jugador debía invertir Event Cone Angle (0°=Frente)"
+                assert ai_cones == orig_cones, (
+                    f"El banco _AI (IA + Replay) NO debe invertir Event Cone Angle respecto a AC: orig={orig_cones} vs ai={ai_cones}"
+                )
+            print(f"   Silenciamiento FSB5/PMLB/MUIT, throttle->load, cono Jugador!=IA y banco IA virtualizado verificados ({tc_boxes_checked} cajas TC neutralizadas)!")
 
     print("17. Probando exportación Mod AC directa con virtualización IA y protección Vorbis (Macca + Bentley)...")
     mod_cases = [
@@ -962,7 +1004,16 @@ def main() -> None:
                         assert sl.data_bytes != b"\x00" * len(sl.data_bytes), (
                             f"{mod_name} flujo Vorbis dañado en slot {sl.global_index}"
                         )
-            print(f"   Mod {mod_name} (Jugador + IA + .csdbin + protección Vorbis) verificado al 100%!")
+            if s_mod.bank_result is not None and s_mod.ai_bank_result is not None:
+                m_orig = _extract_cone_vol_endpoints(ac_mod_b.raw)
+                if m_orig:
+                    m_player = _extract_cone_vol_endpoints(s_mod.bank_result.bank_bytes)
+                    m_ai = _extract_cone_vol_endpoints(s_mod.ai_bank_result.bank_bytes)
+                    assert m_player != m_orig, f"{mod_name}: Jugador debía invertir Event Cone Angle"
+                    assert m_ai == m_orig, (
+                        f"{mod_name}: _AI (IA + Replay) NO debía invertir Event Cone Angle"
+                    )
+            print(f"   Mod {mod_name} (Jugador + IA + cono espacial + .csdbin + protección Vorbis) verificado al 100%!")
 
     # Verificar que override_root_rpm en Modo Directo AC actualiza INST (+69) en el .bank exportado
     ap_slot = next((sl for sl in ac_lib.fmod_bank.slots if sl.has_rpm_autopitch and sl.autopitch_ref_rpm and sl.wav_guid), None)

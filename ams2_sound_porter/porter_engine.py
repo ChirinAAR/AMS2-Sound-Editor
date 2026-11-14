@@ -3157,8 +3157,9 @@ def build_direct_ported_bank_from_ac(
     # 3. Parcheo binario de PROJ: 'rpms' -> 'rpm' en PRMB e IBSB a buses de AMS2
     proj_buf = bytearray(_patch_prmb_and_ibsb_in_proj(orig_proj_payload, {"rpms": "rpm"}, ibg_to_target_bus))
 
-    # Invertir cono espacial 3D si aplica (ajustando la orientación trasera de AC al frente de AMS2)
-    if invert_spatial_cone:
+    # Invertir cono espacial 3D únicamente en el banco del Jugador (AMS2 Jugador usa 0°=Frente/180°=Atrás,
+    # opuesto a AC; en cambio _AI.bank —IA y Replay— ya usa 0°=Atrás/180°=Frente igual que AC).
+    if invert_spatial_cone and not is_ai_bank:
         proj_buf = bytearray(invert_event_cone_curves_in_proj(bytes(proj_buf))[0])
 
     # 'throttle' de AC: AMS2 no lo alimenta en repeticiones / IA (usa 'load'). Renombrar a 'load' en bancos
@@ -3812,7 +3813,7 @@ def export_ams2_mod_package(
                 rpm_bands=rpm_bands,
                 is_ai_bank=True,
                 mute_secondary_pops=mute_pops,
-                invert_spatial_cone=invert_spatial_cone,
+                invert_spatial_cone=False,
                 mappings=mappings,
             )
         elif donor is not None and donor.source_path is not None:
@@ -3838,7 +3839,7 @@ def export_ams2_mod_package(
                     rpm_bands=rpm_bands,
                     is_ai_bank=True,
                     mute_secondary_pops=mute_pops,
-                    invert_spatial_cone=invert_spatial_cone,
+                    invert_spatial_cone=False,
                 )
         elif library and library.fmod_bank:
             ai_bank_res = build_direct_ported_bank_from_ac(
@@ -3848,7 +3849,7 @@ def export_ams2_mod_package(
                 rpm_bands=rpm_bands,
                 is_ai_bank=True,
                 mute_secondary_pops=mute_pops,
-                invert_spatial_cone=invert_spatial_cone,
+                invert_spatial_cone=False,
             )
 
         if ai_bank_res is not None:

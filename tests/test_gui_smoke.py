@@ -342,6 +342,45 @@ def main() -> None:
                 if orig_ga_info: ga.messagebox.showinfo = orig_ga_info
                 if orig_ga_yesno: ga.messagebox.askyesno = orig_ga_yesno
 
+        # 7. Verificar las 4 vistas nuevas (Menú, Custom Car sound, Vanilla car sounds, Test/edit Sounds) y opciones bloqueadas
+        assert app.title() == "AMS 2 Sound Importer"
+        assert app.mute_all_pops_var.get() is True
+        assert app.invert_cone_var.get() is True
+        assert app.standalone_var.get() is True
+        assert app.sync_pitch_var.get() is True
+        assert app.auto_link_csd_var.get() is True
+        assert app.open_folder_after_var.get() is True
+        assert app.vanilla_auto_backup_var.get() is True
+        assert app.vanilla_sync_ai_var.get() is True
+        assert app.vanilla_mute_pops_var.get() is True
+        assert app.codec_choice_var.get() == "PCM16"
+        assert not app.notebook.winfo_ismapped()
+
+        app.show_view("menu")
+        assert app._current_view == "menu"
+        app.show_view("custom")
+        assert app._current_view == "custom"
+        assert app.target_mode_var.get() == "mod"
+        assert app.port_mode_var.get() == "direct"
+        assert app.ui_bank_check_var.get() == "✔"
+        assert app.ui_guids_check_var.get() == "✔"
+        assert app.ui_csdbin_check_var.get() == "✔"
+
+        app.cmd_open_test_edit("custom")
+        assert app._current_view == "test_edit"
+        app.cmd_finish_test_edit()
+        assert app._current_view == "custom"
+
+        app.show_view("vanilla")
+        assert app._current_view == "vanilla"
+        assert app.target_mode_var.get() == "vanilla"
+        assert app.port_mode_var.get() == "direct"
+        app.cmd_open_test_edit("vanilla")
+        assert app._current_view == "test_edit"
+        app.cmd_finish_test_edit()
+        assert app._current_view == "vanilla"
+        print("   Navegación de las 4 vistas nuevas y opciones de exportación bloqueadas verificadas!")
+
         app.update_idletasks()
         print("GUI Smoke Test + Audio Preview Async + Soporte GUIDs.txt + Pestaña 3 (v1.4.0) + Vanilla Manager (v1.6.0) superado al 100% sin errores!")
     finally:
