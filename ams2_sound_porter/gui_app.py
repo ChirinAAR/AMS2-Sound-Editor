@@ -5554,8 +5554,16 @@ class SoundPorterApp(tk.Tk):
                 self.vanilla_mgr.load_vehicle_events_info(veh)
 
                 bank_bytes: bytes
+                cached_blobs: list[bytes] | None = None
+                use_compressed_direct = False
                 if is_direct:
                     assert self.source_lib and self.source_lib.fmod_bank
+                    ac_fmod = self.source_lib.fmod_bank
+                    use_compressed_direct = (
+                        sum(len(sb.raw_fsb_bytes) for sb in ac_fmod.subbanks) > 20_000_000
+                        and any(sl.mode == FSB5_MODE_PCM16 for sl in ac_fmod.slots)
+                    )
+                    direct_codec = FSB5_MODE_FADPCM if use_compressed_direct else None
                     veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
                     native_p = (
                         veh_backup_folder / veh.bank_path.name
@@ -5563,7 +5571,7 @@ class SoundPorterApp(tk.Tk):
                         else veh.bank_path
                     )
                     direct_res = build_direct_ported_bank_from_ac(
-                        ac_bank=self.source_lib.fmod_bank,
+                        ac_bank=ac_fmod,
                         mod_identifier=veh.car_name,
                         standalone_guids=False,
                         target_role_guids=veh.event_guids,
@@ -5577,8 +5585,11 @@ class SoundPorterApp(tk.Tk):
                         native_bank_path=native_p,
                         invert_spatial_cone=invert_cone,
                         mappings=self.mappings,
+                        output_codec_mode=direct_codec,
+                        prune_unused_samples=use_compressed_direct,
                     )
                     bank_bytes = direct_res.bank_bytes
+                    cached_blobs = direct_res.fsb_blobs_cache if use_compressed_direct else None
                 else:
                     assert self.donor_bank
                     eff_mappings = self.mappings
@@ -5629,6 +5640,9 @@ class SoundPorterApp(tk.Tk):
                             mute_secondary_pops=mute_pops,
                             invert_spatial_cone=False,
                             mappings=self.mappings,
+                            output_codec_mode=(FSB5_MODE_FADPCM if use_compressed_direct else None),
+                            prune_unused_samples=use_compressed_direct,
+                            cached_fsb_blobs=cached_blobs,
                         )
                         ai_bytes = ai_direct_res.bank_bytes
                     else:

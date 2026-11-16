@@ -13,7 +13,7 @@
     "original_size": 9906208,
     "backup_timestamp": "2026-11-07T15:17:45.731599",
     "is_modified": false,
-    "modified_timestamp": "2026-11-11T02:32:10.106819"
+    "modified_timestamp": "2026-11-16T16:29:00.722105"
   },
   "mercedes_sls_gt3": {
     "vehicle_id": "mercedes_sls_gt3",
@@ -29,7 +29,7 @@
     "original_size": 3584608,
     "backup_timestamp": "2026-11-07T15:18:15.897895",
     "is_modified": false,
-    "modified_timestamp": "2026-11-11T02:31:52.333043"
+    "modified_timestamp": "2026-11-16T16:29:19.631632"
   },
   "porsche_991_rsr_gte": {
     "vehicle_id": "porsche_991_rsr_gte",
@@ -45,7 +45,7 @@
     "original_size": 4348096,
     "backup_timestamp": "2026-11-09T15:22:32.828854",
     "is_modified": false,
-    "modified_timestamp": "2026-11-14T01:07:45.786656"
+    "modified_timestamp": "2026-11-16T15:12:10.969016"
   },
   "f_ultimate_f_ultimate_2022": {
     "vehicle_id": "f_ultimate_f_ultimate_2022",
@@ -62,5 +62,21 @@
     "backup_timestamp": "2026-11-11T02:32:49.510889",
     "is_modified": false,
     "modified_timestamp": "2026-11-12T01:22:10.977502"
+  },
+  "c_corvette_c8_gt3r": {
+    "vehicle_id": "c_corvette_c8_gt3r",
+    "display_name": "Corvette C8 GT3R",
+    "bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\C\\Corvette_C8_GT3R.bank",
+    "ai_bank_path": "D:\\SteamLibrary\\steamapps\\common\\Automobilista 2\\Audio\\AMS2\\Vehicles\\Sort\\C\\Corvette_C8_GT3R_AI.bank",
+    "csdbin_path": null,
+    "backup_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\c_corvette_c8_gt3r\\Corvette_C8_GT3R.bank",
+    "backup_ai_file": "C:\\Users\\Usuario\\.gemini\\antigravity\\scratch\\ams2-sound-porter\\backups\\vanilla\\c_corvette_c8_gt3r\\Corvette_C8_GT3R_AI.bank",
+    "backup_csd_file": null,
+    "original_sha256": "d35d1e60b95726cc555c63159fd301acdd12c42b875da52da2d732b2a40c9e9e",
+    "original_ai_sha256": "a26ee13b3826f697c581aab024d4f6e14571b6511d8ccd7f6f5e96f0ea030e36",
+    "original_size": 4785504,
+    "backup_timestamp": "2026-11-16T16:28:40.197527",
+    "is_modified": false,
+    "modified_timestamp": "2026-11-16T17:30:06.945166"
   }
 }

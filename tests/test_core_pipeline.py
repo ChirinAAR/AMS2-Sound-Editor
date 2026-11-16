@@ -95,6 +95,14 @@ CSDBIN_PATH = REF_DIR / "Archivo Sonido Vehiculo Automobilista 2.csdbin"
 def assert_proj_tables_sorted(raw_bank: bytes) -> int:
     """Verifica que TODAS las tablas LIST de FMOD mantengan orden estricto memcmp por GUID."""
     checked_lists = 0
+    bnki_u2: int | None = None
+    for cid, ps, pe, _ in iter_riff_chunks(raw_bank, 12, len(raw_bank)):
+        if cid == b"LIST" and raw_bank[ps : ps + 4] == b"PROJ":
+            for scid, sps, spe, _ in iter_riff_chunks(raw_bank, ps + 4, pe):
+                if scid == b"BNKI" and spe - sps >= 28:
+                    bnki_u2 = struct.unpack_from("<I", raw_bank, sps + 24)[0]
+                    break
+            break
 
     def walk(start: int, end: int) -> None:
         nonlocal checked_lists
@@ -113,7 +121,13 @@ def assert_proj_tables_sorted(raw_bank: bytes) -> int:
 
         for tag, glist in child_guids_by_tag.items():
             if len(glist) > 1:
-                assert glist == sorted(glist), f"Tabla FMOD '{tag.decode()}' perdió el orden memcmp!"
+                if tag == b"EVNT" and bnki_u2 is not None and 0 < bnki_u2 <= len(glist):
+                    part1 = glist[:bnki_u2]
+                    part2 = glist[bnki_u2:]
+                    assert part1 == sorted(part1), "Tabla FMOD 'EVNT' part1 [0..BNKI.u2) perdió el orden memcmp!"
+                    assert part2 == sorted(part2), "Tabla FMOD 'EVNT' part2 [BNKI.u2..N) perdió el orden memcmp!"
+                else:
+                    assert glist == sorted(glist), f"Tabla FMOD '{tag.decode()}' perdió el orden memcmp!"
                 checked_lists += 1
 
     walk(12, len(raw_bank))
@@ -943,6 +957,50 @@ def main() -> None:
                 assert ai_cones == orig_cones, (
                     f"El banco _AI (IA + Replay) NO debe invertir Event Cone Angle respecto a AC: orig={orig_cones} vs ai={ai_cones}"
                 )
+
+                # Verificar 0 colisiones de GUIDs internos entre Jugador e IA tras aislar el banco AI
+                def _collect_table_guids(raw_b: bytes) -> dict[bytes, set[bytes]]:
+                    out_t: dict[bytes, set[bytes]] = {}
+                    for _c, _ps, _pe, _ in iter_riff_chunks(raw_b, 12, len(raw_b)):
+                        if _c == b"LIST" and raw_b[_ps : _ps + 4] == b"PROJ":
+                            for _tc, _tps, _tpe, _ in iter_riff_chunks(raw_b, _ps + 4, _pe):
+                                if _tc == b"LIST":
+                                    lt_b = raw_b[_tps : _tps + 4]
+                                    s_g: set[bytes] = set()
+                                    for _sc, _sps, _spe, _ in iter_riff_chunks(raw_b, _tps + 4, _tpe):
+                                        if _sc == b"LCNT":
+                                            continue
+                                        if _sc == b"LIST":
+                                            for _ssc, _ssps, _sspe, _ in iter_riff_chunks(raw_b, _sps + 4, _spe):
+                                                if _sspe - _ssps >= 16:
+                                                    s_g.add(bytes(raw_b[_ssps : _ssps + 16]))
+                                                break
+                                        elif _spe - _sps >= 16:
+                                            s_g.add(bytes(raw_b[_sps : _sps + 16]))
+                                    out_t[lt_b] = s_g
+                    return out_t
+
+                tbl_p = _collect_table_guids(macca_res.bank_bytes)
+                tbl_ai = _collect_table_guids(macca_ai_res.bank_bytes)
+                for chk_tbl in (b"IBSS", b"GBSS", b"MBSS", b"BEFX", b"PEFX", b"SCFX", b"EVTS", b"TLNS", b"PMLS", b"PRMS", b"CTRS", b"CRVS", b"MUIS", b"SPIS", b"EVIS", b"WAIS", b"WAVS", b"MODS"):
+                    ov = tbl_p.get(chk_tbl, set()) & tbl_ai.get(chk_tbl, set())
+                    assert not ov, f"Colisión de {len(ov)} GUIDs entre Jugador e IA en tabla {chk_tbl.decode()}!"
+
+                # Verificar compresión FADPCM + poda de muestras no utilizadas (< 25 MB para banco Macca de 109 MB)
+                macca_comp = build_direct_ported_bank_from_ac(
+                    ac_bank=macca_b,
+                    mod_identifier=mclaren_v.car_name,
+                    standalone_guids=False,
+                    target_role_guids=mclaren_v.event_guids,
+                    target_role_paths=mclaren_v.event_paths,
+                    target_bank_guid=mclaren_v.bank_guid or None,
+                    native_bank_path=mclaren_v.bank_path,
+                    mute_secondary_pops=True,
+                    output_codec_mode=FSB5_MODE_FADPCM,
+                    prune_unused_samples=True,
+                )
+                assert len(macca_comp.bank_bytes) < 25_000_000, f"Tamaño comprimido inesperado: {len(macca_comp.bank_bytes):,}"
+                assert_sndh_and_fsb_alignment(macca_comp.bank_bytes)
             print(f"   Silenciamiento FSB5/PMLB/MUIT, throttle->load, cono Jugador!=IA y banco IA virtualizado verificados ({tc_boxes_checked} cajas TC neutralizadas)!")
 
     print("17. Probando exportación Mod AC directa con virtualización IA y protección Vorbis (Macca + Bentley)...")
@@ -1000,7 +1058,7 @@ def main() -> None:
                 if role_lbl == "AI":
                     assert all((fl & 0xE0) == 0x40 for _, fl in lims), f"{mod_name} AI sin flags 0x40: {lims}"
                 for sl in parsed_b.slots:
-                    if sl.mode != FSB5_MODE_PCM16:
+                    if sl.mode not in (FSB5_MODE_PCM16, FSB5_MODE_FADPCM):
                         assert sl.data_bytes != b"\x00" * len(sl.data_bytes), (
                             f"{mod_name} flujo Vorbis dañado en slot {sl.global_index}"
                         )

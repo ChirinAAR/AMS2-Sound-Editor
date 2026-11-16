@@ -345,55 +345,70 @@ def encode_fadpcm(pcm: np.ndarray) -> tuple[bytes, int]:
 
     for ch in range(channels):
         sig = pcm_pad[:, ch].astype(np.int32)
-        s1, s2 = int(sig[0]), int(sig[0])
+
+        # Selección vectorizada del filtro IIR óptimo por subgrupo de 32 muestras
+        p1 = np.empty_like(sig)
+        p2 = np.empty_like(sig)
+        p1[0] = sig[0]
+        p1[1:] = sig[:-1]
+        p2[0] = sig[0]
+        p2[1] = sig[0]
+        p2[2:] = sig[:-2]
+        sub_shape = (num_blocks * 8, 32)
+        best_res: np.ndarray | None = None
+        best_filt = np.zeros(num_blocks * 8, dtype=np.int32)
+        for ci, (c1, c2) in enumerate(active_coeffs):
+            pred = (p1 * c1 + p2 * c2) >> 6
+            res = np.abs(sig - pred).reshape(sub_shape).max(axis=1)
+            if best_res is None:
+                best_res = res
+            else:
+                mask = res < best_res
+                best_filt[mask] = ci
+                best_res[mask] = res[mask]
+
+        sig_list = sig.tolist()
+        best_filt_list = best_filt.tolist()
+        assert best_res is not None
+        best_res_list = best_res.tolist()
+
+        s1, s2 = sig_list[0], sig_list[0]
+        sg_idx = 0
         for b in range(num_blocks):
-            blk = sig[b * 256 : (b + 1) * 256]
             h1_init, h2_init = s1, s2
             coefs_u32 = 0
             shifts_u32 = 0
             pay = bytearray(128)
+            base_off = b * 256
 
             for g in range(8):
-                sub = blk[g * 32 : (g + 1) * 32]
+                g_start = base_off + g * 32
+                sub = sig_list[g_start : g_start + 32]
                 best_err = 1 << 60
-                best_ci = 0
+                best_ci = best_filt_list[sg_idx]
+                min_peak_res = best_res_list[sg_idx]
+                sg_idx += 1
+
                 best_sh = 4
                 best_nibs: list[int] = [0] * 32
                 best_s1, best_s2 = s1, s2
 
-                # Elegimos el filtro con menor residuo máximo primero para acotar la búsqueda
-                best_filter_ci = 0
-                min_peak_res = 1 << 30
-                ts1, ts2 = s1, s2
-                for ci, (c1, c2) in enumerate(active_coeffs):
-                    max_r = 0
-                    ps1, ps2 = ts1, ts2
-                    for smp_v in sub:
-                        pred = (ps1 * c1 + ps2 * c2) >> 6
-                        r = abs(int(smp_v) - pred)
-                        if r > max_r:
-                            max_r = r
-                        ps2, ps1 = ps1, int(smp_v)
-                    if max_r < min_peak_res:
-                        min_peak_res = max_r
-                        best_filter_ci = ci
-
                 # Calculamos el shift óptimo alrededor del pico residual
-                c1, c2 = active_coeffs[best_filter_ci]
+                c1, c2 = active_coeffs[best_ci]
                 est_sh = max(0, min(12, int(math.ceil(math.log2(max(1.0, min_peak_res / 7.0))))))
                 cand_shifts = sorted({max(0, est_sh - 1), est_sh, min(12, est_sh + 1)})
 
                 for sh in cand_shifts:
                     rsh = 22 - sh
-                    step_unit = 1 << sh  # equivalente en escala PCM
+                    step_unit = float(1 << sh)  # equivalente en escala PCM
                     cs1, cs2 = s1, s2
                     err_sum = 0
                     cur_nibs = [0] * 32
                     for i in range(32):
-                        target = int(sub[i])
+                        target = sub[i]
                         pred64 = cs1 * c1 + cs2 * c2
                         diff = target - (pred64 >> 6)
-                        q = int(round(diff / float(step_unit)))
+                        q = int(round(diff / step_unit))
                         if q > 7:
                             q = 7
                         elif q < -8:
@@ -410,7 +425,6 @@ def encode_fadpcm(pcm: np.ndarray) -> tuple[bytes, int]:
                         cs2, cs1 = cs1, rec
                     if err_sum < best_err:
                         best_err = err_sum
-                        best_ci = best_filter_ci
                         best_sh = sh
                         best_nibs = cur_nibs
                         best_s1, best_s2 = cs1, cs2
