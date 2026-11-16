@@ -201,8 +201,8 @@ class SoundPorterApp(tk.Tk):
         self.ui_csdbin_status_var = tk.StringVar(value=".csdbin : Not selected")
 
         self._configure_styles()
-        self._build_legacy_notebook_hidden()
         self._build_new_views()
+        self._build_legacy_notebook_hidden()
         self._build_statusbar()
         self.show_view("menu")
 
@@ -428,7 +428,7 @@ class SoundPorterApp(tk.Tk):
         return self.donor_bank
 
     def _build_new_views(self) -> None:
-        """Construye las 4 vistas principales del nuevo flujo AMS 2 Sound Importer."""
+        """Construye las vistas principales del nuevo flujo AMS 2 Sound Importer."""
         self.view_container = ttk.Frame(self, style="TFrame")
         self.view_container.pack(fill="both", expand=True)
 
@@ -436,11 +436,13 @@ class SoundPorterApp(tk.Tk):
         self.view_custom = ttk.Frame(self.view_container, style="TFrame")
         self.view_vanilla = ttk.Frame(self.view_container, style="TFrame")
         self.view_test_edit = ttk.Frame(self.view_container, style="TFrame")
+        self.view_csdbin = ttk.Frame(self.view_container, style="TFrame")
 
         self._build_view_menu()
         self._build_view_custom()
         self._build_view_vanilla()
         self._build_view_test_edit()
+        self._build_view_csdbin()
 
     def _build_legacy_notebook_hidden(self) -> None:
         """Mantiene inicializados los componentes internos legados (incluido modo donante) sin mostrarlos."""
@@ -465,9 +467,9 @@ class SoundPorterApp(tk.Tk):
         self._build_tab_export()
 
     def show_view(self, view_name: str) -> None:
-        """Cambia la vista activa entre 'menu', 'custom', 'vanilla' y 'test_edit'."""
+        """Cambia la vista activa entre 'menu', 'custom', 'vanilla', 'test_edit' y 'csdbin'."""
         self._current_view = view_name
-        for vf in (self.view_menu, self.view_custom, self.view_vanilla, self.view_test_edit):
+        for vf in (self.view_menu, self.view_custom, self.view_vanilla, self.view_test_edit, self.view_csdbin):
             vf.pack_forget()
 
         if view_name == "menu":
@@ -486,6 +488,8 @@ class SoundPorterApp(tk.Tk):
             self.view_test_edit.pack(fill="both", expand=True)
             self._refresh_rpm_tab()
             self.after(20, self._draw_rpm_bands_canvas)
+        elif view_name == "csdbin":
+            self.view_csdbin.pack(fill="both", expand=True)
 
     def _build_view_menu(self) -> None:
         outer = ttk.Frame(self.view_menu, style="TFrame")
@@ -637,6 +641,21 @@ class SoundPorterApp(tk.Tk):
         tk.Label(st3, textvariable=self.ui_csdbin_status_var, bg=BG_DARK, fg="#e2e8f0", font=("Segoe UI", 12)).pack(
             side="left"
         )
+        tk.Button(
+            rows,
+            text="Edit .csdbin",
+            command=self.cmd_open_csdbin_editor,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 11),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=20,
+            pady=6,
+        ).grid(row=2, column=3, sticky="w", padx=(24, 0), pady=12)
 
         # Acciones inferiores
         actions = ttk.Frame(body, style="TFrame")
@@ -1127,6 +1146,53 @@ class SoundPorterApp(tk.Tk):
         self._enforce_locked_export_options()
         self.target_mode_var.set(mode)
         self.cmd_run_export()
+
+    def _build_view_csdbin(self) -> None:
+        hdr = tk.Frame(self.view_csdbin, bg="#080c13", padx=16, pady=10)
+        hdr.pack(fill="x", side="top")
+        tk.Label(
+            hdr,
+            text="Edit .csdbin Parameters",
+            bg="#080c13",
+            fg="#ffffff",
+            font=("Segoe UI", 22, "bold"),
+        ).pack(side="left")
+        tk.Button(
+            hdr,
+            text="Finish",
+            command=self.cmd_finish_csdbin_edit,
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 14),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=18,
+            pady=4,
+        ).pack(side="right")
+
+        body = ttk.Frame(self.view_csdbin, style="Panel.TFrame", padding=12)
+        body.pack(fill="both", expand=True)
+        self._build_mod_csdbin_view(body)
+
+    def cmd_open_csdbin_editor(self) -> None:
+        if self.csd_doc is None:
+            messagebox.showwarning(
+                "No .csdbin loaded",
+                "Please select a car .csdbin file first (Step 3).",
+            )
+            return
+        self._populate_visual_csd_from_doc()
+        self._sync_visual_to_raw_csd_editor()
+        self.show_view("csdbin")
+
+    def cmd_finish_csdbin_edit(self) -> None:
+        if self.csd_doc is not None:
+            self._collect_visual_into_doc()
+            self.status_var.set("✔ .csdbin parameters updated (bank/event links remain automatic on import).")
+        self.show_view("custom")
 
     def cmd_open_test_edit(self, return_view: str) -> None:
         if self.source_lib is None or self.source_lib.fmod_bank is None:
@@ -1825,7 +1891,8 @@ class SoundPorterApp(tk.Tk):
         self.mod_view_frame = ttk.Frame(self.tab_csdbin, style="Panel.TFrame")
 
         self._build_vanilla_view(self.vanilla_view_frame)
-        self._build_mod_csdbin_view(self.mod_view_frame)
+        if not hasattr(self, "raw_csd_text"):
+            self._build_mod_csdbin_view(self.mod_view_frame)
 
         self._on_target_mode_changed()
 
@@ -1958,27 +2025,20 @@ class SoundPorterApp(tk.Tk):
 
         ttk.Button(
             top,
-            text="📂 Abrir .csdbin o .csd...",
+            text="📂 Open .csdbin / .csd...",
             style="Primary.TButton",
             command=self.cmd_open_csdbin,
         ).pack(side="left", padx=(0, 8))
 
         ttk.Button(
             top,
-            text="🔗 Autocompletar Rutas event:/ Standalone",
-            style="Primary.TButton",
-            command=self.cmd_autofill_csdbin_standalone,
-        ).pack(side="left", padx=(0, 8))
-
-        ttk.Button(
-            top,
-            text="💾 Guardar como .csdbin...",
+            text="💾 Save as .csdbin...",
             command=self.cmd_save_csdbin_as,
         ).pack(side="left", padx=(0, 8))
 
         ttk.Button(
             top,
-            text="📄 Exportar Texto .csd (OMVT)...",
+            text="📄 Export .csd Text (OMVT)...",
             command=self.cmd_export_csd_text,
         ).pack(side="left", padx=(0, 12))
 
@@ -1989,8 +2049,8 @@ class SoundPorterApp(tk.Tk):
 
         visual_tab = ttk.Frame(sub_nb, style="Panel.TFrame", padding=8)
         raw_tab = ttk.Frame(sub_nb, style="Panel.TFrame", padding=8)
-        sub_nb.add(visual_tab, text="  🎛️ Editor Visual de Enlaces y Parámetros  ")
-        sub_nb.add(raw_tab, text="  📝 Código Fuente .csd Completo (Formato OMVT)  ")
+        sub_nb.add(visual_tab, text="  🎛️ Parameters & Links Editor  ")
+        sub_nb.add(raw_tab, text="  📝 Raw .csd Source (OMVT Format)  ")
 
         # --- Sub-pestaña 3A: Formulario Visual con Scroll ---
         canvas = tk.Canvas(visual_tab, bg=BG_PANEL, highlightthickness=0)
@@ -2013,20 +2073,20 @@ class SoundPorterApp(tk.Tk):
         # Cabecera de parámetros generales del vehículo
         meta_card = ttk.Frame(scroll_body, style="Card.TFrame", padding=12)
         meta_card.pack(fill="x", pady=(0, 10))
-        ttk.Label(meta_card, text="Parámetros Generales y Posición 3D del Emisor", style="CardSection.TLabel").grid(
+        ttk.Label(meta_card, text="General Parameters & 3D Emitter Position (event links map automatically on import)", style="CardSection.TLabel").grid(
             row=0, column=0, columnspan=6, sticky="w", pady=(0, 8)
         )
 
         fields_hdr = [
-            ("Clase Sonido (sound_class):", self.csd_class_var, 0, 0),
-            ("Set de Mezcla (mix_set):", self.csd_mix_var, 0, 2),
-            ("ID Hex (8 bytes):", self.csd_id_var, 0, 4),
-            ("Volumen Motor Ext (off_0000):", self.csd_vol_ext_var, 1, 0),
-            ("Volumen Motor Int (off_0004):", self.csd_vol_int_var, 1, 2),
-            ("N° Marchas (off_00a0):", self.csd_gears_var, 1, 4),
-            ("Posición Motor X (m):", self.csd_pos_x_var, 2, 0),
-            ("Posición Motor Y / Altura (m):", self.csd_pos_y_var, 2, 2),
-            ("Posición Motor Z / Long. (m):", self.csd_pos_z_var, 2, 4),
+            ("Sound Class (sound_class):", self.csd_class_var, 0, 0),
+            ("Mix Set (mix_set):", self.csd_mix_var, 0, 2),
+            ("Hex ID (8 bytes):", self.csd_id_var, 0, 4),
+            ("Ext Engine Volume (off_0000):", self.csd_vol_ext_var, 1, 0),
+            ("Int Engine Volume (off_0004):", self.csd_vol_int_var, 1, 2),
+            ("Gear Count (off_00a0):", self.csd_gears_var, 1, 4),
+            ("Engine Pos X (m):", self.csd_pos_x_var, 2, 0),
+            ("Engine Pos Y / Height (m):", self.csd_pos_y_var, 2, 2),
+            ("Engine Pos Z / Length (m):", self.csd_pos_z_var, 2, 4),
         ]
         for lbl_txt, var, r, c in fields_hdr:
             ttk.Label(meta_card, text=lbl_txt, style="Card.TLabel").grid(
@@ -2059,12 +2119,12 @@ class SoundPorterApp(tk.Tk):
         raw_bar.pack(fill="x", pady=(0, 6))
         ttk.Button(
             raw_bar,
-            text="🔄 Actualizar Texto desde Formulario Visual",
+            text="🔄 Sync Text from Visual Form",
             command=self._sync_visual_to_raw_csd_editor,
         ).pack(side="left", padx=(0, 8))
         ttk.Button(
             raw_bar,
-            text="✔ Aplicar Cambios del Texto .csd al Documento",
+            text="✔ Apply .csd Text Changes to Document",
             style="Primary.TButton",
             command=self._apply_raw_csd_editor_to_doc,
         ).pack(side="left")

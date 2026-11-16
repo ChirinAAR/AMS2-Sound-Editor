@@ -371,6 +371,15 @@ def main() -> None:
         app.cmd_finish_test_edit()
         assert app._current_view == "custom"
 
+        app.cmd_open_csdbin_editor()
+        assert app._current_view == "csdbin"
+        orig_vol_ext = app.csd_vol_ext_var.get()
+        app.csd_vol_ext_var.set("1.25")
+        app.cmd_finish_csdbin_edit()
+        assert app._current_view == "custom"
+        assert app.csd_vol_ext_var.get() == "1.25"
+        app.csd_vol_ext_var.set(orig_vol_ext)
+
         app.show_view("vanilla")
         assert app._current_view == "vanilla"
         assert app.target_mode_var.get() == "vanilla"

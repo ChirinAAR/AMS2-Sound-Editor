@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
 import winreg
 import struct
@@ -112,8 +113,12 @@ class VanillaVehicleManager:
             self.ams2_root = Path(ams2_root)
 
         if backup_dir is None:
-            # Directorio de respaldo local seguro dentro del paquete
-            app_dir = Path(__file__).resolve().parent.parent
+            # Directorio de respaldo persistente junto al ejecutable si está empaquetado, o raíz del proyecto
+            app_dir = (
+                Path(sys.executable).resolve().parent
+                if getattr(sys, "frozen", False)
+                else Path(__file__).resolve().parent.parent
+            )
             self.backup_dir = app_dir / "backups" / "vanilla"
         else:
             self.backup_dir = Path(backup_dir)
