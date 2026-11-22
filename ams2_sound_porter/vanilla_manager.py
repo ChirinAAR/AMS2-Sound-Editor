@@ -87,6 +87,7 @@ class VanillaVehicle:
     ai_event_paths: dict[str, str] = field(default_factory=dict)    # role -> path
     ai_event_buses: dict[str, str] = field(default_factory=dict)    # role -> bus_guid
     is_modified: bool = False            # True si está usando sonido porteado
+    modified_scope: str = "full"         # 'full', 'interior', o 'exterior'
     has_backup: bool = False             # True si existe respaldo seguro original
     original_sha256: str | None = None
     original_ai_sha256: str | None = None
@@ -95,7 +96,105 @@ class VanillaVehicle:
     csdbin_path: Path | None = None      # Archivo .csdbin suelto en Vehicles/<carpeta> si existe
     target_parameters: list[str] = field(default_factory=list) # Parámetros detectados en el banco nativo (load, rpm, etc.)
     ctrl_parameters: set[str] = field(default_factory=set)     # Parámetros activos en CTRS/CTRL (load, throttle, rpm)
+    extra_event_variants: dict[str, list[tuple[str, str]]] = field(default_factory=dict)         # role -> [(guid_str, path), ...] extras (sólo si hay >1 variante)
+    extra_ai_event_variants: dict[str, list[tuple[str, str, str]]] = field(default_factory=dict) # role -> [(guid_str, path, bus_guid), ...] extras
+    prefers_throttle_player: bool = False
+    prefers_throttle_ai: bool = False
+    _profile_loaded: bool = False
 
+
+def _extract_bank_param_profile(
+    bank: FmodBank,
+    master_strings: dict[str, str],
+    is_ai: bool = False,
+) -> tuple[list[str], set[str], bool]:
+    """Detecta parámetros, controladores activos y si los eventos de motor usan 'throttle' en lugar de 'load'."""
+    p_names: set[str] = set()
+    prm_guid_to_name: dict[bytes, str] = {}
+    ctrl_prms: set[str] = set()
+    load_guids: set[bytes] = set()
+    thr_guids: set[bytes] = set()
+    ctrs_load = 0
+    ctrs_thr = 0
+    evtb_map: dict[bytes, bytes] = {}
+
+    for cid, ps, pe, _ in iter_riff_chunks(bank.raw, 12, len(bank.raw)):
+        if cid == b"LIST" and bank.raw[ps : ps + 4] == b"PROJ":
+            proj_pay = bank.raw[ps + 4 : pe]
+
+            def scan_prms(s: int, e: int) -> None:
+                for scid, sps, spe, _ in iter_riff_chunks(proj_pay, s, e):
+                    if scid == b"PRMB" and spe - sps >= 25:
+                        g = proj_pay[sps : sps + 16]
+                        slen = struct.unpack_from("<H", proj_pay, sps + 21)[0]
+                        name = proj_pay[sps + 23 : sps + 23 + slen].decode("latin1", "replace").rstrip("\x00")
+                        p_names.add(name)
+                        prm_guid_to_name[g] = name
+                        if name == "load":
+                            load_guids.add(g)
+                        elif name == "throttle":
+                            thr_guids.add(g)
+                    elif scid == b"LIST":
+                        scan_prms(sps + 4, spe)
+
+            scan_prms(0, len(proj_pay))
+
+            for scid, sps, spe, _ in iter_riff_chunks(proj_pay, 0, len(proj_pay)):
+                if scid == b"LIST" and proj_pay[sps : sps + 4] == b"CTRS":
+                    ctrs = proj_pay[sps + 4 : spe]
+                    for ccid, cps, cpe, _ in iter_riff_chunks(ctrs, 0, len(ctrs)):
+                        if ccid == b"CTRL" and cpe - cps >= 48:
+                            cpay = ctrs[cps:cpe]
+                            for pg, pname in prm_guid_to_name.items():
+                                if pg in cpay and pname in ("load", "throttle", "rpm"):
+                                    ctrl_prms.add(pname)
+                            if any(lg in cpay for lg in load_guids):
+                                ctrs_load += 1
+                            if any(tg in cpay for tg in thr_guids):
+                                ctrs_thr += 1
+                elif scid == b"LIST" and proj_pay[sps : sps + 4] == b"EVTS":
+                    evts = proj_pay[sps + 4 : spe]
+                    for ecid, eps, epe, _ in iter_riff_chunks(evts, 0, len(evts)):
+                        if ecid == b"LIST":
+                            for bcid, bps, bpe, _ in iter_riff_chunks(evts, eps + 4, epe):
+                                if bcid == b"EVTB" and bpe - bps >= 16:
+                                    evtb_map[bytes(evts[bps : bps + 16])] = bytes(evts[bps:bpe])
+            break
+
+    eng_load_events = 0
+    eng_thr_events = 0
+    for ev in bank.events:
+        ev_p = master_strings.get(ev.guid_str.lower(), ev.path or "").lower()
+        if any(k in ev_p for k in ("starter", "starting", "exhaust")):
+            continue
+        is_eng = (
+            ("main" in ev_p or "engine" in ev_p or ev.role in ("EngineInt", "EngineExt"))
+            if is_ai
+            else (
+                any(k in ev_p for k in ("engineext", "engine_ext", "ext_engine", "engineint", "engine_int", "int_engine"))
+                or (not ev_p and ev.role in ("EngineInt", "EngineExt"))
+            )
+        )
+        if not is_eng:
+            continue
+        raw_evtb = evtb_map.get(ev.guid_bytes, b"")
+        if not raw_evtb:
+            continue
+        if any(lg in raw_evtb for lg in load_guids):
+            eng_load_events += 1
+        if any(tg in raw_evtb for tg in thr_guids):
+            eng_thr_events += 1
+
+    prefers_throttle = (
+        "throttle" in p_names
+        and ctrs_thr > 0
+        and (
+            ctrs_load == 0
+            or eng_load_events == 0
+            or (eng_thr_events > eng_load_events and ctrs_thr >= ctrs_load * 4)
+        )
+    )
+    return sorted(list(p_names)), ctrl_prms, prefers_throttle
 
 
 class VanillaVehicleManager:
@@ -227,12 +326,14 @@ class VanillaVehicleManager:
                 original_sha = None
                 backup_time = None
                 is_modified = False
+                modified_scope = "full"
 
                 if manifest_entry:
                     has_backup = True
                     original_sha = manifest_entry.get("original_sha256")
                     backup_time = manifest_entry.get("backup_timestamp")
                     is_modified = manifest_entry.get("is_modified", False)
+                    modified_scope = manifest_entry.get("modified_scope", "full") or "full"
                 elif orig_file.is_file():
                     has_backup = True
                     is_modified = True
@@ -248,6 +349,7 @@ class VanillaVehicleManager:
                     ai_bank_path=ai_bank_path,
                     relative_audio_path=rel_audio_path,
                     is_modified=is_modified,
+                    modified_scope=modified_scope,
                     has_backup=has_backup,
                     original_sha256=original_sha,
                     backup_timestamp=backup_time,
@@ -276,7 +378,12 @@ class VanillaVehicleManager:
                             vehicle.csdbin_path = csd
                             break
 
-        if vehicle.event_roles and vehicle.target_parameters and (vehicle.ai_event_roles or not vehicle.ai_bank_path):
+        if (
+            vehicle._profile_loaded
+            and vehicle.event_roles
+            and vehicle.target_parameters
+            and (vehicle.ai_event_roles or not vehicle.ai_bank_path)
+        ):
             return
         if not vehicle.bank_path.is_file():
             return
@@ -293,32 +400,50 @@ class VanillaVehicleManager:
             elif orig_file.is_file():
                 bank_file_to_read = orig_file
 
+            from .fmod_bank import iter_riff_chunks
+            from .porter_engine import _collect_evib_targets
+
+            def _bank_evib_targets(bank_obj: FmodBank) -> set[bytes]:
+                for cid, ps, pe, _ in iter_riff_chunks(bank_obj.raw, 12, len(bank_obj.raw)):
+                    if cid == b"LIST" and bank_obj.raw[ps : ps + 4] == b"PROJ":
+                        return _collect_evib_targets(bank_obj.raw[ps + 4 : pe])
+                return set()
+
             b = FmodBank(bank_file_to_read)
+            player_evib = _bank_evib_targets(b)
             vehicle.slots_count = len(b.slots)
             vehicle.bank_guid = bytes_to_guid_str(b.bank_guid) if b.bank_guid else ""
             roles: set[str] = set()
             guids: dict[str, str] = {}
             paths: dict[str, str] = {}
+            all_variants: dict[str, list[tuple[str, str]]] = {}
             int_count = 0
             for ev in b.events:
                 ev_p = master_strings.get(ev.guid_str.lower(), ev.path or "")
                 p_low = ev_p.lower()
                 role = ev.role or "Unknown"
+                var_role = role
 
                 # Clasificación precisa por ruta en master_strings para evitar solapamientos y eventos perdidos
                 if "starter" in p_low:
                     role = "Starter"
+                    var_role = "Starter"
                 elif "starting" in p_low:
                     role = "Starting"
+                    var_role = "Starting"
                 elif "exhaust" in p_low:
                     role = "Exhaust"
+                    var_role = "Exhaust"
                 elif any(k in p_low for k in ("engineext", "engine_ext", "ext_engine")):
                     role = "EngineExt"
+                    var_role = "EngineExt"
                 elif any(k in p_low for k in ("engineint", "engine_int", "int_engine")):
                     int_count += 1
                     role = "EngineInt" if int_count == 1 else "AuxInt"
+                    var_role = "EngineInt"
                 elif role == "Starting" and "Starter" not in guids:
                     role = "Starter"
+                    var_role = "Starter"
 
                 if role:
                     roles.add(role)
@@ -328,42 +453,26 @@ class VanillaVehicleManager:
                         paths[role] = ev_p
                     elif ev.path and role not in paths:
                         paths[role] = ev.path
+                if (
+                    var_role in ("EngineExt", "EngineInt", "Starter", "Starting", "Exhaust")
+                    and ev.guid_str
+                    and (ev_p or ev.path or ev.guid_bytes not in player_evib)
+                ):
+                    all_variants.setdefault(var_role, []).append((ev.guid_str, ev_p or ev.path or ""))
             vehicle.event_roles = sorted(list(roles))
             vehicle.event_guids = guids
             vehicle.event_paths = paths
+            extra_p: dict[str, list[tuple[str, str]]] = {}
+            for vr, items in all_variants.items():
+                primary_g = guids.get(vr, "").lower()
+                extras = [x for x in items if x[0].lower() != primary_g]
+                if len(items) > 1 and extras:
+                    extra_p[vr] = extras
+            vehicle.extra_event_variants = extra_p
 
-            # Extraer nombres de parámetros nativos y controladores activos del banco de jugador (load, rpm, throttle, etc.)
-            p_names: set[str] = set()
-            prm_guid_to_name: dict[bytes, str] = {}
-            ctrl_prms: set[str] = set()
-            for cid, ps, pe, _ in iter_riff_chunks(b.raw, 12, len(b.raw)):
-                if cid == b"LIST" and b.raw[ps : ps + 4] == b"PROJ":
-                    proj_pay = b.raw[ps + 4 : pe]
-                    def scan_prms(s: int, e: int) -> None:
-                        for scid, sps, spe, _ in iter_riff_chunks(proj_pay, s, e):
-                            if scid == b"PRMB" and spe - sps >= 25:
-                                g = proj_pay[sps : sps + 16]
-                                slen = struct.unpack_from("<H", proj_pay, sps + 21)[0]
-                                name = proj_pay[sps + 23 : sps + 23 + slen].decode("latin1", "replace").rstrip("\x00")
-                                p_names.add(name)
-                                prm_guid_to_name[g] = name
-                            elif scid == b"LIST":
-                                scan_prms(sps + 4, spe)
-                    scan_prms(0, len(proj_pay))
-
-                    # Escaneo de controladores activos CTRS/CTRL
-                    for scid, sps, spe, _ in iter_riff_chunks(proj_pay, 0, len(proj_pay)):
-                        if scid == b"LIST" and proj_pay[sps : sps + 4] == b"CTRS":
-                            ctrs = proj_pay[sps + 4 : spe]
-                            for ccid, cps, cpe, _ in iter_riff_chunks(ctrs, 0, len(ctrs)):
-                                if ccid == b"CTRL" and cpe - cps >= 48:
-                                    cpay = ctrs[cps:cpe]
-                                    for pg, pname in prm_guid_to_name.items():
-                                        if pg in cpay and pname in ("load", "throttle", "rpm"):
-                                            ctrl_prms.add(pname)
-                    break
-            vehicle.target_parameters = sorted(list(p_names))
-            vehicle.ctrl_parameters = ctrl_prms
+            vehicle.target_parameters, vehicle.ctrl_parameters, vehicle.prefers_throttle_player = (
+                _extract_bank_param_profile(b, master_strings, is_ai=False)
+            )
 
             # Analizar también banco de IA si existe
             if vehicle.ai_bank_path:
@@ -377,27 +486,38 @@ class VanillaVehicleManager:
 
                 if ai_file_to_read.is_file():
                     ai_b = FmodBank(ai_file_to_read)
+                    ai_evib = _bank_evib_targets(ai_b)
                     vehicle.ai_bank_guid = bytes_to_guid_str(ai_b.bank_guid) if ai_b.bank_guid else ""
                     ai_roles: set[str] = set()
                     ai_guids: dict[str, str] = {}
                     ai_paths: dict[str, str] = {}
                     ai_buses: dict[str, str] = {}
+                    ai_all_variants: dict[str, list[tuple[str, str, str]]] = {}
                     for ev in ai_b.events:
                         p = master_strings.get(ev.guid_str.lower(), ev.path or "")
                         p_low = p.lower()
                         if "main_live" in p_low or "_live" in p_low:
-                            role = "ai_engine_live"
+                            base_role = "ai_engine_live"
                         elif "main" in p_low:
-                            role = "ai_engine_main"
+                            base_role = "ai_engine_main"
                         elif "engineext" in p_low or "engine_ext" in p_low or ev.role == "EngineExt":
-                            role = "ai_engine_ext"
+                            base_role = "ai_engine_ext"
                         elif "engineint" in p_low or "engine_int" in p_low or ev.role == "EngineInt":
-                            role = "ai_engine_int"
+                            base_role = "ai_engine_int"
                         else:
-                            role = ev.role or f"AI_Event_{ev.index}"
+                            base_role = ev.role or f"AI_Event_{ev.index}"
 
+                        if (
+                            base_role in ("ai_engine_main", "ai_engine_live", "ai_engine_ext", "ai_engine_int")
+                            and ev.guid_str
+                            and (p or ev.path or ev.guid_bytes not in ai_evib)
+                        ):
+                            ai_all_variants.setdefault(base_role, []).append(
+                                (ev.guid_str, p or ev.path or "", ev.parent_bus_guid or "")
+                            )
+
+                        role = base_role
                         if role in ai_guids:
-                            base_role = role
                             k = 2
                             while f"{base_role}_{k}" in ai_guids:
                                 k += 1
@@ -416,6 +536,17 @@ class VanillaVehicleManager:
                     vehicle.ai_event_guids = ai_guids
                     vehicle.ai_event_paths = ai_paths
                     vehicle.ai_event_buses = ai_buses
+                    extra_ai: dict[str, list[tuple[str, str, str]]] = {}
+                    for ar, items in ai_all_variants.items():
+                        primary_ag = ai_guids.get(ar, "").lower()
+                        extras = [x for x in items if x[0].lower() != primary_ag]
+                        if len(items) > 1 and extras:
+                            extra_ai[ar] = extras
+                    vehicle.extra_ai_event_variants = extra_ai
+                    _ai_p, _ai_c, vehicle.prefers_throttle_ai = _extract_bank_param_profile(
+                        ai_b, master_strings, is_ai=True
+                    )
+            vehicle._profile_loaded = True
         except Exception:
             pass
 
@@ -527,6 +658,7 @@ class VanillaVehicleManager:
         bank_bytes: bytes,
         ai_bank_bytes: bytes | None = None,
         csdbin_bytes: bytes | None = None,
+        audio_scope: str = "full",
     ) -> tuple[bool, str]:
         """Inyecta el nuevo sonido compilado en el vehículo vanilla, creando primero el respaldo seguro."""
         if not bank_bytes:
@@ -540,13 +672,14 @@ class VanillaVehicleManager:
         # 2. Escribir el nuevo archivo .bank de forma segura (con archivo temporal atómico)
         target_path = vehicle.bank_path
         tmp_target = target_path.with_suffix(".bank.tmp")
+        veh_backup_folder = self.backup_dir / vehicle.vehicle_id
         try:
             tmp_target.write_bytes(bank_bytes)
             if target_path.is_file():
                 target_path.unlink()
             tmp_target.rename(target_path)
 
-            # 3. Si se proporciona banco AI, escribirlo
+            # 3. Si se proporciona banco AI, escribirlo; si es modo 'interior', asegurar que _AI.bank quede vanilla
             ai_msg_part = ""
             if ai_bank_bytes and vehicle.ai_bank_path:
                 ai_tmp = vehicle.ai_bank_path.with_suffix(".bank.tmp")
@@ -554,23 +687,39 @@ class VanillaVehicleManager:
                 if vehicle.ai_bank_path.is_file():
                     vehicle.ai_bank_path.unlink()
                 ai_tmp.rename(vehicle.ai_bank_path)
-                ai_msg_part = f"\n• Banco IA / TV Replay: {vehicle.ai_bank_path.name} ({len(ai_bank_bytes):,} bytes)"
+                ai_msg_part = f"\n• AI / TV Replay bank: {vehicle.ai_bank_path.name} ({len(ai_bank_bytes):,} bytes)"
+            elif audio_scope == "interior" and vehicle.ai_bank_path:
+                ai_backup = veh_backup_folder / vehicle.ai_bank_path.name
+                ai_orig = vehicle.ai_bank_path.parent / f"{vehicle.ai_bank_path.name}.orig"
+                src_ai_orig = ai_backup if ai_backup.is_file() else (ai_orig if ai_orig.is_file() else None)
+                if src_ai_orig is not None:
+                    shutil.copy2(src_ai_orig, vehicle.ai_bank_path)
+                ai_msg_part = f"\n• AI / TV Replay bank: Kept original vanilla ({vehicle.ai_bank_path.name})"
 
-            # 3b. Si se proporciona .csdbin suelto, escribirlo
+            # 3b. Si se proporciona .csdbin suelto, escribirlo; si es modo 'interior', mantener .csdbin vanilla
             if csdbin_bytes and vehicle.csdbin_path:
                 csd_tmp = vehicle.csdbin_path.with_suffix(".csdbin.tmp")
                 csd_tmp.write_bytes(csdbin_bytes)
                 if vehicle.csdbin_path.is_file():
                     vehicle.csdbin_path.unlink()
                 csd_tmp.rename(vehicle.csdbin_path)
+            elif audio_scope == "interior" and vehicle.csdbin_path:
+                csd_backup = veh_backup_folder / vehicle.csdbin_path.name
+                csd_orig = vehicle.csdbin_path.parent / f"{vehicle.csdbin_path.name}.orig"
+                src_csd_orig = csd_backup if csd_backup.is_file() else (csd_orig if csd_orig.is_file() else None)
+                if src_csd_orig is not None:
+                    shutil.copy2(src_csd_orig, vehicle.csdbin_path)
 
             # 4. Actualizar estado en el manifiesto
+            norm_scope = audio_scope if audio_scope in ("full", "interior", "exterior") else "full"
             if vehicle.vehicle_id in self._manifest_cache:
                 self._manifest_cache[vehicle.vehicle_id]["is_modified"] = True
+                self._manifest_cache[vehicle.vehicle_id]["modified_scope"] = norm_scope
                 self._manifest_cache[vehicle.vehicle_id]["modified_timestamp"] = datetime.now().isoformat()
                 self._save_manifest()
 
             vehicle.is_modified = True
+            vehicle.modified_scope = norm_scope
             return True, (
                 f"¡Sonido inyectado con éxito en '{vehicle.display_name}'!\n"
                 f"• Banco Jugador: {target_path.name} ({len(bank_bytes):,} bytes){ai_msg_part}\n"
@@ -655,9 +804,11 @@ class VanillaVehicleManager:
             # 6. Actualizar manifiesto
             if vehicle.vehicle_id in self._manifest_cache:
                 self._manifest_cache[vehicle.vehicle_id]["is_modified"] = False
+                self._manifest_cache[vehicle.vehicle_id]["modified_scope"] = "full"
                 self._save_manifest()
 
             vehicle.is_modified = False
+            vehicle.modified_scope = "full"
             return True, f"Vehículo '{vehicle.display_name}' restaurado con éxito al 100% original de Steam (SHA256 verificado)."
         except Exception as e:
             return False, f"Error durante la restauración: {e}"

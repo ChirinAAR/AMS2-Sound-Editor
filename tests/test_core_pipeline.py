@@ -36,12 +36,17 @@ from ams2_sound_porter.porter_engine import (
     SlotMappingConfig,
     SourceAudioLibrary,
     ThrottleCutConfig,
+    apply_band_edits_to_bank,
     auto_detect_throttle_cut_config,
+    _extract_native_engine_max_rpm,
     auto_distribute_rpm_bands,
     auto_map_samples,
     build_default_rpm_bands,
     build_direct_ported_bank_from_ac,
     build_ported_bank,
+    collect_vanilla_scope_targets,
+    merge_ported_events_into_native_bank,
+    uninvert_spatial_cone_in_bank_bytes,
     estimate_engine_rpm_bounds,
     export_ams2_mod_package,
 )
@@ -111,10 +116,12 @@ def assert_proj_tables_sorted(raw_bank: bytes) -> int:
             if cid == b"LIST":
                 ltype = raw_bank[ps : ps + 4]
                 # Extraer GUID del primer subchunk *B si es un contenedor de ítem (EVNT, IBUS, WAIT, etc.)
-                for scid, sps, spe, _ in iter_riff_chunks(raw_bank, ps + 4, pe):
-                    if scid in LOCAL_OBJECT_BASE_CHUNKS and spe - sps >= 16:
-                        child_guids_by_tag.setdefault(ltype, []).append(raw_bank[sps : sps + 16])
-                        break
+                # Excluir TRAN (TMLN/TRNS) porque FMOD ordena transiciones por prioridad de timeline, no por GUID.
+                if ltype != b"TRAN":
+                    for scid, sps, spe, _ in iter_riff_chunks(raw_bank, ps + 4, pe):
+                        if scid in LOCAL_OBJECT_BASE_CHUNKS and spe - sps >= 16:
+                            child_guids_by_tag.setdefault(ltype, []).append(raw_bank[sps : sps + 16])
+                            break
                 walk(ps + 4, pe)
             elif cid in (b"CTRL", b"CURV", b"MAP ", b"WAV ") and pe - ps >= 16:
                 child_guids_by_tag.setdefault(cid, []).append(raw_bank[ps : ps + 16])
@@ -1091,6 +1098,853 @@ def main() -> None:
         f"Autopitch directo esperado {orig_ap_rpm + 300.0}, obtenido {new_ap_rpm}"
     )
     print(f"   Override de RPM Raíz (Pitch) en Modo Directo AC verificado: {orig_ap_rpm:.0f} -> {new_ap_rpm:.0f} RPM!")
+
+    # 18. Acomodación condicional para bancos multi-variante y basados en 'throttle' sin alterar la ruta estándar
+    from ams2_sound_porter.vanilla_manager import VanillaVehicleManager
+
+    print("18. Verificando acomodación condicional (throttle + extra_role_variants) y ruta estándar intacta...")
+    p_std_res = build_direct_ported_bank_from_ac(
+        ac_bank=ac_lib.fmod_bank,
+        mod_identifier="TestStd_P",
+        target_role_guids={
+            "EngineExt": "{11111111-1111-4111-8111-111111111101}",
+            "EngineInt": "{11111111-1111-4111-8111-111111111103}",
+        },
+        target_role_paths={
+            "EngineExt": "event:/AMS2/Vehicles/TestMulti/EngineExt",
+            "EngineInt": "event:/AMS2/Vehicles/TestMulti/EngineInt",
+        },
+    )
+    p_std_explicit = build_direct_ported_bank_from_ac(
+        ac_bank=ac_lib.fmod_bank,
+        mod_identifier="TestStd_P",
+        target_role_guids={
+            "EngineExt": "{11111111-1111-4111-8111-111111111101}",
+            "EngineInt": "{11111111-1111-4111-8111-111111111103}",
+        },
+        target_role_paths={
+            "EngineExt": "event:/AMS2/Vehicles/TestMulti/EngineExt",
+            "EngineInt": "event:/AMS2/Vehicles/TestMulti/EngineInt",
+        },
+        extra_role_variants=None,
+        prefer_throttle_param=False,
+    )
+    assert p_std_res.bank_bytes == p_std_explicit.bank_bytes, "La ruta estándar debía ser idéntica bit-a-bit!"
+
+    res_multi_p = build_direct_ported_bank_from_ac(
+        ac_bank=ac_lib.fmod_bank,
+        mod_identifier="TestMulti_P",
+        target_role_guids={
+            "EngineExt": "{11111111-1111-4111-8111-111111111101}",
+            "EngineInt": "{11111111-1111-4111-8111-111111111103}",
+        },
+        target_role_paths={
+            "EngineExt": "event:/AMS2/Vehicles/TestMulti/EngineExt",
+            "EngineInt": "event:/AMS2/Vehicles/TestMulti/EngineInt",
+        },
+        extra_role_variants={
+            "EngineExt": [("{11111111-1111-4111-8111-111111111102}", "event:/AMS2/Vehicles/TestMulti/EngineExt_B")],
+            "EngineInt": [
+                ("{11111111-1111-4111-8111-111111111104}", "event:/AMS2/Vehicles/TestMulti/EngineInt_V1"),
+                ("{11111111-1111-4111-8111-111111111105}", "event:/AMS2/Vehicles/TestMulti/EngineInt_V2"),
+            ],
+        },
+        prefer_throttle_param=True,
+    )
+    assert_sndh_and_fsb_alignment(res_multi_p.bank_bytes)
+    assert_proj_tables_sorted(res_multi_p.bank_bytes)
+    rel_multi_p = FmodBank(raw=res_multi_p.bank_bytes)
+    p_multi_guids = [e.guid_str.lower() for e in rel_multi_p.events]
+    assert len(p_multi_guids) == len(set(p_multi_guids)), "GUIDs duplicados en Player multi-variante!"
+    for expected_g in (
+        "{11111111-1111-4111-8111-111111111101}",
+        "{11111111-1111-4111-8111-111111111102}",
+        "{11111111-1111-4111-8111-111111111103}",
+        "{11111111-1111-4111-8111-111111111104}",
+        "{11111111-1111-4111-8111-111111111105}",
+    ):
+        assert expected_g in p_multi_guids, f"Falta variante Player {expected_g} en EVTS!"
+    multi_p_params = {p[0].lower() for e in rel_multi_p.events for p in e.parameters}
+    assert "throttle" in multi_p_params, f"Se esperaba 'throttle' en Player multi-variante: {multi_p_params}"
+
+    ams2_dir = Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2")
+    if ams2_dir.is_dir():
+        mgr_multi = VanillaVehicleManager(ams2_dir)
+        catalog_multi = mgr_multi.scan_catalog()
+        for std_kw in ("720s", "corvette_c8_gt3", "sls_gt3"):
+            v_std = next((v for v in catalog_multi if std_kw in v.vehicle_id.lower()), None)
+            if v_std:
+                mgr_multi.load_vehicle_events_info(v_std)
+                assert not v_std.prefers_throttle_player and not v_std.prefers_throttle_ai, (
+                    f"{v_std.vehicle_id}: vehículo estándar no debe activar prefers_throttle"
+                )
+                assert not v_std.extra_event_variants and not v_std.extra_ai_event_variants, (
+                    f"{v_std.vehicle_id}: vehículo estándar no debe activar extra_variants"
+                )
+
+        for target_kw in ("alpine_a424", "f_ultimate_2022", "f_v8_gen1"):
+            v_cand = next(
+                (v for v in catalog_multi if target_kw in v.vehicle_id.lower() or target_kw in v.bank_path.stem.lower()),
+                None,
+            )
+            if not v_cand:
+                continue
+            mgr_multi.load_vehicle_events_info(v_cand)
+            assert v_cand.prefers_throttle_player and v_cand.prefers_throttle_ai
+            res_vp = build_direct_ported_bank_from_ac(
+                ac_bank=ac_lib.fmod_bank,
+                mod_identifier=v_cand.car_name,
+                target_role_guids=v_cand.event_guids,
+                target_role_paths=v_cand.event_paths,
+                target_bank_guid=v_cand.bank_guid or None,
+                target_param_names=v_cand.target_parameters,
+                target_ctrl_params=v_cand.ctrl_parameters,
+                target_role_buses=getattr(v_cand, "ai_event_buses", None),
+                native_bank_path=v_cand.bank_path,
+                mute_secondary_pops=True,
+                invert_spatial_cone=True,
+                extra_role_variants=v_cand.extra_event_variants or None,
+                prefer_throttle_param=v_cand.prefers_throttle_player,
+            )
+            assert_sndh_and_fsb_alignment(res_vp.bank_bytes)
+            assert_proj_tables_sorted(res_vp.bank_bytes)
+            rel_vp = FmodBank(raw=res_vp.bank_bytes)
+            vp_ev_set = {e.guid_str.lower() for e in rel_vp.events}
+            vp_pnames = {p[0].lower() for e in rel_vp.events for p in e.parameters}
+            assert "throttle" in vp_pnames
+            for role_k in ("EngineExt", "EngineInt", "Starter", "Starting", "Exhaust"):
+                if role_k in v_cand.event_guids:
+                    assert v_cand.event_guids[role_k].lower() in vp_ev_set
+            for _r, items in v_cand.extra_event_variants.items():
+                for item in items:
+                    assert item[0].lower() in vp_ev_set, f"{v_cand.vehicle_id} Player: falta variante extra {item[0]}"
+
+            if v_cand.ai_bank_path:
+                res_vai = build_direct_ported_bank_from_ac(
+                    ac_bank=ac_lib.fmod_bank,
+                    mod_identifier=f"{v_cand.car_name}_AI",
+                    target_role_guids=v_cand.ai_event_guids,
+                    target_role_paths=v_cand.ai_event_paths,
+                    target_bank_guid=v_cand.ai_bank_guid or None,
+                    target_role_buses=v_cand.ai_event_buses,
+                    is_ai_bank=True,
+                    mute_secondary_pops=True,
+                    extra_role_variants=v_cand.extra_ai_event_variants or None,
+                    prefer_throttle_param=v_cand.prefers_throttle_ai,
+                )
+                assert_sndh_and_fsb_alignment(res_vai.bank_bytes)
+                assert_proj_tables_sorted(res_vai.bank_bytes)
+                rel_vai = FmodBank(raw=res_vai.bank_bytes)
+                vai_ev_set = {e.guid_str.lower() for e in rel_vai.events}
+                vai_pnames = {p[0].lower() for e in rel_vai.events for p in e.parameters}
+                assert "throttle" in vai_pnames
+                for _r, g_a in v_cand.ai_event_guids.items():
+                    if _r in ("ai_engine_main", "ai_engine_live", "ai_engine_ext", "ai_engine_int"):
+                        assert g_a.lower() in vai_ev_set
+                for _r, items in v_cand.extra_ai_event_variants.items():
+                    for item in items:
+                        assert item[0].lower() in vai_ev_set, f"{v_cand.vehicle_id} AI: falta variante extra {item[0]}"
+            print(f"   Vehículo especial {v_cand.vehicle_id} verificado (Player + AI)!")
+
+    print("19. Verificando extensión automática de tope RPM y preservación de corte/pops en Jugador...")
+    tatuus_bank_p = Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\tatuus_f3_t_318\sfx\tatuus_f3_t_318.bank")
+    tatuus_guids_p = tatuus_bank_p.parent / "GUIDs.txt"
+    cortex_bank_p = Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_gtm_cortex_v8\sfx\rss_gtm_cortex_v8.bank")
+    cortex_guids_p = cortex_bank_p.parent / "GUIDs.txt"
+
+    if ams2_dir.is_dir() and tatuus_bank_p.is_file():
+        mgr_r = VanillaVehicleManager(ams2_dir)
+        mgr_r.scan_catalog()
+        v_f3s = mgr_r.get_vehicle_by_id("formula_3_f3_sudam")
+        if v_f3s:
+            mgr_r.load_vehicle_events_info(v_f3s)
+            f3s_max_rpm = _extract_native_engine_max_rpm(v_f3s.bank_path)
+            assert f3s_max_rpm is not None and f3s_max_rpm >= 9900.0, f"Tope nativo F3_Sudam inesperado: {f3s_max_rpm}"
+
+            tat_b = FmodBank(tatuus_bank_p, guids_path=tatuus_guids_p)
+            tat_bands = build_default_rpm_bands(tat_b)
+            tat_res_p = build_direct_ported_bank_from_ac(
+                ac_bank=tat_b,
+                mod_identifier=v_f3s.car_name,
+                standalone_guids=False,
+                target_role_guids=v_f3s.event_guids,
+                target_role_paths=v_f3s.event_paths,
+                target_bank_guid=v_f3s.bank_guid or None,
+                target_param_names=v_f3s.target_parameters,
+                target_ctrl_params=v_f3s.ctrl_parameters,
+                rpm_bands=tat_bands,
+                mute_secondary_pops=False,
+                native_bank_path=v_f3s.bank_path,
+                target_max_rpm=f3s_max_rpm,
+            )
+            assert_sndh_and_fsb_alignment(tat_res_p.bank_bytes)
+            assert_proj_tables_sorted(tat_res_p.bank_bytes)
+            tat_re_p = FmodBank(raw=tat_res_p.bank_bytes)
+            int_bands_p = [
+                b for b in tat_re_p.rpm_bands
+                if b.event_role == "EngineInt" and b.rpm_min <= 9500.0 <= b.rpm_max
+            ]
+            int_names_p = {tat_re_p.slots[i].name for b in int_bands_p for i in b.donor_slot_indices}
+            assert "ext_limiter2" in int_names_p and "int_rss4_1_on_7_5" in int_names_p, (
+                f"F3_Sudam Jugador quedó sin cobertura a 9500 RPM: {int_names_p}"
+            )
+
+            if v_f3s.ai_bank_path and v_f3s.ai_event_guids:
+                tat_ai_bands = [
+                    RpmBandConfig(
+                        band_id=b.band_id, pml_guid=b.pml_guid, event_guid=b.event_guid, box_index=b.box_index,
+                        event_role=b.event_role, perspective=b.perspective, load_role=b.load_role,
+                        donor_slot_indices=list(b.donor_slot_indices), donor_label=b.donor_label,
+                        rpm_min=0.0, rpm_max=0.0, fade_in_end=0.0, fade_out_start=0.0,
+                        orig_rpm_min=b.orig_rpm_min, orig_rpm_max=b.orig_rpm_max,
+                        orig_fade_in_end=b.orig_fade_in_end, orig_fade_out_start=b.orig_fade_out_start,
+                        fade_in_curv_guid=b.fade_in_curv_guid, fade_out_curv_guid=b.fade_out_curv_guid,
+                        bus_rpm_cutoff=b.bus_rpm_cutoff, is_muted_bus=True, is_fill_layer=b.is_fill_layer,
+                    ) if getattr(b, "load_role", "") in ("pops", "throttle_cut") else b
+                    for b in tat_bands
+                ]
+                tat_res_ai = build_direct_ported_bank_from_ac(
+                    ac_bank=tat_b,
+                    mod_identifier=f"{v_f3s.car_name}_AI",
+                    standalone_guids=False,
+                    target_role_guids=v_f3s.ai_event_guids,
+                    target_role_paths=v_f3s.ai_event_paths,
+                    target_bank_guid=v_f3s.ai_bank_guid or None,
+                    target_role_buses=getattr(v_f3s, "ai_event_buses", None),
+                    rpm_bands=tat_ai_bands,
+                    is_ai_bank=True,
+                    mute_secondary_pops=True,
+                    target_max_rpm=f3s_max_rpm,
+                )
+                assert_sndh_and_fsb_alignment(tat_res_ai.bank_bytes)
+                assert_proj_tables_sorted(tat_res_ai.bank_bytes)
+                tat_re_ai = FmodBank(raw=tat_res_ai.bank_bytes)
+                ai_ext_names_9500 = {
+                    tat_re_ai.slots[i].name
+                    for b in tat_re_ai.rpm_bands
+                    if b.event_role == "EngineExt" and b.rpm_min <= 9500.0 <= b.rpm_max
+                    for i in b.donor_slot_indices
+                }
+                assert "int_rss4_1_on_7_5" in ai_ext_names_9500 and "ext_limiter2" not in ai_ext_names_9500, (
+                    f"F3_Sudam AI incorrecto a 9500 RPM: {ai_ext_names_9500}"
+                )
+            print("   F3_Sudam + tatuus_f3_t_318 verificado (8000 -> 10000 RPM, corte activo en Jugador y limpio en IA)!")
+
+    if ams2_dir.is_dir() and cortex_bank_p.is_file():
+        mgr_r = VanillaVehicleManager(ams2_dir)
+        mgr_r.scan_catalog()
+        v_c8 = mgr_r.get_vehicle_by_id("c_corvette_c8_gt3r")
+        if v_c8:
+            mgr_r.load_vehicle_events_info(v_c8)
+            cor_b = FmodBank(cortex_bank_p, guids_path=cortex_guids_p)
+            cor_bands = build_default_rpm_bands(cor_b)
+            cor_res_p = build_direct_ported_bank_from_ac(
+                ac_bank=cor_b,
+                mod_identifier=v_c8.car_name,
+                standalone_guids=False,
+                target_role_guids=v_c8.event_guids,
+                target_role_paths=v_c8.event_paths,
+                target_bank_guid=v_c8.bank_guid or None,
+                target_param_names=v_c8.target_parameters,
+                target_ctrl_params=v_c8.ctrl_parameters,
+                rpm_bands=cor_bands,
+                mute_secondary_pops=False,
+                native_bank_path=v_c8.bank_path,
+            )
+            assert_sndh_and_fsb_alignment(cor_res_p.bank_bytes)
+            assert_proj_tables_sorted(cor_res_p.bank_bytes)
+            cor_re_p = FmodBank(raw=cor_res_p.bank_bytes)
+            lim_band_p = [
+                b for b in cor_re_p.rpm_bands
+                if b.event_role in ("EngineInt", "AuxInt")
+                and any("Int_Lim" in cor_re_p.slots[i].name for i in b.donor_slot_indices)
+            ]
+            assert lim_band_p and any(b.rpm_min <= 8500.0 <= b.rpm_max for b in lim_band_p), (
+                f"Corvette C8 GT3R Jugador perdió la capa RSS_C8_Int_Lim al corte: {lim_band_p}"
+            )
+            if v_c8.ai_bank_path and v_c8.ai_event_guids:
+                cor_ai_bands = [
+                    RpmBandConfig(
+                        band_id=b.band_id, pml_guid=b.pml_guid, event_guid=b.event_guid, box_index=b.box_index,
+                        event_role=b.event_role, perspective=b.perspective, load_role=b.load_role,
+                        donor_slot_indices=list(b.donor_slot_indices), donor_label=b.donor_label,
+                        rpm_min=0.0, rpm_max=0.0, fade_in_end=0.0, fade_out_start=0.0,
+                        orig_rpm_min=b.orig_rpm_min, orig_rpm_max=b.orig_rpm_max,
+                        orig_fade_in_end=b.orig_fade_in_end, orig_fade_out_start=b.orig_fade_out_start,
+                        fade_in_curv_guid=b.fade_in_curv_guid, fade_out_curv_guid=b.fade_out_curv_guid,
+                        bus_rpm_cutoff=b.bus_rpm_cutoff, is_muted_bus=True, is_fill_layer=b.is_fill_layer,
+                    ) if getattr(b, "load_role", "") in ("pops", "throttle_cut") else b
+                    for b in cor_bands
+                ]
+                cor_res_ai = build_direct_ported_bank_from_ac(
+                    ac_bank=cor_b,
+                    mod_identifier=f"{v_c8.car_name}_AI",
+                    standalone_guids=False,
+                    target_role_guids=v_c8.ai_event_guids,
+                    target_role_paths=v_c8.ai_event_paths,
+                    target_bank_guid=v_c8.ai_bank_guid or None,
+                    target_role_buses=getattr(v_c8, "ai_event_buses", None),
+                    rpm_bands=cor_ai_bands,
+                    is_ai_bank=True,
+                    mute_secondary_pops=True,
+                )
+                assert_sndh_and_fsb_alignment(cor_res_ai.bank_bytes)
+                assert_proj_tables_sorted(cor_res_ai.bank_bytes)
+                cor_re_ai = FmodBank(raw=cor_res_ai.bank_bytes)
+                tc_or_lim_ai = [
+                    b for b in cor_re_ai.rpm_bands
+                    if b.rpm_max > b.rpm_min
+                    and any("RSS_C8_Int_Lim" in cor_re_ai.slots[i].name or "RSS_C8_TC" in cor_re_ai.slots[i].name for i in b.donor_slot_indices)
+                ]
+                assert not tc_or_lim_ai, f"Corvette C8 AI dejó POPS/TC sin silenciar: {tc_or_lim_ai}"
+            print("   Corvette_C8_GT3R + rss_gtm_cortex_v8 verificado (corte activo en Jugador, TC/pops silenciados en IA)!")
+
+    print("20. Probando edición in-place de sonidos ya modificados (apply_band_edits_to_bank + re-sync _AI.bank)...")
+    ams2_root_20 = Path(r"D:\SteamLibrary\steamapps\common\Automobilista 2")
+    if ams2_root_20.is_dir() and AC_BANK_PATH.is_file():
+        from ams2_sound_porter.vanilla_manager import VanillaVehicleManager
+        vm20 = VanillaVehicleManager(ams2_root=ams2_root_20)
+        vm20.scan_catalog()
+        v20 = next((v for v in vm20._vehicles_cache if v.ai_bank_path is not None and v.ai_bank_path.is_file()), None)
+        if v20 is not None:
+            vm20.load_vehicle_events_info(v20)
+            src_ac20 = FmodBank(AC_BANK_PATH)
+            orig_ac_cones = _extract_cone_vol_endpoints(src_ac20.raw)
+            first_player = build_direct_ported_bank_from_ac(
+                ac_bank=src_ac20,
+                mod_identifier=v20.car_name,
+                standalone_guids=False,
+                target_role_guids=v20.event_guids,
+                target_role_paths=v20.event_paths,
+                target_bank_guid=v20.bank_guid or None,
+                invert_spatial_cone=True,
+                mute_secondary_pops=False,
+            )
+            with tempfile.TemporaryDirectory() as tmp20:
+                mod_bank_file = Path(tmp20) / v20.bank_path.name
+                mod_bank_file.write_bytes(first_player.bank_bytes)
+
+                mod_lib = SourceAudioLibrary.from_bank(mod_bank_file)
+                assert mod_lib.fmod_bank is not None
+                mod_bank = mod_lib.fmod_bank
+                mod_bands = build_default_rpm_bands(mod_bank)
+                mod_maps = [SlotMappingConfig(sl.global_index, action="keep_donor") for sl in mod_bank.slots]
+
+                # Elegir 3 bandas activas distintas con wav_guid válido
+                active_bands = [
+                    b for b in mod_bands
+                    if not b.is_muted_bus and b.donor_slot_indices
+                    and mod_bank.slots[b.donor_slot_indices[0]].wav_guid is not None
+                ]
+                assert len(active_bands) >= 3, "Se esperaban al menos 3 bandas activas en el banco modificado"
+                b_edit, b_mute, b_redir = active_bands[0], active_bands[1], active_bands[2]
+                g_edit = b_edit.donor_slot_indices[0]
+                g_mute = b_mute.donor_slot_indices[0]
+                g_redir = b_redir.donor_slot_indices[0]
+
+                def _read_wait_gain_db(raw_b: bytes, wav_g: bytes) -> float | None:
+                    for _c, _ps, _pe, _ in iter_riff_chunks(raw_b, 12, len(raw_b)):
+                        if _c == b"LIST" and raw_b[_ps : _ps + 4] == b"PROJ":
+                            found_val: list[float] = []
+                            def _walk(s: int, e: int) -> None:
+                                for sc, sps, spe, _ in iter_riff_chunks(raw_b, s, e):
+                                    if sc == b"LIST":
+                                        if raw_b[sps : sps + 4] == b"WAIT":
+                                            wg = None
+                                            gdb = None
+                                            for cc, cps, cpe, _ in iter_riff_chunks(raw_b, sps + 4, spe):
+                                                if cc == b"WAIB" and cpe - cps >= 32:
+                                                    wg = bytes(raw_b[cps + 16 : cps + 32])
+                                                elif cc == b"INST" and cpe - cps >= 20:
+                                                    gdb = struct.unpack_from("<f", raw_b, cps + 16)[0]
+                                            if wg == wav_g and gdb is not None:
+                                                found_val.append(gdb)
+                                        _walk(sps + 4, spe)
+                            _walk(_ps + 4, _pe)
+                            return found_val[0] if found_val else None
+                    return None
+
+                orig_gain_edit = _read_wait_gain_db(mod_bank.raw, mod_bank.slots[g_edit].wav_guid)
+                assert orig_gain_edit is not None
+
+                # 1) Editar rango RPM + Root RPM + Gain (+3.5 dB) en b_edit
+                b_edit.rpm_min = 2150.0
+                b_edit.fade_in_end = 2450.0
+                b_edit.fade_out_start = 4850.0
+                b_edit.rpm_max = 5350.0
+                mod_maps[g_edit].override_root_rpm = 3777.0
+                mod_maps[g_edit].gain_db = 3.5
+
+                # 2) Silenciar b_mute
+                b_mute.is_muted_bus = True
+                mod_maps[g_mute].action = "silence"
+
+                # 3) Redirigir muestra de b_redir hacia la muestra de b_edit
+                src_idx_edit = next(
+                    (it.index for it in mod_lib.items if it._slot_ref and it._slot_ref.global_index == g_edit),
+                    None,
+                )
+                assert src_idx_edit is not None
+                mod_maps[g_redir].action = "replace_source"
+                mod_maps[g_redir].source_index = src_idx_edit
+
+                edited_player_bytes = apply_band_edits_to_bank(
+                    bank=mod_bank,
+                    rpm_bands=mod_bands,
+                    mappings=mod_maps,
+                    library=mod_lib,
+                )
+                assert_sndh_and_fsb_alignment(edited_player_bytes)
+                assert_proj_tables_sorted(edited_player_bytes)
+
+                re_player = FmodBank(raw=edited_player_bytes)
+                assert re_player.bank_guid == mod_bank.bank_guid, "apply_band_edits_to_bank alteró el bank_guid!"
+                if orig_ac_cones:
+                    assert _extract_cone_vol_endpoints(edited_player_bytes) == _extract_cone_vol_endpoints(mod_bank.raw), (
+                        "apply_band_edits_to_bank no debe volver a invertir Event Cone Angle!"
+                    )
+
+                re_b_edit = next(
+                    (b for b in re_player.rpm_bands if b.pml_guid == b_edit.pml_guid and b.event_guid == b_edit.event_guid and b.box_index == b_edit.box_index),
+                    None,
+                )
+                assert re_b_edit is not None and abs(re_b_edit.rpm_min - 2150.0) < 1.0 and abs(re_b_edit.rpm_max - 5350.0) < 1.0
+                new_gain_edit = _read_wait_gain_db(edited_player_bytes, mod_bank.slots[g_edit].wav_guid)
+                assert new_gain_edit is not None and abs(new_gain_edit - min(24.0, orig_gain_edit + 3.5)) < 0.05
+                re_sl_edit = next((s for s in re_player.slots if s.wav_guid == mod_bank.slots[g_edit].wav_guid), None)
+                if mod_bank.slots[g_edit].autopitch_ref_rpm is not None and re_sl_edit is not None:
+                    assert re_sl_edit.autopitch_ref_rpm is not None and abs(re_sl_edit.autopitch_ref_rpm - 3777.0) < 1.0
+
+                re_b_mute = next(
+                    (b for b in re_player.rpm_bands if b.pml_guid == b_mute.pml_guid and b.event_guid == b_mute.event_guid and b.box_index == b_mute.box_index),
+                    None,
+                )
+                assert re_b_mute is None or (re_b_mute.rpm_min == 0.0 and re_b_mute.rpm_max == 0.0)
+                muted_gain = _read_wait_gain_db(edited_player_bytes, mod_bank.slots[g_mute].wav_guid)
+                assert muted_gain is not None and muted_gain <= -95.0
+
+                # Verificar redirección WAV en b_redir
+                redir_wg = mod_bank.slots[g_redir].wav_guid
+                expected_loc = (mod_bank.slots[g_edit].subbank_index, mod_bank.slots[g_edit].sample_index)
+                found_redir_loc = None
+                for _c, _ps, _pe, _ in iter_riff_chunks(edited_player_bytes, 12, len(edited_player_bytes)):
+                    if _c == b"LIST" and edited_player_bytes[_ps : _ps + 4] == b"PROJ":
+                        def _find_w(s: int, e: int) -> None:
+                            nonlocal found_redir_loc
+                            for sc, sps, spe, _ in iter_riff_chunks(edited_player_bytes, s, e):
+                                if sc == b"LIST":
+                                    _find_w(sps + 4, spe)
+                                elif sc == b"WAV " and spe - sps >= 30 and bytes(edited_player_bytes[sps : sps + 16]) == redir_wg:
+                                    _, sb_i, _, smp_i, _ = struct.unpack_from("<HHHII", edited_player_bytes, sps + 16)
+                                    found_redir_loc = (sb_i, smp_i)
+                        _find_w(_ps + 4, _pe)
+                assert found_redir_loc == expected_loc, f"WAV redirect falló: {found_redir_loc} != {expected_loc}"
+
+                # Verificar re-sync de _AI.bank desde el banco Jugador editado
+                ai_src_bytes = uninvert_spatial_cone_in_bank_bytes(edited_player_bytes)
+                ai_src_bank = FmodBank(raw=ai_src_bytes)
+                ai_res20 = build_direct_ported_bank_from_ac(
+                    ac_bank=ai_src_bank,
+                    mod_identifier=f"{v20.car_name}_AI",
+                    standalone_guids=False,
+                    target_role_guids=v20.ai_event_guids,
+                    target_role_paths=v20.ai_event_paths,
+                    target_bank_guid=v20.ai_bank_guid or None,
+                    target_role_buses=getattr(v20, "ai_event_buses", None),
+                    rpm_bands=build_default_rpm_bands(ai_src_bank),
+                    is_ai_bank=True,
+                    mute_secondary_pops=True,
+                    invert_spatial_cone=False,
+                    target_max_rpm=0.0,
+                )
+                assert_sndh_and_fsb_alignment(ai_res20.bank_bytes)
+                assert_proj_tables_sorted(ai_res20.bank_bytes)
+                if orig_ac_cones:
+                    assert _extract_cone_vol_endpoints(ai_res20.bank_bytes) == orig_ac_cones, (
+                        "El _AI.bank re-sincronizado debe conservar el cono AC original!"
+                    )
+            print("   apply_band_edits_to_bank (RPM, pitch, gain dB, silence, WAV redirect) + re-sync _AI.bank verificados al 100%!")
+
+    print("21. Probando reemplazo parcial de vehículos vanilla (Interior only / Exterior only)...")
+    if ams2_root_20.is_dir() and AC_BANK_PATH.is_file():
+        from ams2_sound_porter.vanilla_manager import VanillaVehicleManager
+        vm21 = VanillaVehicleManager(ams2_root=ams2_root_20)
+        vm21.scan_catalog()
+
+        partial_cases = [
+            ("corvette_c8_gt3r", Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_gtm_cortex_v8\sfx\rss_gtm_cortex_v8.bank"), "RSS_C8_", "C8_R_int_", "corvette_gt3r_ext_"),
+            ("bmw_m3_gtr", AC_BANK_PATH, "z4gt3", "m3gtr_int_", "m3gtr_ext_"),
+        ]
+        for vkey, ac_p21, ac_tok, nat_int_tok, nat_ext_tok in partial_cases:
+            if not ac_p21.is_file():
+                continue
+            v21 = next((v for v in vm21._vehicles_cache if vkey in v.vehicle_id.lower()), None)
+            if v21 is None:
+                continue
+            vm21.load_vehicle_events_info(v21)
+            nat_p21 = vm21.backup_dir / v21.vehicle_id / v21.bank_path.name
+            if not nat_p21.is_file():
+                nat_p21 = v21.bank_path
+            nat_bank_p = FmodBank(nat_p21)
+            ac_bank21 = FmodBank(ac_p21)
+
+            # A) Interior only: EngineInt (+ AuxInt) -> AC, EngineExt + Exhaust -> Vanilla AMS2
+            rep_i, sil_i, pmap_i, ex_i = collect_vanilla_scope_targets(v21, ac_bank21, "interior", is_ai=False)
+            ported_i = build_direct_ported_bank_from_ac(
+                ac_bank=ac_bank21,
+                mod_identifier=v21.car_name,
+                standalone_guids=False,
+                target_role_guids=v21.event_guids,
+                target_role_paths=v21.event_paths,
+                target_bank_guid=v21.bank_guid or None,
+                native_bank_path=nat_p21,
+                invert_spatial_cone=False,
+                extra_role_variants=ex_i or None,
+                active_scope="interior",
+            )
+            hyb_int_bytes = merge_ported_events_into_native_bank(
+                native_bank=nat_bank_p,
+                ported_bank=FmodBank(raw=ported_i.bank_bytes),
+                replace_event_guids=rep_i,
+                silence_native_event_guids=sil_i,
+                event_paths_map=pmap_i,
+                mod_identifier=v21.car_name,
+                seed_tag="hybrid:p:interior",
+            )
+            assert_sndh_and_fsb_alignment(hyb_int_bytes)
+            assert_proj_tables_sorted(hyb_int_bytes)
+            fb_int = FmodBank(raw=hyb_int_bytes)
+            assert fb_int.bank_guid == nat_bank_p.bank_guid
+            ev_by_g_i = {ev.guid_str.lower(): ev for ev in fb_int.events}
+            int_ev_i = ev_by_g_i[v21.event_guids["EngineInt"].lower()]
+            ext_ev_i = ev_by_g_i[v21.event_guids["EngineExt"].lower()]
+            assert any(ac_tok.lower() in s.lower() for s in int_ev_i.linked_samples), (
+                f"{vkey} interior-only: EngineInt no contiene muestras AC ({int_ev_i.linked_samples[:5]})"
+            )
+            assert any(nat_ext_tok.lower() in s.lower() for s in ext_ev_i.linked_samples), (
+                f"{vkey} interior-only: EngineExt no conservó muestras vanilla ({ext_ev_i.linked_samples[:5]})"
+            )
+            if "AuxInt" in v21.event_guids:
+                aux_ev_i = ev_by_g_i[v21.event_guids["AuxInt"].lower()]
+                assert any(ac_tok.lower() in s.lower() for s in aux_ev_i.linked_samples), (
+                    f"{vkey} interior-only: AuxInt no fue reemplazado por AC ({aux_ev_i.linked_samples[:5]})"
+                )
+
+            # B) Exterior only: EngineExt -> AC, Exhaust -> silenciado, EngineInt (+ AuxInt) -> Vanilla AMS2
+            rep_e, sil_e, pmap_e, ex_e = collect_vanilla_scope_targets(v21, ac_bank21, "exterior", is_ai=False)
+            ported_e = build_direct_ported_bank_from_ac(
+                ac_bank=ac_bank21,
+                mod_identifier=v21.car_name,
+                standalone_guids=False,
+                target_role_guids=v21.event_guids,
+                target_role_paths=v21.event_paths,
+                target_bank_guid=v21.bank_guid or None,
+                native_bank_path=nat_p21,
+                invert_spatial_cone=True,
+                extra_role_variants=ex_e or None,
+                active_scope="exterior",
+            )
+            hyb_ext_bytes = merge_ported_events_into_native_bank(
+                native_bank=nat_bank_p,
+                ported_bank=FmodBank(raw=ported_e.bank_bytes),
+                replace_event_guids=rep_e,
+                silence_native_event_guids=sil_e,
+                event_paths_map=pmap_e,
+                mod_identifier=v21.car_name,
+                seed_tag="hybrid:p:exterior",
+            )
+            assert_sndh_and_fsb_alignment(hyb_ext_bytes)
+            assert_proj_tables_sorted(hyb_ext_bytes)
+            fb_ext = FmodBank(raw=hyb_ext_bytes)
+            assert fb_ext.bank_guid == nat_bank_p.bank_guid
+            ev_by_g_e = {ev.guid_str.lower(): ev for ev in fb_ext.events}
+            int_ev_e = ev_by_g_e[v21.event_guids["EngineInt"].lower()]
+            ext_ev_e = ev_by_g_e[v21.event_guids["EngineExt"].lower()]
+            assert any(nat_int_tok.lower() in s.lower() for s in int_ev_e.linked_samples), (
+                f"{vkey} exterior-only: EngineInt no conservó muestras vanilla ({int_ev_e.linked_samples[:5]})"
+            )
+            assert any(ac_tok.lower() in s.lower() for s in ext_ev_e.linked_samples) or len(ext_ev_e.linked_samples) >= 5
+            if "Exhaust" in v21.event_guids and v21.event_guids["Exhaust"].lower() in ev_by_g_e:
+                exh_ev_e = ev_by_g_e[v21.event_guids["Exhaust"].lower()]
+                assert len(exh_ev_e.linked_samples) == 0, (
+                    f"{vkey} exterior-only: Exhaust vanilla debía neutralizarse ({exh_ev_e.linked_samples})"
+                )
+
+            # C) Exterior only _AI.bank: ai_engine_main/live/ext -> AC, ai_engine_int -> Vanilla AMS2
+            if v21.ai_bank_path and v21.ai_event_guids:
+                nat_ai21 = vm21.backup_dir / v21.vehicle_id / v21.ai_bank_path.name
+                if not nat_ai21.is_file():
+                    nat_ai21 = v21.ai_bank_path
+                nat_bank_ai = FmodBank(nat_ai21)
+                rep_ai, sil_ai, pmap_ai, ex_ai = collect_vanilla_scope_targets(v21, ac_bank21, "exterior", is_ai=True)
+                ported_ai = build_direct_ported_bank_from_ac(
+                    ac_bank=ac_bank21,
+                    mod_identifier=f"{v21.car_name}_AI",
+                    standalone_guids=False,
+                    target_role_guids=v21.ai_event_guids,
+                    target_role_paths=v21.ai_event_paths,
+                    target_bank_guid=v21.ai_bank_guid or None,
+                    target_role_buses=getattr(v21, "ai_event_buses", None),
+                    is_ai_bank=True,
+                    mute_secondary_pops=True,
+                    invert_spatial_cone=False,
+                    extra_role_variants=ex_ai or None,
+                    active_scope="exterior",
+                )
+                hyb_ai_bytes = merge_ported_events_into_native_bank(
+                    native_bank=nat_bank_ai,
+                    ported_bank=FmodBank(raw=ported_ai.bank_bytes),
+                    replace_event_guids=rep_ai,
+                    silence_native_event_guids=sil_ai,
+                    event_paths_map=pmap_ai,
+                    mod_identifier=f"{v21.car_name}_AI",
+                    seed_tag="hybrid:ai:exterior",
+                )
+                assert_sndh_and_fsb_alignment(hyb_ai_bytes)
+                assert_proj_tables_sorted(hyb_ai_bytes)
+                fb_ai_e = FmodBank(raw=hyb_ai_bytes)
+                assert fb_ai_e.bank_guid == nat_bank_ai.bank_guid
+                if "ai_engine_int" in v21.ai_event_guids:
+                    ai_ev_map = {ev.guid_str.lower(): ev for ev in fb_ai_e.events}
+                    ai_int_ev = ai_ev_map[v21.ai_event_guids["ai_engine_int"].lower()]
+                    assert any(nat_int_tok.lower() in s.lower() for s in ai_int_ev.linked_samples), (
+                        f"{vkey} AI exterior-only: ai_engine_int no conservó muestras vanilla ({ai_int_ev.linked_samples[:5]})"
+                    )
+            print(f"   Reemplazo parcial Interior-only & Exterior-only verificado para {vkey}!")
+
+    print("22. Verificando sincronización CURV+MAP en sub-eventos EVIT al extender tope RPM (Porsche_963 + rss_mph_protech_p96_v8)...")
+    p96_bank_path = Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_mph_protech_p96_v8\sfx\rss_mph_protech_p96_v8.bank")
+    p96_guids_path = p96_bank_path.parent / "GUIDs.txt"
+    if ams2_root_20.is_dir() and p96_bank_path.is_file():
+        from ams2_sound_porter.vanilla_manager import VanillaVehicleManager
+        from ams2_sound_porter.porter_engine import _iter_proj_table_items
+        vm22 = VanillaVehicleManager(ams2_root=ams2_root_20)
+        vm22.scan_catalog()
+        v963 = next((v for v in vm22._vehicles_cache if "963" in v.vehicle_id.lower()), None)
+        if v963 is not None:
+            vm22.load_vehicle_events_info(v963)
+            nat_p963 = vm22.backup_dir / v963.vehicle_id / v963.bank_path.name
+            if not nat_p963.is_file():
+                nat_p963 = v963.bank_path
+            max_rpm_963 = _extract_native_engine_max_rpm(nat_p963)
+            assert max_rpm_963 and max_rpm_963 > 12000.0, f"Se esperaba tope nativo >12000 RPM en 963: {max_rpm_963}"
+            p96_b = FmodBank(p96_bank_path, guids_path=p96_guids_path if p96_guids_path.is_file() else None)
+            p96_bands = build_default_rpm_bands(p96_b)
+            p96_res_p = build_direct_ported_bank_from_ac(
+                ac_bank=p96_b,
+                mod_identifier=v963.car_name,
+                standalone_guids=False,
+                target_role_guids=v963.event_guids,
+                target_role_paths=v963.event_paths,
+                target_bank_guid=v963.bank_guid or None,
+                rpm_bands=p96_bands,
+                mute_secondary_pops=False,
+                native_bank_path=nat_p963,
+                invert_spatial_cone=True,
+                prefer_throttle_param=bool(v963.prefers_throttle_player),
+                target_max_rpm=max_rpm_963,
+            )
+            p96_res_ai = build_direct_ported_bank_from_ac(
+                ac_bank=p96_b,
+                mod_identifier=f"{v963.car_name}_AI",
+                standalone_guids=False,
+                target_role_guids=v963.ai_event_guids,
+                target_role_paths=v963.ai_event_paths,
+                target_bank_guid=v963.ai_bank_guid or None,
+                target_role_buses=v963.ai_event_buses,
+                rpm_bands=p96_bands,
+                is_ai_bank=True,
+                mute_secondary_pops=True,
+                invert_spatial_cone=False,
+                prefer_throttle_param=bool(v963.prefers_throttle_ai),
+                target_max_rpm=max_rpm_963,
+            )
+            for lbl22, raw22 in (("Player", p96_res_p.bank_bytes), ("AI", p96_res_ai.bank_bytes)):
+                assert_sndh_and_fsb_alignment(raw22)
+                assert_proj_tables_sorted(raw22)
+                proj22 = next(
+                    raw22[ps + 4 : pe]
+                    for cid, ps, pe, _ in iter_riff_chunks(raw22, 12, len(raw22))
+                    if cid == b"LIST" and raw22[ps : ps + 4] == b"PROJ"
+                )
+                tbls22 = list(_iter_proj_table_items(proj22))
+                prms22 = {}
+                for lt, items in tbls22:
+                    if lt == b"PRMS":
+                        for k, _, _, bp in items:
+                            sl = struct.unpack_from("<H", bp, 21)[0]
+                            prms22[k] = bp[23 : 23 + sl].decode("latin1", "replace").rstrip("\x00").lower()
+                curvs22 = {}
+                for lt, items in tbls22:
+                    if lt == b"CRVS":
+                        for k, _, _, bp in items:
+                            cnt = struct.unpack_from("<H", bp, 32)[0] >> 1
+                            st = struct.unpack_from("<H", bp, 34)[0] if cnt else 0
+                            curvs22[k] = [struct.unpack_from("<ff", bp, 36 + i * st) for i in range(cnt)] if st >= 8 else []
+                mpgs22 = {}
+                for lt, items in tbls22:
+                    if lt == b"MPGS":
+                        for k, _, _, bp in items:
+                            cnt = struct.unpack_from("<H", bp, 16)[0] >> 1
+                            st = struct.unpack_from("<H", bp, 18)[0] if cnt else 0
+                            mpgs22[k] = [struct.unpack_from("<ff", bp, 20 + i * st) for i in range(cnt)] if st >= 8 else []
+                evit_map22 = {}
+                for lt, items in tbls22:
+                    if lt == b"EVIS":
+                        for k, full, _, _ in items:
+                            for sc, sps, spe, _ in iter_riff_chunks(full, 12, len(full)):
+                                if sc == b"LIST" and full[sps : sps + 4] == b"PRPS":
+                                    for sc2, sps2, spe2, _ in iter_riff_chunks(full, sps + 4, spe):
+                                        if sc2 == b"PROP":
+                                            pid = struct.unpack_from("<I", full, sps2)[0]
+                                            evit_map22[(k, pid)] = bytes(full[sps2 + 8 : sps2 + 24])
+                checked22 = 0
+                for lt, items in tbls22:
+                    if lt == b"CTRS":
+                        for k, _, _, bp in items:
+                            tgt, pg, cg = bp[16:32], bp[32:48], bp[48:64]
+                            prop = struct.unpack_from("<I", bp, 64)[0]
+                            if prop > 20 and (tgt, prop) in evit_map22 and prms22.get(pg) in ("rpm", "rpms"):
+                                mg = evit_map22[(tgt, prop)]
+                                c_pts = curvs22.get(cg, [])
+                                m_pts = mpgs22.get(mg, [])
+                                assert c_pts and m_pts, f"{lbl22}: faltan puntos CURV/MAP en EVIT {tgt.hex()[:8]}"
+                                ratio = m_pts[-1][1] / c_pts[-1][0]
+                                assert abs(ratio - 1.0) < 1e-4, (
+                                    f"{lbl22}: desfase CURV/MAP en EVIT {tgt.hex()[:8]}: CURV={c_pts} MAP={m_pts} ratio={ratio}"
+                                )
+                                checked22 += 1
+                assert checked22 >= 6, f"{lbl22}: se esperaban >=6 reenvíos EVIT RPM, encontrados {checked22}"
+            print(f"   Porsche_963 + rss_mph_protech_p96_v8 verificado (CURV+MAP 1:1 exacto hasta {max_rpm_963:.0f} RPM en Jugador e IA)!")
+            del p96_b, p96_res_p, p96_res_ai
+
+    print("23. Verificando sonoridad exterior/replay AMS2 (3D Spatializer LinearSquared + Distance Filter + MBUS float gain sin saturación)...")
+    if ams2_root_20.is_dir():
+        import gc
+        gc.collect()
+        from ams2_sound_porter.porter_engine import (
+            AMS2_LIVE_REPLAY_PANNER,
+            _iter_proj_table_items,
+            _parse_pmef_param_offsets,
+            _select_primary_engine_events,
+        )
+        vm23 = VanillaVehicleManager(ams2_root=ams2_root_20)
+        vm23.scan_catalog()
+
+        def _inspect_ext_ev23(raw_b: bytes, ev_g: bytes):
+            pr = next(
+                raw_b[ps + 4 : pe]
+                for cid, ps, pe, _ in iter_riff_chunks(raw_b, 12, len(raw_b))
+                if cid == b"LIST" and raw_b[ps : ps + 4] == b"PROJ"
+            )
+            tbl = dict(_iter_proj_table_items(pr))
+            mbss = {g: full for g, full, _, _ in tbl.get(b"MBSS", ())}
+            befx = {g: (full, bp) for g, full, _, bp in tbl.get(b"BEFX", ())}
+            pefx = {g: (full, bp) for g, full, _, bp in tbl.get(b"PEFX", ())}
+            ev_bp = next(bp for g, _, _, bp in tbl[b"EVTS"] if g == ev_g)
+            mb_g = next(ev_bp[i : i + 16] for i in range(16, len(ev_bp) - 15) if ev_bp[i : i + 16] in mbss)
+            mf = mbss[mb_g]
+            bus_b = next(mf[sps:spe] for sc, sps, spe, _ in iter_riff_chunks(mf, 12, len(mf)) if sc == b"BUS ")
+            mvol = round(struct.unpack_from("<f", bus_b, len(bus_b) - 16)[0], 2)
+            pan3d = None
+            df_d = None
+            for i in range(0, len(mf) - 15):
+                w = mf[i : i + 16]
+                if w in befx and struct.unpack_from("<I", befx[w][1], 20)[0] == 27:
+                    pmef = next(befx[w][0][sps:spe] for sc, sps, spe, _ in iter_riff_chunks(befx[w][0], 12, len(befx[w][0])) if sc == b"PMEF")
+                    pm = _parse_pmef_param_offsets(pmef)
+                    if 17 in pm and float(pm[17][2]) > 0.5:
+                        pan3d = (
+                            int(pm[11][2]), round(float(pm[12][2]), 2), round(float(pm[13][2]), 2),
+                            int(pm[14][2]), round(float(pm[15][2]), 2), round(float(pm[16][2]), 2),
+                        )
+                elif w in pefx:
+                    pf, pb = pefx[w]
+                    nl = struct.unpack_from("<H", pb, 20)[0]
+                    if "distance filter" in pb[22 : 22 + nl].decode("ascii", errors="replace").lower():
+                        pmef = next(pf[sps:spe] for sc, sps, spe, _ in iter_riff_chunks(pf, 12, len(pf)) if sc == b"PMEF")
+                        pm = _parse_pmef_param_offsets(pmef)
+                        df_d = round(float(pm[0][2]), 1)
+            return mvol, pan3d, df_d
+
+        def _check_ext_case23(vid_kw: str, ac_bp: Path, exp_p_mindist: float) -> None:
+            if not ac_bp.is_file():
+                return
+            v_c = next((v for v in vm23._vehicles_cache if vid_kw in v.vehicle_id.lower()), None)
+            if not v_c or not v_c.ai_bank_path:
+                return
+            vm23.load_vehicle_events_info(v_c)
+            nat_p23 = vm23.backup_dir / v_c.vehicle_id / v_c.bank_path.name
+            if not nat_p23.is_file():
+                nat_p23 = v_c.bank_path
+            nat_ai23 = vm23.backup_dir / v_c.vehicle_id / v_c.ai_bank_path.name
+            if not nat_ai23.is_file():
+                nat_ai23 = v_c.ai_bank_path
+
+            ac_b23 = FmodBank(ac_bp, guids_path=ac_bp.parent / "GUIDs.txt" if (ac_bp.parent / "GUIDs.txt").is_file() else None)
+            _, orig_int_ev = _select_primary_engine_events(ac_b23)
+            orig_int_state = _inspect_ext_ev23(ac_b23.raw, orig_int_ev.guid_bytes)
+
+            r_p23 = build_direct_ported_bank_from_ac(
+                ac_bank=ac_b23, mod_identifier=v_c.car_name, standalone_guids=False,
+                target_role_guids=v_c.event_guids, target_role_paths=v_c.event_paths,
+                target_bank_guid=v_c.bank_guid or None, native_bank_path=nat_p23,
+                output_codec_mode=FSB5_MODE_PCM16, mute_secondary_pops=False, invert_spatial_cone=True,
+            )
+            assert_sndh_and_fsb_alignment(r_p23.bank_bytes)
+            assert_proj_tables_sorted(r_p23.bank_bytes)
+            p_int_s = _inspect_ext_ev23(r_p23.bank_bytes, guid_str_to_bytes(v_c.event_guids["EngineInt"]))
+            p_ext_s = _inspect_ext_ev23(r_p23.bank_bytes, guid_str_to_bytes(v_c.event_guids["EngineExt"]))
+            p_bytes_saved = r_p23.bank_bytes
+            del r_p23
+
+            r_ai23 = build_direct_ported_bank_from_ac(
+                ac_bank=ac_b23, mod_identifier=f"{v_c.car_name}_AI", standalone_guids=False,
+                target_role_guids=v_c.ai_event_guids, target_role_paths=v_c.ai_event_paths,
+                target_bank_guid=v_c.ai_bank_guid or None, target_role_buses=v_c.ai_event_buses,
+                native_bank_path=nat_ai23, output_codec_mode=FSB5_MODE_PCM16,
+                is_ai_bank=True, mute_secondary_pops=True, invert_spatial_cone=False,
+            )
+            del ac_b23
+            assert_sndh_and_fsb_alignment(r_ai23.bank_bytes)
+            assert_proj_tables_sorted(r_ai23.bank_bytes)
+            ai_live_s = _inspect_ext_ev23(r_ai23.bank_bytes, guid_str_to_bytes(v_c.ai_event_guids["ai_engine_live"]))
+            ai_main_s = _inspect_ext_ev23(r_ai23.bank_bytes, guid_str_to_bytes(v_c.ai_event_guids["ai_engine_main"]))
+            del r_ai23
+
+            assert p_int_s == orig_int_state, f"{v_c.car_name}: EngineInt no debe ser alterado!"
+            assert ai_live_s[1] == AMS2_LIVE_REPLAY_PANNER, f"{v_c.car_name}: AI_EngineMAIN_LIVE panner={ai_live_s[1]}"
+            assert ai_main_s[1][0] == 2 and ai_main_s[1][1] >= 7.0, f"{v_c.car_name}: AI_EngineMAIN panner={ai_main_s[1]}"
+            assert p_ext_s[1][0] == 2 and abs(p_ext_s[1][1] - exp_p_mindist) < 0.05, f"{v_c.car_name}: Player EngineExt minDist={p_ext_s[1]}"
+            assert p_ext_s[0] > 2.5 and abs(p_ext_s[0] - ai_live_s[0]) < 0.05, f"{v_c.car_name}: MBUS gain inconsistente: {p_ext_s[0]} vs {ai_live_s[0]}"
+            assert ai_live_s[2] is None or ai_live_s[2] >= 5000.0
+            assert p_ext_s[2] is None or p_ext_s[2] >= 3000.0
+
+            # Idempotencia al re-sincronizar IA desde banco Jugador ya porteado
+            re_src_b = FmodBank(raw=p_bytes_saved)
+            del p_bytes_saved
+            gc.collect()
+            r_ai23_re = build_direct_ported_bank_from_ac(
+                ac_bank=re_src_b, mod_identifier=f"{v_c.car_name}_AI", standalone_guids=False,
+                target_role_guids=v_c.ai_event_guids, target_role_paths=v_c.ai_event_paths,
+                target_bank_guid=v_c.ai_bank_guid or None, target_role_buses=v_c.ai_event_buses,
+                native_bank_path=nat_ai23, output_codec_mode=None, is_ai_bank=True, mute_secondary_pops=True,
+            )
+            del re_src_b
+            ai_live_re = _inspect_ext_ev23(r_ai23_re.bank_bytes, guid_str_to_bytes(v_c.ai_event_guids["ai_engine_live"]))
+            del r_ai23_re
+            assert abs(ai_live_re[0] - ai_live_s[0]) < 0.05 and ai_live_re[1] == ai_live_s[1], (
+                f"{v_c.car_name}: re-sync IA no es idempotente ({ai_live_s[0]} -> {ai_live_re[0]})"
+            )
+
+        for vid_kw, ac_bp, exp_p_mindist in (
+            ("c_corvette_c8_gt3r", Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_gtm_cortex_v8\sfx\rss_gtm_cortex_v8.bank"), 7.0),
+            ("formula_3_f3_sudam", Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\tatuus_f3_t_318\sfx\tatuus_f3_t_318.bank"), 30.0),
+            ("porsche_963", Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_mph_protech_p96_v8\sfx\rss_mph_protech_p96_v8.bank"), 7.0),
+        ):
+            _check_ext_case23(vid_kw, ac_bp, exp_p_mindist)
+            gc.collect()
+        print("   Sonoridad exterior/replay AMS2 (LinearSquared 1..300m, Distance Filter, MBUS float gain e idempotencia) verificada al 100%!")
 
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 

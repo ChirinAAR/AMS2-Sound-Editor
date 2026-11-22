@@ -31,6 +31,8 @@ from .porter_engine import (
     SlotMappingConfig,
     SourceAudioLibrary,
     ThrottleCutConfig,
+    _extract_native_engine_max_rpm,
+    apply_band_edits_to_bank,
     apply_ported_bank_to_csdbin,
     auto_detect_throttle_cut_config,
     auto_distribute_rpm_bands,
@@ -40,10 +42,13 @@ from .porter_engine import (
     build_direct_ported_bank_from_ac,
     build_mod_event_paths,
     build_ported_bank,
+    collect_vanilla_scope_targets,
     estimate_engine_rpm_bounds,
     export_ams2_mod_package,
+    merge_ported_events_into_native_bank,
     sync_faithful_assetto_corsa_setup,
     sync_faithful_section_from_source,
+    uninvert_spatial_cone_in_bank_bytes,
 )
 
 
@@ -184,14 +189,23 @@ class SoundPorterApp(tk.Tk):
         self.vanilla_auto_backup_var = tk.BooleanVar(value=True)
         self.vanilla_sync_ai_var = tk.BooleanVar(value=True)
         self.vanilla_mute_pops_var = tk.BooleanVar(value=True)
+        self.vanilla_audio_scope_var = tk.StringVar(value="full")
+        self.vanilla_scope_hint_var = tk.StringVar(
+            value="Replaces both onboard interior audio and exterior / chase / replay audio."
+        )
         self.mute_all_pops_var = tk.BooleanVar(value=True)
         self.invert_cone_var = tk.BooleanVar(value=True)
         self.vanilla_filtered_vehicles: list[VanillaVehicle] = []
         self.vanilla_export_dest_var = tk.StringVar(value="Ningún vehículo vanilla seleccionado.")
 
-        # Estado de navegación y vista simplificada (4 vistas)
+        # Estado de navegación y vista simplificada
         self._current_view: str = "menu"
         self._test_return_view: str = "custom"
+        self._editing_modified_vanilla: bool = False
+        self._modified_edit_vehicle: VanillaVehicle | None = None
+        self._modified_vehicles_list: list[VanillaVehicle] = []
+        self.modified_search_var = tk.StringVar(value="")
+        self.modified_count_var = tk.StringVar(value="Select a modified sound to edit its RPM bands.")
         self._pending_guids_path: Path | None = None
         self.ui_bank_check_var = tk.StringVar(value="○")
         self.ui_bank_status_var = tk.StringVar(value=".bank : Not selected")
@@ -435,12 +449,14 @@ class SoundPorterApp(tk.Tk):
         self.view_menu = ttk.Frame(self.view_container, style="TFrame")
         self.view_custom = ttk.Frame(self.view_container, style="TFrame")
         self.view_vanilla = ttk.Frame(self.view_container, style="TFrame")
+        self.view_modified = ttk.Frame(self.view_container, style="TFrame")
         self.view_test_edit = ttk.Frame(self.view_container, style="TFrame")
         self.view_csdbin = ttk.Frame(self.view_container, style="TFrame")
 
         self._build_view_menu()
         self._build_view_custom()
         self._build_view_vanilla()
+        self._build_view_modified()
         self._build_view_test_edit()
         self._build_view_csdbin()
 
@@ -467,24 +483,41 @@ class SoundPorterApp(tk.Tk):
         self._build_tab_export()
 
     def show_view(self, view_name: str) -> None:
-        """Cambia la vista activa entre 'menu', 'custom', 'vanilla', 'test_edit' y 'csdbin'."""
+        """Cambia la vista activa entre 'menu', 'custom', 'vanilla', 'modified', 'test_edit' y 'csdbin'."""
         self._current_view = view_name
-        for vf in (self.view_menu, self.view_custom, self.view_vanilla, self.view_test_edit, self.view_csdbin):
+        for vf in (
+            self.view_menu,
+            self.view_custom,
+            self.view_vanilla,
+            self.view_modified,
+            self.view_test_edit,
+            self.view_csdbin,
+        ):
             vf.pack_forget()
 
         if view_name == "menu":
+            self._editing_modified_vanilla = False
             self.view_menu.pack(fill="both", expand=True)
         elif view_name == "custom":
+            self._editing_modified_vanilla = False
             self.target_mode_var.set("mod")
             self.port_mode_var.set("direct")
             self._on_target_mode_changed()
             self.view_custom.pack(fill="both", expand=True)
         elif view_name == "vanilla":
+            self._editing_modified_vanilla = False
             self.target_mode_var.set("vanilla")
             self.port_mode_var.set("direct")
             self._on_target_mode_changed()
             self.view_vanilla.pack(fill="both", expand=True)
+        elif view_name == "modified":
+            self._editing_modified_vanilla = False
+            self.target_mode_var.set("vanilla")
+            self.port_mode_var.set("direct")
+            self._refresh_modified_sounds_list()
+            self.view_modified.pack(fill="both", expand=True)
         elif view_name == "test_edit":
+            self._sync_test_edit_header_mode()
             self.view_test_edit.pack(fill="both", expand=True)
             self._refresh_rpm_tab()
             self.after(20, self._draw_rpm_bands_canvas)
@@ -523,7 +556,7 @@ class SoundPorterApp(tk.Tk):
             width=30,
             command=lambda: self.show_view("custom"),
             **btn_opts,
-        ).pack(pady=(0, 26))
+        ).pack(pady=(0, 20))
 
         tk.Button(
             outer,
@@ -531,7 +564,15 @@ class SoundPorterApp(tk.Tk):
             width=30,
             command=lambda: self.show_view("vanilla"),
             **btn_opts,
-        ).pack(pady=(0, 34))
+        ).pack(pady=(0, 20))
+
+        tk.Button(
+            outer,
+            text="Edit modified sounds",
+            width=30,
+            command=lambda: self.show_view("modified"),
+            **btn_opts,
+        ).pack(pady=(0, 32))
 
         tk.Button(
             outer,
@@ -771,9 +812,76 @@ class SoundPorterApp(tk.Tk):
         self.vanilla_combo.grid(row=2, column=2, sticky="w", pady=12)
         self.vanilla_combo.bind("<<ComboboxSelected>>", self._on_vanilla_vehicle_selected)
 
+        # Row 4: Audio to replace (Full / Interior only / Exterior only)
+        tk.Label(rows, text="4)", bg=BG_DARK, fg="#f1f5f9", font=("Segoe UI", 15)).grid(
+            row=3, column=0, sticky="nw", padx=(0, 12), pady=(16, 8)
+        )
+        tk.Label(
+            rows,
+            text="Audio to replace:",
+            bg=BG_DARK,
+            fg="#f1f5f9",
+            font=("Segoe UI", 12, "bold"),
+        ).grid(row=3, column=1, sticky="nw", padx=(0, 26), pady=(18, 8))
+
+        scope_box = tk.Frame(
+            rows,
+            bg=BG_CARD,
+            bd=1,
+            relief="solid",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+            padx=14,
+            pady=10,
+        )
+        scope_box.grid(row=3, column=2, sticky="w", pady=(12, 8))
+
+        rb_opts = {
+            "bg": BG_CARD,
+            "fg": "#f1f5f9",
+            "activebackground": BG_CARD,
+            "activeforeground": "#ffffff",
+            "selectcolor": BG_INPUT,
+            "font": ("Segoe UI", 11),
+            "cursor": "hand2",
+            "anchor": "w",
+        }
+        tk.Radiobutton(
+            scope_box,
+            text="Full (Interior & Exterior)",
+            variable=self.vanilla_audio_scope_var,
+            value="full",
+            command=self._on_vanilla_scope_changed,
+            **rb_opts,
+        ).pack(anchor="w", pady=(0, 4))
+        tk.Radiobutton(
+            scope_box,
+            text="Interior only (Onboard)",
+            variable=self.vanilla_audio_scope_var,
+            value="interior",
+            command=self._on_vanilla_scope_changed,
+            **rb_opts,
+        ).pack(anchor="w", pady=(0, 4))
+        tk.Radiobutton(
+            scope_box,
+            text="Exterior only (Chase & Replays)",
+            variable=self.vanilla_audio_scope_var,
+            value="exterior",
+            command=self._on_vanilla_scope_changed,
+            **rb_opts,
+        ).pack(anchor="w")
+
+        tk.Label(
+            rows,
+            textvariable=self.vanilla_scope_hint_var,
+            bg=BG_DARK,
+            fg=FG_MUTED,
+            font=("Segoe UI", 10),
+        ).grid(row=4, column=2, sticky="w", pady=(2, 0))
+
         # Acciones inferiores
         actions = ttk.Frame(body, style="TFrame")
-        actions.pack(anchor="w", pady=(34, 0))
+        actions.pack(anchor="w", pady=(26, 0))
         self.btn_vanilla_import = tk.Button(
             actions,
             text="Import sound",
@@ -823,17 +931,149 @@ class SoundPorterApp(tk.Tk):
             pady=6,
         ).pack(side="left")
 
+    def _build_view_modified(self) -> None:
+        hdr = tk.Frame(self.view_modified, bg="#080c13", padx=20, pady=14)
+        hdr.pack(fill="x", side="top")
+        tk.Label(
+            hdr,
+            text="Edit modified sounds",
+            bg="#080c13",
+            fg="#ffffff",
+            font=("Segoe UI", 22, "bold"),
+        ).pack(side="left")
+
+        right_hdr = tk.Frame(hdr, bg="#080c13")
+        right_hdr.pack(side="right")
+        tk.Label(
+            right_hdr,
+            text="Game directory:",
+            bg="#080c13",
+            fg="#f1f5f9",
+            font=("Segoe UI", 11),
+        ).pack(side="left", padx=(0, 8))
+        ttk.Entry(right_hdr, textvariable=self.vanilla_ams2_path_var, width=42).pack(side="left", padx=(0, 8))
+        tk.Button(
+            right_hdr,
+            text="Browse...",
+            command=self.cmd_browse_ams2_path,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            padx=12,
+            pady=3,
+        ).pack(side="left", padx=(0, 12))
+        ttk.Button(
+            right_hdr,
+            text="← Menu",
+            command=lambda: self.show_view("menu"),
+        ).pack(side="left")
+
+        body = ttk.Frame(self.view_modified, style="TFrame", padding=(36, 20))
+        body.pack(fill="both", expand=True)
+
+        info_row = ttk.Frame(body, style="TFrame")
+        info_row.pack(fill="x", pady=(0, 12))
+        tk.Label(
+            info_row,
+            textvariable=self.modified_count_var,
+            bg=BG_DARK,
+            fg="#e2e8f0",
+            font=("Segoe UI", 12),
+        ).pack(side="left")
+
+        search_row = ttk.Frame(body, style="TFrame")
+        search_row.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            search_row,
+            text="Search:",
+            bg=BG_DARK,
+            fg="#cbd5e1",
+            font=("Segoe UI", 11),
+        ).pack(side="left", padx=(0, 8))
+        mod_search_ent = ttk.Entry(search_row, textvariable=self.modified_search_var, width=40)
+        mod_search_ent.pack(side="left", padx=(0, 12))
+        mod_search_ent.bind("<KeyRelease>", lambda _e: self._filter_modified_sounds_tree())
+        ttk.Button(
+            search_row,
+            text="↻ Refresh",
+            command=self._refresh_modified_sounds_list,
+        ).pack(side="left")
+
+        tree_frame = ttk.Frame(body, style="Panel.TFrame")
+        tree_frame.pack(fill="both", expand=True, pady=(0, 16))
+        mcols = ("veh", "file", "scope", "ai", "date", "backup")
+        self.modified_tree = ttk.Treeview(tree_frame, columns=mcols, show="headings", selectmode="browse")
+        self.modified_tree.heading("veh", text="Modified Vehicle")
+        self.modified_tree.heading("file", text="Game File")
+        self.modified_tree.heading("scope", text="Audio Scope")
+        self.modified_tree.heading("ai", text="AI / Replay Bank")
+        self.modified_tree.heading("date", text="Modified Date")
+        self.modified_tree.heading("backup", text="Original Backup")
+        self.modified_tree.column("veh", width=230, anchor="w")
+        self.modified_tree.column("file", width=220, anchor="w")
+        self.modified_tree.column("scope", width=130, anchor="center")
+        self.modified_tree.column("ai", width=150, anchor="center")
+        self.modified_tree.column("date", width=155, anchor="center")
+        self.modified_tree.column("backup", width=155, anchor="center")
+        mod_vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.modified_tree.yview)
+        self.modified_tree.configure(yscrollcommand=mod_vsb.set)
+        self.modified_tree.pack(side="left", fill="both", expand=True)
+        mod_vsb.pack(side="right", fill="y")
+        self.modified_tree.bind("<Double-1>", lambda _e: self.cmd_open_modified_vehicle_editor())
+
+        actions = ttk.Frame(body, style="TFrame")
+        actions.pack(fill="x")
+        self.btn_modified_edit = tk.Button(
+            actions,
+            text="Edit sound bands",
+            command=self.cmd_open_modified_vehicle_editor,
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 14),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=24,
+            pady=6,
+        )
+        self.btn_modified_edit.pack(side="left", padx=(0, 20))
+
+        tk.Button(
+            actions,
+            text="Restore original sounds",
+            command=self.cmd_open_vanilla_restore_dialog,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 13),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=22,
+            pady=6,
+        ).pack(side="left")
+
     def _build_view_test_edit(self) -> None:
         hdr = tk.Frame(self.view_test_edit, bg="#080c13", padx=16, pady=10)
         hdr.pack(fill="x", side="top")
-        tk.Label(
+        self.test_edit_title_lbl = tk.Label(
             hdr,
             text="Test/edit Sounds",
             bg="#080c13",
             fg="#ffffff",
             font=("Segoe UI", 22, "bold"),
-        ).pack(side="left")
-        tk.Button(
+        )
+        self.test_edit_title_lbl.pack(side="left")
+
+        self.btn_test_edit_finish = tk.Button(
             hdr,
             text="Finish",
             command=self.cmd_finish_test_edit,
@@ -847,7 +1087,39 @@ class SoundPorterApp(tk.Tk):
             cursor="hand2",
             width=18,
             pady=4,
-        ).pack(side="right")
+        )
+        self.btn_test_edit_finish.pack(side="right")
+
+        self.btn_test_edit_confirm = tk.Button(
+            hdr,
+            text="Confirm",
+            command=self.cmd_confirm_modified_edit,
+            bg=ACCENT_GREEN,
+            fg="#ffffff",
+            activebackground=ACCENT_GREEN_HOVER,
+            activeforeground="#ffffff",
+            font=("Segoe UI", 14, "bold"),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=18,
+            pady=4,
+        )
+        self.btn_test_edit_back = tk.Button(
+            hdr,
+            text="← Back",
+            command=self.cmd_cancel_modified_edit,
+            bg=BG_CARD,
+            fg="#f1f5f9",
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 13),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            width=14,
+            pady=4,
+        )
 
         content = ttk.Frame(self.view_test_edit, style="Panel.TFrame", padding=(10, 6))
         content.pack(fill="both", expand=True)
@@ -1123,7 +1395,7 @@ class SoundPorterApp(tk.Tk):
             self.ui_csdbin_status_var.set(".csdbin : Not selected")
 
     def _set_import_buttons_state(self, state: str) -> None:
-        for attr in ("btn_export", "btn_custom_import", "btn_vanilla_import"):
+        for attr in ("btn_export", "btn_custom_import", "btn_vanilla_import", "btn_test_edit_confirm"):
             btn = getattr(self, attr, None)
             if btn is not None:
                 btn.config(state=state)
@@ -1194,6 +1466,21 @@ class SoundPorterApp(tk.Tk):
             self.status_var.set("✔ .csdbin parameters updated (bank/event links remain automatic on import).")
         self.show_view("custom")
 
+    def _sync_test_edit_header_mode(self) -> None:
+        """Alterna la cabecera de Test/edit Sounds entre modo normal ('Finish') y edición de modificados ('Confirm')."""
+        self.btn_test_edit_finish.pack_forget()
+        self.btn_test_edit_confirm.pack_forget()
+        self.btn_test_edit_back.pack_forget()
+        if self._editing_modified_vanilla and self._modified_edit_vehicle is not None:
+            self.test_edit_title_lbl.config(
+                text=f"Edit Modified Sound — {self._modified_edit_vehicle.display_name}"
+            )
+            self.btn_test_edit_confirm.pack(side="right")
+            self.btn_test_edit_back.pack(side="right", padx=(0, 12))
+        else:
+            self.test_edit_title_lbl.config(text="Test/edit Sounds")
+            self.btn_test_edit_finish.pack(side="right")
+
     def cmd_open_test_edit(self, return_view: str) -> None:
         if self.source_lib is None or self.source_lib.fmod_bank is None:
             messagebox.showwarning(
@@ -1201,12 +1488,336 @@ class SoundPorterApp(tk.Tk):
                 "Please select an Assetto Corsa .bank file first (Step 1).",
             )
             return
+        self._editing_modified_vanilla = False
+        self._modified_edit_vehicle = None
         self._test_return_view = return_view
         self.show_view("test_edit")
 
     def cmd_finish_test_edit(self) -> None:
         self.stop_audio_preview()
+        self._editing_modified_vanilla = False
         self.show_view(self._test_return_view or "menu")
+
+    def _on_vanilla_scope_changed(self) -> None:
+        scope = self.vanilla_audio_scope_var.get()
+        hints = {
+            "full": "Replaces both onboard interior audio and exterior / chase / replay audio.",
+            "interior": "Replaces only onboard interior audio. Exterior, chase camera, and replays stay vanilla.",
+            "exterior": "Replaces only exterior, chase camera, and replay audio. Onboard interior audio stays vanilla.",
+        }
+        self.vanilla_scope_hint_var.set(hints.get(scope, hints["full"]))
+
+    @staticmethod
+    def _format_audio_scope_label(scope: str, detailed: bool = False) -> str:
+        if detailed:
+            return {
+                "full": "Full (Interior & Exterior)",
+                "interior": "Interior only (Onboard — Exterior & Replays stay vanilla)",
+                "exterior": "Exterior only (Chase & Replays — Interior stays vanilla)",
+            }.get(scope, "Full (Interior & Exterior)")
+        return {
+            "full": "Full",
+            "interior": "Interior only",
+            "exterior": "Exterior only",
+        }.get(scope, "Full")
+
+    def _refresh_modified_sounds_list(self) -> None:
+        """Re-escanea el catálogo vanilla y actualiza la lista de sonidos ya modificados."""
+        if not hasattr(self, "vanilla_mgr"):
+            return
+        self.vanilla_mgr.scan_catalog(force=True)
+        self._modified_vehicles_list = self.vanilla_mgr.get_modified_vehicles()
+        self._filter_modified_sounds_tree()
+
+    def _filter_modified_sounds_tree(self) -> None:
+        if not hasattr(self, "modified_tree"):
+            return
+        for item in self.modified_tree.get_children():
+            self.modified_tree.delete(item)
+        q = self.modified_search_var.get().strip().lower()
+        filtered = [
+            v
+            for v in self._modified_vehicles_list
+            if not q
+            or q in v.display_name.lower()
+            or q in v.brand.lower()
+            or q in v.car_name.lower()
+            or q in v.bank_path.name.lower()
+        ]
+        total = len(self._modified_vehicles_list)
+        if total == 0:
+            self.modified_count_var.set("No modified vehicle sounds detected in the selected AMS2 directory.")
+            self.modified_tree.insert(
+                "",
+                "end",
+                iid="__empty__",
+                values=("(No modified sounds found)", "—", "—", "—", "—", "—"),
+            )
+            return
+        if q:
+            self.modified_count_var.set(
+                f"Showing {len(filtered)} of {total} modified vehicle sound(s). Select one to edit its RPM bands."
+            )
+        else:
+            self.modified_count_var.set(
+                f"{total} modified vehicle sound(s) found. Select one and click 'Edit sound bands' (or double-click)."
+            )
+        for v in filtered:
+            scope_val = getattr(v, "modified_scope", "full") or "full"
+            scope_txt = self._format_audio_scope_label(scope_val, detailed=False)
+            if v.ai_bank_path and v.ai_bank_path.is_file():
+                ai_txt = "Kept vanilla" if scope_val == "interior" else "Synced (_AI.bank)"
+            else:
+                ai_txt = "Single bank"
+            date_str = (v.backup_timestamp[:19].replace("T", " ")) if v.backup_timestamp else "Modified"
+            backup_txt = "Protected (SHA256)" if v.original_sha256 else ".orig backup"
+            self.modified_tree.insert(
+                "",
+                "end",
+                iid=v.vehicle_id,
+                values=(v.display_name, v.bank_path.name, scope_txt, ai_txt, date_str, backup_txt),
+            )
+        children = self.modified_tree.get_children()
+        if children and children[0] != "__empty__":
+            self.modified_tree.selection_set(children[0])
+
+    def cmd_open_modified_vehicle_editor(self, veh: VanillaVehicle | None = None) -> None:
+        """Carga el .bank ya modificado del vehículo seleccionado en el editor de bandas (Test/edit Sounds)."""
+        if veh is None:
+            sel = self.modified_tree.selection() if hasattr(self, "modified_tree") else ()
+            if not sel or sel[0] == "__empty__":
+                messagebox.showwarning(
+                    "No Vehicle Selected",
+                    "Please select a modified vehicle from the list first.",
+                )
+                return
+            veh = self.vanilla_mgr.get_vehicle_by_id(sel[0])
+        if veh is None or not veh.bank_path.is_file():
+            messagebox.showerror(
+                "Sound File Missing",
+                "Could not locate the modified .bank file for the selected vehicle.",
+            )
+            return
+        try:
+            self.stop_audio_preview()
+            self.vanilla_mgr.load_vehicle_events_info(veh)
+            lib = SourceAudioLibrary.from_bank(veh.bank_path)
+            if lib.fmod_bank is None:
+                raise RuntimeError("The selected modified .bank could not be parsed as an FMOD bank.")
+
+            self.source_lib = lib
+            self.vanilla_selected_vehicle = veh
+            self._modified_edit_vehicle = veh
+            self._editing_modified_vanilla = True
+            self._test_return_view = "modified"
+            self.port_mode_var.set("direct")
+            self.target_mode_var.set("vanilla")
+            self._selected_band_idx = None
+            self._selected_donor_gidx = None
+
+            self.rpm_bands = build_default_rpm_bands(lib.fmod_bank)
+            self.mappings = [
+                SlotMappingConfig(sl.global_index, action="keep_donor")
+                for sl in lib.fmod_bank.slots
+            ]
+            self.throttle_cut_cfg = auto_detect_throttle_cut_config(lib.fmod_bank, lib)
+            self._sync_tcut_ui_from_cfg()
+            est_idle, est_max = estimate_engine_rpm_bounds(lib.fmod_bank, lib)
+            self.sim_idle_rpm_var.set(f"{est_idle:.0f}")
+            self.sim_max_rpm_var.set(f"{est_max:.0f}")
+
+            self._refresh_source_tree()
+            self._refresh_source_combobox_items()
+            self._update_donor_tree_headings()
+            self._refresh_donor_tree()
+            self.status_var.set(
+                f"✔ Loaded '{veh.display_name}' ({len(self.rpm_bands)} RPM bands). "
+                "Adjust bands and click 'Confirm' to inject into AMS2."
+            )
+            self.show_view("test_edit")
+        except Exception as exc:
+            self._editing_modified_vanilla = False
+            self._modified_edit_vehicle = None
+            messagebox.showerror("Error loading modified sound", str(exc))
+
+    def cmd_cancel_modified_edit(self) -> None:
+        self.stop_audio_preview()
+        self._editing_modified_vanilla = False
+        self.show_view("modified")
+
+    def cmd_confirm_modified_edit(self) -> None:
+        """Aplica los cambios de bandas del editor y re-inyecta el sonido modificado en Automobilista 2."""
+        self.stop_audio_preview()
+        veh = self._modified_edit_vehicle
+        if veh is None or self.source_lib is None or self.source_lib.fmod_bank is None:
+            messagebox.showwarning(
+                "No Modified Sound Loaded",
+                "Please select a modified vehicle first.",
+            )
+            return
+
+        self._set_import_buttons_state("disabled")
+        self.progress.start(12)
+        self.status_var.set(f"⏳ Applying band changes and injecting into '{veh.display_name}'...")
+        self._append_log("\n----------------------------------------------------------------------")
+        self._append_log(f"Aplicando ediciones de bandas sobre sonido modificado '{veh.display_name}'...")
+
+        player_bank = self.source_lib.fmod_bank
+        source_lib_snap = self.source_lib
+        player_bands = list(self.rpm_bands) if self.rpm_bands else None
+        mappings_snap = list(self.mappings) if self.mappings else None
+        sync_ai = self.vanilla_sync_ai_var.get()
+        mute_pops = self.vanilla_mute_pops_var.get()
+        invert_cone = self.invert_cone_var.get()
+        mod_scope = getattr(veh, "modified_scope", "full") or "full"
+
+        def worker() -> None:
+            try:
+                self.vanilla_mgr.load_vehicle_events_info(veh)
+                updated_player_bytes = apply_band_edits_to_bank(
+                    bank=player_bank,
+                    rpm_bands=player_bands,
+                    mappings=mappings_snap,
+                    library=source_lib_snap,
+                )
+
+                ai_bytes: bytes | None = None
+                if mod_scope != "interior" and sync_ai and veh.ai_bank_path and veh.ai_event_guids:
+                    ai_src_bytes = (
+                        uninvert_spatial_cone_in_bank_bytes(updated_player_bytes)
+                        if invert_cone
+                        else updated_player_bytes
+                    )
+                    ai_src_bank = FmodBank(raw=ai_src_bytes)
+                    ai_bands = build_default_rpm_bands(ai_src_bank)
+                    if mute_pops and ai_bands:
+                        clean_ai_bands: list[RpmBandConfig] = []
+                        for b in ai_bands:
+                            if getattr(b, "load_role", "") in ("pops", "throttle_cut"):
+                                clean_ai_bands.append(
+                                    RpmBandConfig(
+                                        band_id=b.band_id,
+                                        pml_guid=b.pml_guid,
+                                        event_guid=b.event_guid,
+                                        box_index=b.box_index,
+                                        event_role=b.event_role,
+                                        perspective=b.perspective,
+                                        load_role=b.load_role,
+                                        donor_slot_indices=list(b.donor_slot_indices),
+                                        donor_label=b.donor_label,
+                                        rpm_min=0.0,
+                                        rpm_max=0.0,
+                                        fade_in_end=0.0,
+                                        fade_out_start=0.0,
+                                        orig_rpm_min=b.orig_rpm_min,
+                                        orig_rpm_max=b.orig_rpm_max,
+                                        orig_fade_in_end=b.orig_fade_in_end,
+                                        orig_fade_out_start=b.orig_fade_out_start,
+                                        fade_in_curv_guid=b.fade_in_curv_guid,
+                                        fade_out_curv_guid=b.fade_out_curv_guid,
+                                        bus_rpm_cutoff=b.bus_rpm_cutoff,
+                                        is_muted_bus=True,
+                                        is_fill_layer=b.is_fill_layer,
+                                    )
+                                )
+                            else:
+                                clean_ai_bands.append(b)
+                        ai_bands = clean_ai_bands
+
+                    veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
+                    nat_ai_p = (
+                        veh_backup_folder / veh.ai_bank_path.name
+                        if (veh_backup_folder / veh.ai_bank_path.name).is_file()
+                        else (
+                            veh.ai_bank_path.parent / f"{veh.ai_bank_path.name}.orig"
+                            if (veh.ai_bank_path.parent / f"{veh.ai_bank_path.name}.orig").is_file()
+                            else veh.ai_bank_path
+                        )
+                    )
+                    ai_res = build_direct_ported_bank_from_ac(
+                        ac_bank=ai_src_bank,
+                        mod_identifier=f"{veh.car_name}_AI",
+                        standalone_guids=False,
+                        target_role_guids=veh.ai_event_guids,
+                        target_role_paths=veh.ai_event_paths,
+                        target_bank_guid=veh.ai_bank_guid or None,
+                        target_role_buses=getattr(veh, "ai_event_buses", None),
+                        rpm_bands=ai_bands,
+                        is_ai_bank=True,
+                        mute_secondary_pops=mute_pops,
+                        native_bank_path=(nat_ai_p if nat_ai_p.is_file() else None),
+                        invert_spatial_cone=False,
+                        output_codec_mode=None,
+                        prune_unused_samples=False,
+                        extra_role_variants=getattr(veh, "extra_ai_event_variants", None) or None,
+                        prefer_throttle_param=bool(getattr(veh, "prefers_throttle_ai", False)),
+                        target_max_rpm=0.0,
+                    )
+                    if mod_scope == "exterior":
+                        rep_ai, sil_ai, pmap_ai, _ = collect_vanilla_scope_targets(veh, ai_src_bank, "exterior", is_ai=True)
+                        if nat_ai_p.is_file() and rep_ai:
+                            ai_bytes = merge_ported_events_into_native_bank(
+                                native_bank=FmodBank(nat_ai_p),
+                                ported_bank=FmodBank(raw=ai_res.bank_bytes),
+                                replace_event_guids=rep_ai,
+                                silence_native_event_guids=sil_ai,
+                                event_paths_map=pmap_ai,
+                                mod_identifier=f"{veh.car_name}_AI",
+                                seed_tag="hybrid:ai:exterior",
+                            )
+                        else:
+                            ai_bytes = ai_res.bank_bytes
+                    else:
+                        ai_bytes = ai_res.bank_bytes
+
+                ok, msg = self.vanilla_mgr.install_sound(
+                    vehicle=veh,
+                    bank_bytes=updated_player_bytes,
+                    ai_bank_bytes=ai_bytes,
+                    audio_scope=mod_scope,
+                )
+                if not ok:
+                    raise RuntimeError(msg)
+
+                self.dispatch_to_ui(
+                    self._on_confirm_modified_edit_success,
+                    veh,
+                    len(updated_player_bytes),
+                    len(ai_bytes) if ai_bytes else 0,
+                    msg,
+                )
+            except Exception as exc:
+                err_str = str(exc)
+                self.dispatch_to_ui(self._on_export_error, f"Error updating modified sound: {err_str}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_confirm_modified_edit_success(
+        self,
+        veh: VanillaVehicle,
+        player_bytes: int,
+        ai_bytes: int,
+        msg: str,
+    ) -> None:
+        self.progress.stop()
+        self._set_import_buttons_state("normal")
+        self._editing_modified_vanilla = False
+        self._append_log(f"✔ ¡Sonido modificado actualizado e inyectado en '{veh.display_name}'!")
+        self._append_log(f"  Player .bank: {veh.bank_path} ({player_bytes / (1024 * 1024):.2f} MB)")
+        if ai_bytes > 0 and veh.ai_bank_path:
+            self._append_log(f"  AI/Replay .bank: {veh.ai_bank_path} ({ai_bytes / (1024 * 1024):.2f} MB)")
+        self.status_var.set(f"✅ Updated sound successfully injected into '{veh.display_name}'!")
+        self._populate_vanilla_vehicles_list(select_id=veh.vehicle_id)
+        self.show_view("modified")
+        ai_line = f"• AI / Replay bank: Updated ({ai_bytes:,} bytes)\n" if ai_bytes > 0 else ""
+        messagebox.showinfo(
+            "Modified Sound Updated!",
+            f"Your band changes have been injected into '{veh.display_name}'.\n\n"
+            f"• Player bank: {veh.bank_path.name} ({player_bytes:,} bytes)\n"
+            f"{ai_line}"
+            f"• Original Steam backup: Preserved intact\n\n"
+            f"The updated sound is ready to use in Automobilista 2.",
+        )
 
     def cmd_open_vanilla_car_picker(self) -> None:
         """Abre un selector rápido con búsqueda para elegir el vehículo vanilla de AMS2."""
@@ -5072,6 +5683,8 @@ class SoundPorterApp(tk.Tk):
     def cmd_rescan_vanilla_catalog(self) -> None:
         self.vanilla_mgr.scan_catalog(force=True)
         self._populate_vanilla_vehicles_list()
+        if self._current_view == "modified":
+            self._refresh_modified_sounds_list()
         self.status_var.set(
             f"✔ Catálogo re-escaneado: {len(self.vanilla_mgr._vehicles_cache)} vehículos vanilla disponibles."
         )
@@ -5246,6 +5859,8 @@ class SoundPorterApp(tk.Tk):
                     messagebox.showinfo("Restored", msg, parent=dlg)
                     refresh_tree()
                     self._populate_vanilla_vehicles_list()
+                    if self._current_view == "modified":
+                        self._refresh_modified_sounds_list()
                 else:
                     messagebox.showerror("Error", msg, parent=dlg)
 
@@ -5263,6 +5878,8 @@ class SoundPorterApp(tk.Tk):
             s_cnt, f_cnt, msgs = self.vanilla_mgr.restore_all()
             refresh_tree()
             self._populate_vanilla_vehicles_list()
+            if self._current_view == "modified":
+                self._refresh_modified_sounds_list()
             messagebox.showinfo("Done", f"Successfully restored {s_cnt} vehicle(s).", parent=dlg)
 
         ttk.Button(
@@ -5464,11 +6081,32 @@ class SoundPorterApp(tk.Tk):
             )
             return
 
+        audio_scope = self.vanilla_audio_scope_var.get()
+        if audio_scope not in ("full", "interior", "exterior"):
+            audio_scope = "full"
+        scope_detail_lbl = self._format_audio_scope_label(audio_scope, detailed=True)
+
         if self.is_direct_ac_mode:
             if not self.source_lib or not self.source_lib.fmod_bank:
                 messagebox.showwarning(
                     "Missing Assetto Corsa Bank",
                     "Please select an Assetto Corsa .bank file in Step 1 before importing.",
+                )
+                return
+            ac_roles = {ev.role for ev in self.source_lib.fmod_bank.events}
+            ac_paths_l = " ".join((ev.path or "").lower() for ev in self.source_lib.fmod_bank.events)
+            if audio_scope == "interior" and "EngineInt" not in ac_roles and "_int" not in ac_paths_l and "cockpit" not in ac_paths_l:
+                messagebox.showwarning(
+                    "Missing Interior Audio in Source Bank",
+                    "The selected Assetto Corsa .bank file does not appear to contain an interior (onboard) engine event.\n\n"
+                    "Please select another source .bank or choose a different audio scope.",
+                )
+                return
+            if audio_scope == "exterior" and "EngineExt" not in ac_roles and "_ext" not in ac_paths_l and "exterior" not in ac_paths_l:
+                messagebox.showwarning(
+                    "Missing Exterior Audio in Source Bank",
+                    "The selected Assetto Corsa .bank file does not appear to contain an exterior engine event.\n\n"
+                    "Please select another source .bank or choose a different audio scope.",
                 )
                 return
         else:
@@ -5487,6 +6125,7 @@ class SoundPorterApp(tk.Tk):
             f"Do you want to import the new sound into the official vehicle:\n\n"
             f"'{veh.display_name}'?\n\n"
             f"• File: {veh.bank_path}\n"
+            f"• Audio Scope: {scope_detail_lbl}\n"
             f"• Mode: {'Direct AC Transmutation (100% Faithful)' if self.is_direct_ac_mode else 'Donor Mapping'}\n\n"
             f"🛡️ A safe backup (SHA256) will be created automatically before modifying anything.\n"
             f"You can restore the original Steam sound at any time with one click.",
@@ -5497,13 +6136,13 @@ class SoundPorterApp(tk.Tk):
         self._set_import_buttons_state("disabled")
         self.progress.start(12)
         mode_label = (
-            "Transmutación Directa (Sin Donante - 100% Fiel AC)"
+            "Direct AC Transmutation (100% Faithful)"
             if self.is_direct_ac_mode
-            else f"Mapeo Donante ({self.codec_choice_var.get()})"
+            else f"Donor Mapping ({self.codec_choice_var.get()})"
         )
-        self.status_var.set(f"⏳ Inyectando sonido porteado en '{veh.display_name}' con respaldo seguro...")
+        self.status_var.set(f"⏳ Importing sound ({self._format_audio_scope_label(audio_scope)}) into '{veh.display_name}'...")
         self._append_log("\n----------------------------------------------------------------------")
-        self._append_log(f"Iniciando inyección en vehículo vanilla '{veh.display_name}' [{mode_label}]...")
+        self._append_log(f"Iniciando inyección en vehículo vanilla '{veh.display_name}' [{mode_label} | Scope: {audio_scope}]...")
 
         sync_ai = self.vanilla_sync_ai_var.get()
         mute_pops = self.vanilla_mute_pops_var.get()
@@ -5513,10 +6152,11 @@ class SoundPorterApp(tk.Tk):
         codec_mode = FSB5_MODE_PCM16 if self.codec_choice_var.get() == "PCM16" else FSB5_MODE_FADPCM
         is_direct = self.is_direct_ac_mode
 
-        bands_to_export = list(self.rpm_bands) if self.rpm_bands else None
-        if mute_pops and bands_to_export:
+        player_bands_to_export = list(self.rpm_bands) if self.rpm_bands else None
+        ai_bands_to_export = player_bands_to_export
+        if mute_pops and ai_bands_to_export:
             clean_bands: list[RpmBandConfig] = []
-            for b in bands_to_export:
+            for b in ai_bands_to_export:
                 is_tc_band = getattr(b, "load_role", "") in ("pops", "throttle_cut")
                 if is_tc_band:
                     clean_bands.append(
@@ -5547,15 +6187,34 @@ class SoundPorterApp(tk.Tk):
                     )
                 else:
                     clean_bands.append(b)
-            bands_to_export = clean_bands
+            ai_bands_to_export = clean_bands
 
         def worker() -> None:
             try:
                 self.vanilla_mgr.load_vehicle_events_info(veh)
+                veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
+                orig_p_candidate = veh.bank_path.parent / f"{veh.bank_path.name}.orig"
+                native_p = (
+                    veh_backup_folder / veh.bank_path.name
+                    if (veh_backup_folder / veh.bank_path.name).is_file()
+                    else (orig_p_candidate if orig_p_candidate.is_file() else veh.bank_path)
+                )
+                native_max_rpm = _extract_native_engine_max_rpm(native_p)
 
                 bank_bytes: bytes
                 cached_blobs: list[bytes] | None = None
                 use_compressed_direct = False
+                ac_fmod_ref = self.source_lib.fmod_bank if (self.source_lib and self.source_lib.fmod_bank) else None
+                rep_p: set[bytes] = set()
+                sil_p: set[bytes] = set()
+                pmap_p: dict[bytes, str] = {}
+                extra_p_variants = getattr(veh, "extra_event_variants", None) or None
+                if audio_scope in ("interior", "exterior"):
+                    rep_p, sil_p, pmap_p, aug_ex_p = collect_vanilla_scope_targets(
+                        veh, ac_fmod_ref, audio_scope, is_ai=False
+                    )
+                    extra_p_variants = aug_ex_p or None
+
                 if is_direct:
                     assert self.source_lib and self.source_lib.fmod_bank
                     ac_fmod = self.source_lib.fmod_bank
@@ -5564,12 +6223,6 @@ class SoundPorterApp(tk.Tk):
                         and any(sl.mode == FSB5_MODE_PCM16 for sl in ac_fmod.slots)
                     )
                     direct_codec = FSB5_MODE_FADPCM if use_compressed_direct else None
-                    veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
-                    native_p = (
-                        veh_backup_folder / veh.bank_path.name
-                        if (veh_backup_folder / veh.bank_path.name).is_file()
-                        else veh.bank_path
-                    )
                     direct_res = build_direct_ported_bank_from_ac(
                         ac_bank=ac_fmod,
                         mod_identifier=veh.car_name,
@@ -5580,52 +6233,73 @@ class SoundPorterApp(tk.Tk):
                         target_param_names=veh.target_parameters,
                         target_ctrl_params=veh.ctrl_parameters,
                         target_role_buses=getattr(veh, "ai_event_buses", None),
-                        rpm_bands=bands_to_export,
-                        mute_secondary_pops=mute_pops,
+                        rpm_bands=player_bands_to_export,
+                        mute_secondary_pops=False,
                         native_bank_path=native_p,
-                        invert_spatial_cone=invert_cone,
+                        invert_spatial_cone=(invert_cone if audio_scope != "interior" else False),
                         mappings=self.mappings,
                         output_codec_mode=direct_codec,
                         prune_unused_samples=use_compressed_direct,
+                        extra_role_variants=extra_p_variants,
+                        prefer_throttle_param=bool(getattr(veh, "prefers_throttle_player", False)),
+                        target_max_rpm=native_max_rpm,
+                        library=self.source_lib,
+                        active_scope=audio_scope,
                     )
                     bank_bytes = direct_res.bank_bytes
                     cached_blobs = direct_res.fsb_blobs_cache if use_compressed_direct else None
                 else:
                     assert self.donor_bank
-                    eff_mappings = self.mappings
-                    if mute_pops and self.mappings:
-                        eff_mappings = []
-                        for i, m in enumerate(self.mappings):
-                            sl = self.donor_bank.slots[m.donor_global_index] if 0 <= m.donor_global_index < len(self.donor_bank.slots) else None
-                            if sl and (sl.load_role in ("pops", "throttle_cut") or "limiter" in sl.name.lower() or "backfire" in sl.name.lower()):
-                                eff_mappings.append(SlotMappingConfig(
-                                    donor_global_index=m.donor_global_index,
-                                    action="silence",
-                                    source_index=None,
-                                    gain_db=-96.0,
-                                    match_reason="Silenciado para Replay / IA limpia",
-                                ))
-                            else:
-                                eff_mappings.append(m)
                     donor_res = build_ported_bank(
                         donor=self.donor_bank,
                         library=self.source_lib,
-                        mappings=eff_mappings,
+                        mappings=self.mappings,
                         mod_identifier=veh.car_name,
                         standalone_guids=False,
                         sync_autopitch=sync_pitch,
                         output_codec_mode=codec_mode,
-                        rpm_bands=bands_to_export,
+                        rpm_bands=player_bands_to_export,
                         throttle_cut=tcut_cfg,
                     )
                     bank_bytes = donor_res.bank_bytes
 
-                # 2. Configurar banco de la IA si está marcado y existe
-                # El _AI.bank debe conservar la GUID de banco y las GUIDs de eventos nativas de la IA
-                # (MAIN, MAIN_LIVE, ext_AI, int_AI). Copiar el banco del jugador duplicaba la GUID de banco
-                # (FMOD rechaza el segundo banco) y dejaba a los rivales y repeticiones sin eventos -> mudos.
+                if audio_scope in ("interior", "exterior"):
+                    if not rep_p:
+                        raise RuntimeError(
+                            f"This vehicle does not expose a replaceable {audio_scope} engine event in its native bank."
+                        )
+                    bank_bytes = merge_ported_events_into_native_bank(
+                        native_bank=FmodBank(native_p),
+                        ported_bank=FmodBank(raw=bank_bytes),
+                        replace_event_guids=rep_p,
+                        silence_native_event_guids=sil_p,
+                        event_paths_map=pmap_p,
+                        mod_identifier=veh.car_name,
+                        seed_tag=f"hybrid:p:{audio_scope}",
+                    )
+
+                # 2. Configurar banco de la IA según el alcance seleccionado:
+                # - 'interior': _AI.bank permanece 100% vanilla (repeticiones y rivales sin cambios).
+                # - 'exterior': solo se reemplazan los eventos exteriores de _AI.bank, manteniendo ai_engine_int vanilla.
+                # - 'full': comportamiento completo estándar.
                 ai_bytes: bytes | None = None
-                if sync_ai and veh.ai_bank_path and veh.ai_event_guids:
+                if audio_scope != "interior" and sync_ai and veh.ai_bank_path and veh.ai_event_guids:
+                    orig_ai_candidate = veh.ai_bank_path.parent / f"{veh.ai_bank_path.name}.orig"
+                    native_ai_p = (
+                        veh_backup_folder / veh.ai_bank_path.name
+                        if (veh_backup_folder / veh.ai_bank_path.name).is_file()
+                        else (orig_ai_candidate if orig_ai_candidate.is_file() else veh.ai_bank_path)
+                    )
+                    rep_ai: set[bytes] = set()
+                    sil_ai: set[bytes] = set()
+                    pmap_ai: dict[bytes, str] = {}
+                    extra_ai_variants = getattr(veh, "extra_ai_event_variants", None) or None
+                    if audio_scope == "exterior":
+                        rep_ai, sil_ai, pmap_ai, aug_ex_ai = collect_vanilla_scope_targets(
+                            veh, ac_fmod_ref, "exterior", is_ai=True
+                        )
+                        extra_ai_variants = aug_ex_ai or None
+
                     if is_direct:
                         ai_direct_res = build_direct_ported_bank_from_ac(
                             ac_bank=self.source_lib.fmod_bank,
@@ -5635,28 +6309,46 @@ class SoundPorterApp(tk.Tk):
                             target_role_paths=veh.ai_event_paths,
                             target_bank_guid=veh.ai_bank_guid or None,
                             target_role_buses=getattr(veh, "ai_event_buses", None),
-                            rpm_bands=bands_to_export,
+                            rpm_bands=ai_bands_to_export,
                             is_ai_bank=True,
                             mute_secondary_pops=mute_pops,
+                            native_bank_path=(native_ai_p if native_ai_p.is_file() else None),
                             invert_spatial_cone=False,
                             mappings=self.mappings,
                             output_codec_mode=(FSB5_MODE_FADPCM if use_compressed_direct else None),
                             prune_unused_samples=use_compressed_direct,
                             cached_fsb_blobs=cached_blobs,
+                            extra_role_variants=extra_ai_variants,
+                            prefer_throttle_param=bool(getattr(veh, "prefers_throttle_ai", False)),
+                            target_max_rpm=native_max_rpm,
+                            library=self.source_lib,
+                            active_scope=audio_scope,
                         )
                         ai_bytes = ai_direct_res.bank_bytes
                     else:
-                        veh_backup_folder = self.vanilla_mgr.backup_dir / veh.vehicle_id
-                        native_ai_p = (
-                            veh_backup_folder / veh.ai_bank_path.name
-                            if (veh_backup_folder / veh.ai_bank_path.name).is_file()
-                            else veh.ai_bank_path
-                        )
                         if native_ai_p.is_file() and self.source_lib:
                             ai_donor = FmodBank(native_ai_p)
+                            ai_maps = auto_map_samples(ai_donor, self.source_lib)
+                            if mute_pops and ai_maps:
+                                muted_ai_maps: list[SlotMappingConfig] = []
+                                for m in ai_maps:
+                                    sl = ai_donor.slots[m.donor_global_index] if 0 <= m.donor_global_index < len(ai_donor.slots) else None
+                                    if sl and (sl.load_role in ("pops", "throttle_cut") or "limiter" in sl.name.lower() or "backfire" in sl.name.lower()):
+                                        muted_ai_maps.append(
+                                            SlotMappingConfig(
+                                                donor_global_index=m.donor_global_index,
+                                                action="silence",
+                                                source_index=None,
+                                                gain_db=-96.0,
+                                                match_reason="Silenciado para Replay / IA limpia",
+                                            )
+                                        )
+                                    else:
+                                        muted_ai_maps.append(m)
+                                ai_maps = muted_ai_maps
                             ai_donor_res = build_ported_bank(
                                 donor=ai_donor,
-                                mappings=auto_map_samples(ai_donor, self.source_lib),
+                                mappings=ai_maps,
                                 library=self.source_lib,
                                 mod_identifier=f"{veh.car_name}_AI",
                                 standalone_guids=False,
@@ -5665,9 +6357,20 @@ class SoundPorterApp(tk.Tk):
                             )
                             ai_bytes = ai_donor_res.bank_bytes
 
-                # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) si existe
+                    if audio_scope == "exterior" and ai_bytes and native_ai_p.is_file() and rep_ai:
+                        ai_bytes = merge_ported_events_into_native_bank(
+                            native_bank=FmodBank(native_ai_p),
+                            ported_bank=FmodBank(raw=ai_bytes),
+                            replace_event_guids=rep_ai,
+                            silence_native_event_guids=sil_ai,
+                            event_paths_map=pmap_ai,
+                            mod_identifier=f"{veh.car_name}_AI",
+                            seed_tag="hybrid:ai:exterior",
+                        )
+
+                # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) solo cuando se modifica el exterior
                 csd_bytes: bytes | None = None
-                if veh.csdbin_path and veh.csdbin_path.is_file():
+                if audio_scope != "interior" and veh.csdbin_path and veh.csdbin_path.is_file():
                     try:
                         csd_doc = CsdbinDocument.from_file(veh.csdbin_path)
                         if "engine_placement" in csd_doc.links:
@@ -5690,31 +6393,42 @@ class SoundPorterApp(tk.Tk):
                     bank_bytes=bank_bytes,
                     ai_bank_bytes=ai_bytes,
                     csdbin_bytes=csd_bytes,
+                    audio_scope=audio_scope,
                 )
                 if not ok:
                     raise RuntimeError(msg)
 
-                self.dispatch_to_ui(self._on_inject_vanilla_success, veh, len(bank_bytes), msg)
+                self.dispatch_to_ui(self._on_inject_vanilla_success, veh, len(bank_bytes), msg, audio_scope)
             except Exception as exc:
                 err_str = str(exc)
-                self.dispatch_to_ui(self._on_export_error, f"Fallo en inyección vanilla: {err_str}")
+                self.dispatch_to_ui(self._on_export_error, f"Vanilla sound import failed: {err_str}")
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_inject_vanilla_success(self, veh: VanillaVehicle, byte_count: int, msg: str) -> None:
+    def _on_inject_vanilla_success(
+        self,
+        veh: VanillaVehicle,
+        byte_count: int,
+        msg: str,
+        audio_scope: str = "full",
+    ) -> None:
         self.progress.stop()
         self._set_import_buttons_state("normal")
-        self._append_log(f"✔ ¡Inyección exitosa en vehículo vanilla '{veh.display_name}'!")
+        scope_detail_lbl = self._format_audio_scope_label(audio_scope, detailed=True)
+        self._append_log(f"✔ ¡Inyección exitosa en vehículo vanilla '{veh.display_name}' [{scope_detail_lbl}]!")
         self._append_log(f"  Ruta en juego: {veh.bank_path} ({byte_count / (1024*1024):.2f} MB)")
         self._append_log(f"  Respaldo seguro original: {veh.original_sha256}")
         self._append_log(f"  Estado de restauración: Listo para restaurar con 1 clic sin Steam.")
-        self.status_var.set(f"✅ Sound successfully imported into '{veh.display_name}'!")
+        self.status_var.set(
+            f"✅ Sound successfully imported into '{veh.display_name}' ({self._format_audio_scope_label(audio_scope)})!"
+        )
 
         self._populate_vanilla_vehicles_list(select_id=veh.vehicle_id)
         messagebox.showinfo(
             "Sound Successfully Imported into Official Vehicle!",
             f"The new sound has been installed and activated for '{veh.display_name}'.\n\n"
             f"• File: {veh.bank_path.name}\n"
+            f"• Audio Scope: {scope_detail_lbl}\n"
             f"• Size: {byte_count:,} bytes\n"
             f"• Original backup: Protected (SHA256)\n\n"
             f"This vehicle will now use the imported sound in Automobilista 2.\n"

@@ -386,9 +386,256 @@ def main() -> None:
         assert app.port_mode_var.get() == "direct"
         app.cmd_open_test_edit("vanilla")
         assert app._current_view == "test_edit"
+        assert app.btn_test_edit_finish.winfo_manager() == "pack"
+        assert app.btn_test_edit_confirm.winfo_manager() == ""
         app.cmd_finish_test_edit()
         assert app._current_view == "vanilla"
-        print("   Navegación de las 4 vistas nuevas y opciones de exportación bloqueadas verificadas!")
+        print("   Navegación de las vistas nuevas y opciones de exportación bloqueadas verificadas!")
+
+        # 8. Verificar vista 'Edit modified sounds' + edición de bandas + Confirm (en sandbox temporal sin tocar Steam)
+        print("8. Probando flujo 'Edit modified sounds' -> selector -> Test/Edit Audio -> Confirm (sandbox)...")
+        from ams2_sound_porter.fmod_bank import FmodBank
+        from ams2_sound_porter.porter_engine import build_direct_ported_bank_from_ac
+        from ams2_sound_porter.vanilla_manager import VanillaVehicleManager
+
+        real_mgr = app.vanilla_mgr
+        sample_veh = next(
+            (v for v in real_mgr.scan_catalog() if v.bank_path.is_file() and v.ai_bank_path and v.ai_bank_path.is_file()),
+            None,
+        )
+        ac_ref_bank = REF_DIR / "Sonido Asseto Corsa.bank"
+        if sample_veh is not None and ac_ref_bank.is_file():
+            orig_p_bytes = sample_veh.bank_path.read_bytes()
+            orig_ai_bytes = sample_veh.ai_bank_path.read_bytes()
+            with tempfile.TemporaryDirectory() as sbx_dir:
+                sbx_root = Path(sbx_dir) / "AMS2"
+                sbx_backup = Path(sbx_dir) / "backups"
+                rel_p = sample_veh.bank_path.relative_to(real_mgr.ams2_root)
+                rel_ai = sample_veh.ai_bank_path.relative_to(real_mgr.ams2_root)
+                (sbx_root / rel_p).parent.mkdir(parents=True, exist_ok=True)
+                (sbx_root / rel_p).write_bytes(orig_p_bytes)
+                (sbx_root / rel_ai).write_bytes(orig_ai_bytes)
+
+                sbx_mgr = VanillaVehicleManager(ams2_root=sbx_root, backup_dir=sbx_backup)
+                sbx_vehs = sbx_mgr.scan_catalog(force=True)
+                assert len(sbx_vehs) == 1
+                sv = sbx_vehs[0]
+                sbx_mgr.load_vehicle_events_info(sv)
+
+                ac_b_sbx = FmodBank(ac_ref_bank)
+                init_p = build_direct_ported_bank_from_ac(
+                    ac_bank=ac_b_sbx,
+                    mod_identifier=sv.car_name,
+                    standalone_guids=False,
+                    target_role_guids=sv.event_guids,
+                    target_role_paths=sv.event_paths,
+                    target_bank_guid=sv.bank_guid or None,
+                )
+                init_ai = build_direct_ported_bank_from_ac(
+                    ac_bank=ac_b_sbx,
+                    mod_identifier=f"{sv.car_name}_AI",
+                    standalone_guids=False,
+                    target_role_guids=sv.ai_event_guids,
+                    target_role_paths=sv.ai_event_paths,
+                    target_bank_guid=sv.ai_bank_guid or None,
+                    is_ai_bank=True,
+                    mute_secondary_pops=True,
+                    invert_spatial_cone=False,
+                )
+                ok_inst, msg_inst = sbx_mgr.install_sound(sv, init_p.bank_bytes, ai_bank_bytes=init_ai.bank_bytes)
+                assert ok_inst, msg_inst
+                backup_file = sbx_backup / sv.vehicle_id / sv.bank_path.name
+                assert backup_file.is_file() and backup_file.read_bytes() == orig_p_bytes
+
+                orig_ga_info2 = ga.messagebox.showinfo if hasattr(ga, "messagebox") else None
+                orig_ga_err2 = ga.messagebox.showerror if hasattr(ga, "messagebox") else None
+                orig_mb_info2 = mb.showinfo
+                orig_mb_err2 = mb.showerror
+                info_msgs: list[str] = []
+                err_msgs: list[str] = []
+                mb.showinfo = lambda *a, **kw: info_msgs.append(str(a))
+                mb.showerror = lambda *a, **kw: err_msgs.append(str(a))
+                if hasattr(ga, "messagebox"):
+                    ga.messagebox.showinfo = lambda *a, **kw: info_msgs.append(str(a))
+                    ga.messagebox.showerror = lambda *a, **kw: err_msgs.append(str(a))
+                try:
+                    app.vanilla_mgr = sbx_mgr
+                    app.show_view("modified")
+                    app.update()
+                    assert app._current_view == "modified"
+                    tree_ids = app.modified_tree.get_children()
+                    assert sv.vehicle_id in tree_ids, f"Vehículo modificado no listado en modified_tree: {tree_ids}"
+                    app.modified_tree.selection_set(sv.vehicle_id)
+                    app.cmd_open_modified_vehicle_editor()
+                    app.update()
+
+                    assert app._current_view == "test_edit"
+                    assert app._editing_modified_vanilla is True
+                    assert app.btn_test_edit_confirm.winfo_manager() == "pack"
+                    assert app.btn_test_edit_finish.winfo_manager() == ""
+                    assert len(app.rpm_bands) > 0
+
+                    # Editar primera banda visible y pulsar Confirm
+                    vis_idx = next(i for i, b in enumerate(app.rpm_bands) if not b.is_muted_bus and b.donor_slot_indices)
+                    app._selected_band_idx = vis_idx
+                    edited_b = app.rpm_bands[vis_idx]
+                    app.band_rmin_var.set("2220")
+                    app.band_fi_var.set("2520")
+                    app.band_fo_var.set("5120")
+                    app.band_rmax_var.set("5620")
+                    app.band_gain_var.set("2.0")
+                    app.cmd_apply_band_edit()
+
+                    info_msgs.clear()
+                    err_msgs.clear()
+                    app.cmd_confirm_modified_edit()
+                    timeout2 = time.time() + 60
+                    while not any("Modified Sound Updated!" in m for m in info_msgs) and not err_msgs and time.time() < timeout2:
+                        app.update()
+                        time.sleep(0.05)
+
+                    assert not err_msgs, f"Confirm reportó error: {err_msgs}"
+                    assert any("Modified Sound Updated!" in m for m in info_msgs), (
+                        f"Confirm no completó la re-inyección. info={info_msgs} status={app.status_var.get()}"
+                    )
+                    assert app._current_view == "modified", f"Vista esperada 'modified', actual: {app._current_view}"
+                    assert backup_file.read_bytes() == orig_p_bytes, "El respaldo original Steam fue alterado!"
+
+                    re_sbx_p = FmodBank(sv.bank_path)
+                    chk_b = next(
+                        (
+                            b
+                            for b in re_sbx_p.rpm_bands
+                            if b.pml_guid == edited_b.pml_guid
+                            and b.event_guid == edited_b.event_guid
+                            and b.box_index == edited_b.box_index
+                        ),
+                        None,
+                    )
+                    assert chk_b is not None and abs(chk_b.rpm_min - 2220.0) < 1.0 and abs(chk_b.rpm_max - 5620.0) < 1.0, (
+                        f"La banda editada no se reflejó en el .bank re-inyectado: {chk_b}"
+                    )
+                    assert sv.ai_bank_path.is_file() and sv.ai_bank_path.stat().st_size > 100000
+                    print("   Flujo 'Edit modified sounds' -> edición de bandas -> 'Confirm' verificado al 100% en sandbox!")
+                finally:
+                    app.vanilla_mgr = real_mgr
+                    mb.showinfo = orig_mb_info2
+                    mb.showerror = orig_mb_err2
+                    if hasattr(ga, "messagebox") and orig_ga_info2:
+                        ga.messagebox.showinfo = orig_ga_info2
+                    if hasattr(ga, "messagebox") and orig_ga_err2:
+                        ga.messagebox.showerror = orig_ga_err2
+
+        # 9. Verificar selector de alcance en Vanilla ('Full' por defecto, 'Interior only', 'Exterior only') en sandbox
+        print("9. Probando selector de alcance Vanilla ('Full' / 'Interior only' / 'Exterior only') en sandbox...")
+        assert app.vanilla_audio_scope_var.get() == "full", (
+            f"El valor por defecto debe ser 'full', actual: {app.vanilla_audio_scope_var.get()}"
+        )
+        m3_veh = next(
+            (v for v in real_mgr.scan_catalog() if "bmw_m3_gtr" in v.vehicle_id.lower() and v.ai_bank_path and v.ai_bank_path.is_file()),
+            None,
+        )
+        if m3_veh is not None and ac_ref_bank.is_file():
+            orig_m3_p_path = real_mgr.backup_dir / m3_veh.vehicle_id / m3_veh.bank_path.name
+            if not orig_m3_p_path.is_file():
+                orig_m3_p_path = m3_veh.bank_path
+            orig_m3_ai_path = real_mgr.backup_dir / m3_veh.vehicle_id / m3_veh.ai_bank_path.name
+            if not orig_m3_ai_path.is_file():
+                orig_m3_ai_path = m3_veh.ai_bank_path
+            orig_m3_p = orig_m3_p_path.read_bytes()
+            orig_m3_ai = orig_m3_ai_path.read_bytes()
+
+            with tempfile.TemporaryDirectory() as sbx9_dir:
+                sbx9_root = Path(sbx9_dir) / "AMS2"
+                sbx9_backup = Path(sbx9_dir) / "backups"
+                rel_p9 = m3_veh.bank_path.relative_to(real_mgr.ams2_root)
+                rel_ai9 = m3_veh.ai_bank_path.relative_to(real_mgr.ams2_root)
+                (sbx9_root / rel_p9).parent.mkdir(parents=True, exist_ok=True)
+                (sbx9_root / rel_p9).write_bytes(orig_m3_p)
+                (sbx9_root / rel_ai9).write_bytes(orig_m3_ai)
+
+                sbx9_mgr = VanillaVehicleManager(ams2_root=sbx9_root, backup_dir=sbx9_backup)
+                sv9 = sbx9_mgr.scan_catalog(force=True)[0]
+                sbx9_mgr.load_vehicle_events_info(sv9)
+
+                orig_mb_i9, orig_mb_y9, orig_mb_e9, orig_mb_w9 = mb.showinfo, mb.askyesno, mb.showerror, mb.showwarning
+                orig_ga_i9 = ga.messagebox.showinfo if hasattr(ga, "messagebox") else None
+                orig_ga_y9 = ga.messagebox.askyesno if hasattr(ga, "messagebox") else None
+                orig_ga_e9 = ga.messagebox.showerror if hasattr(ga, "messagebox") else None
+                orig_ga_w9 = ga.messagebox.showwarning if hasattr(ga, "messagebox") else None
+                msgs9: list[str] = []
+                errs9: list[str] = []
+                mb.showinfo = lambda *a, **kw: msgs9.append(str(a))
+                mb.askyesno = lambda *a, **kw: True
+                mb.showerror = lambda *a, **kw: errs9.append(str(a))
+                mb.showwarning = lambda *a, **kw: errs9.append("WARN:" + str(a))
+                if hasattr(ga, "messagebox"):
+                    ga.messagebox.showinfo = lambda *a, **kw: msgs9.append(str(a))
+                    ga.messagebox.askyesno = lambda *a, **kw: True
+                    ga.messagebox.showerror = lambda *a, **kw: errs9.append(str(a))
+                    ga.messagebox.showwarning = lambda *a, **kw: errs9.append("WARN:" + str(a))
+                try:
+                    app.vanilla_mgr = sbx9_mgr
+                    app.vanilla_search_var.set("")
+                    app._populate_vanilla_vehicles_list(select_id=sv9.vehicle_id)
+                    app._load_source_library_from_bank(ac_ref_bank)
+                    app.show_view("vanilla")
+                    app.vanilla_selected_vehicle = sv9
+                    app.port_mode_var.set("direct")
+
+                    # 9a. Inyectar Exterior only
+                    app.vanilla_audio_scope_var.set("exterior")
+                    app._on_vanilla_scope_changed()
+                    assert "Interior" in app.vanilla_scope_hint_var.get() or "interior" in app.vanilla_scope_hint_var.get()
+                    msgs9.clear()
+                    errs9.clear()
+                    app._run_inject_vanilla()
+                    t9 = time.time() + 60
+                    while not any("Sound Successfully Imported" in m for m in msgs9) and not errs9 and time.time() < t9:
+                        app.update()
+                        time.sleep(0.05)
+                    assert not errs9, f"Error en inyección Exterior-only: {errs9}"
+                    assert sv9.modified_scope == "exterior"
+                    fb_ext9 = FmodBank(sv9.bank_path)
+                    ev_map_ext9 = {ev.guid_str.lower(): ev for ev in fb_ext9.events}
+                    assert any("m3gtr_int_" in s.lower() for s in ev_map_ext9[sv9.event_guids["EngineInt"].lower()].linked_samples)
+                    assert sv9.ai_bank_path.read_bytes() != orig_m3_ai, "_AI.bank debió actualizarse en modo Exterior-only"
+
+                    # 9b. Inyectar Interior only sobre el mismo auto -> debe mantener Exterior vanilla Y restaurar _AI.bank a vanilla!
+                    app.vanilla_audio_scope_var.set("interior")
+                    app._on_vanilla_scope_changed()
+                    assert "vanilla" in app.vanilla_scope_hint_var.get().lower()
+                    msgs9.clear()
+                    errs9.clear()
+                    app._run_inject_vanilla()
+                    t9 = time.time() + 60
+                    while not any("Sound Successfully Imported" in m for m in msgs9) and not errs9 and time.time() < t9:
+                        app.update()
+                        time.sleep(0.05)
+                    assert not errs9, f"Error en inyección Interior-only: {errs9}"
+                    assert sv9.modified_scope == "interior"
+                    fb_int9 = FmodBank(sv9.bank_path)
+                    ev_map_int9 = {ev.guid_str.lower(): ev for ev in fb_int9.events}
+                    assert any("z4gt3" in s.lower() for s in ev_map_int9[sv9.event_guids["EngineInt"].lower()].linked_samples)
+                    assert any("m3gtr_ext_" in s.lower() for s in ev_map_int9[sv9.event_guids["EngineExt"].lower()].linked_samples)
+                    assert sv9.ai_bank_path.read_bytes() == orig_m3_ai, "_AI.bank debió restaurarse a vanilla en modo Interior-only!"
+
+                    app.show_view("modified")
+                    app.update()
+                    row_vals = app.modified_tree.item(sv9.vehicle_id, "values")
+                    assert row_vals[2] == "Interior only" and row_vals[3] == "Kept vanilla", f"Fila inesperada en modified_tree: {row_vals}"
+                    assert (sbx9_backup / sv9.vehicle_id / sv9.bank_path.name).read_bytes() == orig_m3_p
+                    print("   Selector Vanilla ('Full' / 'Interior only' / 'Exterior only') y respaldo intacto verificados al 100%!")
+                finally:
+                    app.vanilla_audio_scope_var.set("full")
+                    app._on_vanilla_scope_changed()
+                    app.vanilla_mgr = real_mgr
+                    mb.showinfo, mb.askyesno, mb.showerror, mb.showwarning = orig_mb_i9, orig_mb_y9, orig_mb_e9, orig_mb_w9
+                    if hasattr(ga, "messagebox"):
+                        if orig_ga_i9: ga.messagebox.showinfo = orig_ga_i9
+                        if orig_ga_y9: ga.messagebox.askyesno = orig_ga_y9
+                        if orig_ga_e9: ga.messagebox.showerror = orig_ga_e9
+                        if orig_ga_w9: ga.messagebox.showwarning = orig_ga_w9
 
         app.update_idletasks()
         print("GUI Smoke Test + Audio Preview Async + Soporte GUIDs.txt + Pestaña 3 (v1.4.0) + Vanilla Manager (v1.6.0) superado al 100% sin errores!")

@@ -237,6 +237,12 @@ def _classify_event_role_from_path_or_heuristics(
             for k in ("bodywork", "chassis", "suspension", "door", "horn", "traction", "abs", "dirt", "damage", "hit", "scrape")
         ):
             return "FX"
+        pnames_path = {p[0].lower() for p in plist}
+        if ("rpm" in pnames_path or "rpms" in pnames_path) and "ai" not in leaf:
+            if leaf == "int" or leaf.endswith("_int"):
+                return "EngineInt"
+            if leaf == "ext" or leaf.endswith("_ext"):
+                return "EngineExt"
 
     if b_low:
         if "engine_int" in b_low:

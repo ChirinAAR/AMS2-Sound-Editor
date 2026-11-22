@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from .audio_dsp import AudioBuffer, conform_audio, read_wav_file
+from .audio_dsp import AudioBuffer, conform_audio, decode_fadpcm, read_wav_file
 from .fmod_bank import (
     FSB5_MODE_FADPCM,
     FSB5_MODE_PCM16,
@@ -1670,6 +1671,9 @@ def _patch_proj_chunks(
     autopitch_updates: dict[bytes, float],
     guid_map: dict[bytes, bytes] | None,
     rpm_bands: list[RpmBandConfig] | None = None,
+    gain_db_deltas: dict[bytes, float] | None = None,
+    silence_wav_guids: set[bytes] | None = None,
+    unmute_wav_guids: set[bytes] | None = None,
 ) -> bytes:
     """Retorna los sub-chunks hijos directos de LIST:PROJ ya parcheados (excepto SNDH que se calcula al final)."""
     buf = bytearray(proj_payload)
@@ -1679,6 +1683,7 @@ def _patch_proj_chunks(
     fade_in_curv_updates: dict[bytes, tuple[float, float, float]] = {}
     fade_out_curv_updates: dict[bytes, tuple[float, float, float]] = {}
     bus_cutoff_max_rpm: dict[bytes, float] = {}
+    max_band_rpm = 0.0
 
     if rpm_bands:
         for b in rpm_bands:
@@ -1692,6 +1697,8 @@ def _patch_proj_chunks(
                 rmax = max(rmin + 10.0, float(b.rpm_max))
                 fi_end = max(rmin, min(rmax, float(b.fade_in_end)))
                 fo_start = max(rmin, min(rmax, float(b.fade_out_start)))
+                if rmax > max_band_rpm:
+                    max_band_rpm = rmax
             pmlb_box_updates.setdefault((b.pml_guid, b.event_guid), []).append(b)
             if b.fade_in_curv_guid is not None:
                 fade_in_curv_updates[b.fade_in_curv_guid] = (rmin, fi_end, rmax)
@@ -1703,7 +1710,7 @@ def _patch_proj_chunks(
 
     # Mapear WAIB -> WAV GUID antes de parchear para poder actualizar también MUIT->INST si aplica
     waib_to_wav: dict[bytes, bytes] = {}
-    if autopitch_updates:
+    if autopitch_updates or gain_db_deltas or silence_wav_guids or unmute_wav_guids:
         def collect_waibs(start: int, end: int) -> None:
             for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
                 if cid == b"WAIB" and pe - ps >= 32:
@@ -1713,7 +1720,7 @@ def _patch_proj_chunks(
 
         collect_waibs(0, len(buf))
 
-    # 1. Aplicar redirecciones WAV, Auto-Pitch RPM y edición de bandas PMLB / CURV ANTES de remapear los GUIDs
+    # 1. Aplicar redirecciones WAV, Auto-Pitch RPM, ganancia INST y edición de bandas PMLB / CURV ANTES de remapear GUIDs
     def patch_tree(start: int, end: int) -> None:
         for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
             if cid == b"WAV " and pe - ps >= 30:
@@ -1722,6 +1729,14 @@ def _patch_proj_chunks(
                     new_sb, new_smp_idx = wav_redirects[wg]
                     _, _, flags, _, _ = struct.unpack_from("<HHHII", buf, ps + 16)
                     struct.pack_into("<HHHII", buf, ps + 16, 0x000C, new_sb, flags, new_smp_idx, new_sb)
+            elif cid == b"PRMB" and max_band_rpm > 2500.0 and pe - ps >= 31:
+                slen = struct.unpack_from("<H", buf, ps + 21)[0]
+                if 23 + slen + 8 <= pe - ps:
+                    pname = buf[ps + 23 : ps + 23 + slen].decode("latin1", "replace").rstrip("\x00").strip().lower()
+                    if pname in ("rpm", "rpms"):
+                        _pmin, pmax = struct.unpack_from("<ff", buf, ps + 23 + slen)
+                        if 2500.0 <= pmax < max_band_rpm:
+                            struct.pack_into("<f", buf, ps + 23 + slen + 4, float(max_band_rpm))
             elif cid == b"PMLB" and pmlb_box_updates and pe - ps >= 52:
                 pkey = (bytes(buf[ps : ps + 16]), bytes(buf[ps + 32 : ps + 48]))
                 if pkey in pmlb_box_updates:
@@ -1786,15 +1801,30 @@ def _patch_proj_chunks(
                     for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
                         if scid == b"WAIB" and spe - sps >= 32:
                             target_wg = bytes(buf[sps + 16 : sps + 32])
-                        elif scid == b"INST" and spe - sps >= 73:
+                        elif scid == b"INST" and spe - sps >= 20:
                             inst_span = (sps, spe)
-                    if target_wg and inst_span and target_wg in autopitch_updates:
-                        ips, _ = inst_span
-                        if bytes(buf[ips + 53 : ips + 69]) != b"\x00" * 16:
-                            struct.pack_into("<f", buf, ips + 69, float(autopitch_updates[target_wg]))
+                    if target_wg and inst_span:
+                        ips, ipe = inst_span
+                        if ipe - ips >= 73 and target_wg in autopitch_updates:
+                            if bytes(buf[ips + 53 : ips + 69]) != b"\x00" * 16:
+                                struct.pack_into("<f", buf, ips + 69, float(autopitch_updates[target_wg]))
+                        if silence_wav_guids and target_wg in silence_wav_guids:
+                            struct.pack_into("<f", buf, ips + 16, -96.0)
+                        else:
+                            cur_db = struct.unpack_from("<f", buf, ips + 16)[0]
+                            db_changed = False
+                            if unmute_wav_guids and target_wg in unmute_wav_guids and cur_db <= -90.0:
+                                cur_db = 0.0
+                                db_changed = True
+                            if gain_db_deltas and target_wg in gain_db_deltas and abs(gain_db_deltas[target_wg]) > 1e-4:
+                                cur_db = max(-96.0, min(24.0, cur_db + float(gain_db_deltas[target_wg])))
+                                db_changed = True
+                            if db_changed:
+                                struct.pack_into("<f", buf, ips + 16, float(cur_db))
                     patch_tree(ps + 4, pe)
-                elif ltype == b"MUIT" and autopitch_updates:
+                elif ltype == b"MUIT" and (autopitch_updates or silence_wav_guids or unmute_wav_guids):
                     child_rpms: list[float] = []
+                    child_wgs: list[bytes] = []
                     inst_span = None
                     for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
                         if scid == b"PLST" and spe - sps >= 10:
@@ -1808,15 +1838,25 @@ def _patch_proj_chunks(
                                         if coff + 16 <= len(sp):
                                             ch_g = bytes(sp[coff : coff + 16])
                                             ch_wg = waib_to_wav.get(ch_g)
-                                            if ch_wg and ch_wg in autopitch_updates:
-                                                child_rpms.append(float(autopitch_updates[ch_wg]))
-                        elif scid == b"INST" and spe - sps >= 73:
+                                            if ch_wg:
+                                                child_wgs.append(ch_wg)
+                                                if ch_wg in autopitch_updates:
+                                                    child_rpms.append(float(autopitch_updates[ch_wg]))
+                        elif scid == b"INST" and spe - sps >= 20:
                             inst_span = (sps, spe)
-                    if child_rpms and inst_span:
-                        ips, _ = inst_span
-                        if bytes(buf[ips + 53 : ips + 69]) != b"\x00" * 16:
-                            avg_rpm = sum(child_rpms) / len(child_rpms)
-                            struct.pack_into("<f", buf, ips + 69, float(avg_rpm))
+                    if inst_span:
+                        ips, ipe = inst_span
+                        if child_rpms and ipe - ips >= 73:
+                            if bytes(buf[ips + 53 : ips + 69]) != b"\x00" * 16:
+                                avg_rpm = sum(child_rpms) / len(child_rpms)
+                                struct.pack_into("<f", buf, ips + 69, float(avg_rpm))
+                        if child_wgs:
+                            if silence_wav_guids and all(wg in silence_wav_guids for wg in child_wgs):
+                                struct.pack_into("<f", buf, ips + 16, -96.0)
+                            elif unmute_wav_guids and any(wg in unmute_wav_guids for wg in child_wgs):
+                                cur_db = struct.unpack_from("<f", buf, ips + 16)[0]
+                                if cur_db <= -90.0:
+                                    struct.pack_into("<f", buf, ips + 16, 0.0)
                     patch_tree(ps + 4, pe)
                 else:
                     patch_tree(ps + 4, pe)
@@ -3084,28 +3124,38 @@ def set_event_output_bus_in_proj(proj_buf: bytes, event_guid: bytes, bus_guid: b
     return bytes(buf)
 
 
-def _patch_throttle_params_in_proj(proj_payload: bytes, rename_to_load: bool) -> bytes:
+def _patch_throttle_params_in_proj(
+    proj_payload: bytes,
+    rename_to_load: bool,
+    keep_throttle: bool = False,
+) -> bytes:
     """Corrige el parámetro 'throttle' de AC, que AMS2 no alimenta en repeticiones ni en autos de la IA.
 
     - Su valor por defecto pasa a 1.0 (acelerador a fondo) para que, si el juego no lo alimenta,
       el motor no quede atrapado en las capas de 'pie levantado' (petardeos / crackle en bucle).
-    - Opcionalmente (bancos de IA) se renombra a 'load', el parámetro que AMS2 sí alimenta a la IA,
-      sólo cuando su rango es 0..1 y el banco no posee ya un parámetro 'load'.
+    - Por defecto (bancos estándar 'load') renombra 'throttle' -> 'load' cuando no hay 'load'.
+    - Si `keep_throttle=True` (bancos nativos que operan con 'throttle', ej. A424, F_Ultimate_2022,
+      F_V8_Gen1), conserva 'throttle' y, si el banco de AC sólo trae 'load', lo renombra a 'throttle'.
     """
     has_load = False
+    has_throttle = False
 
     def scan(start: int, end: int) -> None:
-        nonlocal has_load
+        nonlocal has_load, has_throttle
         for cid, ps, pe, _ in iter_riff_chunks(proj_payload, start, end):
             if cid == b"LIST":
                 scan(ps + 4, pe)
             elif cid == b"PRMB" and pe - ps >= 23:
                 slen = struct.unpack_from("<H", proj_payload, ps + 21)[0]
-                if proj_payload[ps + 23 : ps + 23 + slen].decode("latin1", "replace").rstrip("\x00") == "load":
+                pname = proj_payload[ps + 23 : ps + 23 + slen].decode("latin1", "replace").rstrip("\x00")
+                if pname == "load":
                     has_load = True
+                elif pname == "throttle":
+                    has_throttle = True
 
     scan(0, len(proj_payload))
-    do_rename = rename_to_load and not has_load
+    do_rename = rename_to_load and not keep_throttle and not has_load
+    do_load_to_thr = keep_throttle and not has_throttle
 
     def rebuild(data: bytes) -> bytes:
         out = bytearray()
@@ -3117,11 +3167,14 @@ def _patch_throttle_params_in_proj(proj_payload: bytes, rename_to_load: bool) ->
                 slen = struct.unpack_from("<H", pay, 21)[0]
                 name = pay[23 : 23 + slen].decode("latin1", "replace").rstrip("\x00")
                 tail = bytearray(pay[23 + slen :])
-                if name == "throttle" and len(tail) >= 12:
+                if (name == "throttle" or (keep_throttle and name == "load")) and len(tail) >= 12:
                     pmin, pmax = struct.unpack_from("<ff", tail, 0)
                     struct.pack_into("<f", tail, 8, float(max(pmin, min(pmax, 1.0))))
-                    if do_rename and pmin >= -0.0001 and pmax <= 2.0001:
+                    if name == "throttle" and do_rename and pmin >= -0.0001 and pmax <= 2.0001:
                         new_n = b"load"
+                        out += _riff_chunk(b"PRMB", pay[:21] + struct.pack("<H", len(new_n)) + new_n + bytes(tail))
+                    elif name == "load" and do_load_to_thr and pmin >= -0.0001 and pmax <= 2.0001:
+                        new_n = b"throttle"
                         out += _riff_chunk(b"PRMB", pay[:21] + struct.pack("<H", len(new_n)) + new_n + bytes(tail))
                     else:
                         out += _riff_chunk(b"PRMB", pay[: 23 + slen] + bytes(tail))
@@ -3202,6 +3255,1302 @@ def _reencode_pcm16_subbank_to_fadpcm(
     return build_fsb5_container(fsb_samples, mode=FSB5_MODE_FADPCM)
 
 
+def _extract_native_engine_max_rpm(native_bank_path: Path | str) -> float | None:
+    """Obtiene el tope máximo de RPM cubierto por las cajas PMLB de motor en un .bank nativo."""
+    p = Path(native_bank_path)
+    if not p.is_file():
+        return None
+    try:
+        raw = p.read_bytes()
+    except OSError:
+        return None
+    if len(raw) < 20 or raw[:4] != b"RIFF" or raw[8:12] != b"FEV ":
+        return None
+
+    rpm_prm_guids: set[bytes] = set()
+    rpm_boxes_by_prm: list[tuple[bytes, float]] = []
+
+    def _scan(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(raw, start, end):
+            if cid == b"LIST":
+                _scan(ps + 4, pe)
+            elif cid == b"PRMB" and pe - ps >= 23:
+                slen = struct.unpack_from("<H", raw, ps + 21)[0]
+                if 23 + slen <= pe - ps:
+                    pname = raw[ps + 23 : ps + 23 + slen].decode("latin1", "replace").rstrip("\x00").strip().lower()
+                    if pname in ("rpm", "rpms"):
+                        rpm_prm_guids.add(bytes(raw[ps : ps + 16]))
+            elif cid == b"PMLB" and pe - ps >= 52:
+                pg = bytes(raw[ps + 16 : ps + 32])
+                nb = struct.unpack_from("<H", raw, ps + 48)[0] >> 1
+                st = struct.unpack_from("<H", raw, ps + 50)[0]
+                if st >= 24 and ps + 52 + nb * st <= pe:
+                    local_max = 0.0
+                    for bi in range(nb):
+                        bo = ps + 52 + bi * st
+                        v0, vlen = struct.unpack_from("<ff", raw, bo + 16)
+                        if vlen > 10.0:
+                            local_max = max(local_max, v0 + vlen)
+                    if local_max > 2500.0:
+                        rpm_boxes_by_prm.append((pg, local_max))
+
+    for cid, ps, pe, _ in iter_riff_chunks(raw, 12, len(raw)):
+        if cid == b"LIST" and raw[ps : ps + 4] == b"PROJ":
+            _scan(ps + 4, pe)
+            break
+
+    max_rpm = 0.0
+    for pg, lmax in rpm_boxes_by_prm:
+        if pg in rpm_prm_guids:
+            max_rpm = max(max_rpm, lmax)
+    return max_rpm if max_rpm > 2500.0 else None
+
+
+def _extend_top_rpm_boxes_in_proj(proj_payload: bytes, target_max_rpm: float) -> bytes:
+    """Extiende hasta target_max_rpm las cajas RPM superiores si el banco AC termina antes que el auto AMS2."""
+    buf = bytearray(proj_payload)
+    rpm_prms: dict[bytes, tuple[float, float]] = {}
+    ev_max_rpm: dict[bytes, float] = {}
+    ctrls: list[tuple[bytes, bytes, bytes, int]] = []
+    evit_prop_to_map: dict[tuple[bytes, int], bytes] = {}
+    evit_prop_to_child_prm: dict[tuple[bytes, int], bytes] = {}
+
+    def _scan(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                ltype = buf[ps : ps + 4]
+                if ltype == b"EVIT":
+                    evib_self: bytes | None = None
+                    local_props: list[tuple[int, bytes]] = []
+                    local_evib_prms: list[tuple[int, bytes]] = []
+                    for scid, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
+                        if scid == b"EVIB" and spe - sps >= 40:
+                            evib_self = bytes(buf[sps : sps + 16])
+                            cnt = struct.unpack_from("<H", buf, sps + 36)[0] >> 1
+                            st = struct.unpack_from("<H", buf, sps + 38)[0]
+                            if st >= 20 and sps + 40 + cnt * st <= spe:
+                                for ci in range(cnt):
+                                    eo = sps + 40 + ci * st
+                                    pid = struct.unpack_from("<I", buf, eo)[0]
+                                    cpg = bytes(buf[eo + 4 : eo + 20])
+                                    local_evib_prms.append((pid, cpg))
+                        elif scid == b"LIST" and buf[sps : sps + 4] == b"PRPS":
+                            for pcid, pps, ppe, _ in iter_riff_chunks(buf, sps + 4, spe):
+                                if pcid == b"PROP" and ppe - pps >= 24:
+                                    pid = struct.unpack_from("<I", buf, pps)[0]
+                                    mg = bytes(buf[pps + 8 : pps + 24])
+                                    local_props.append((pid, mg))
+                    if evib_self is not None:
+                        for pid, mg in local_props:
+                            evit_prop_to_map[(evib_self, pid)] = mg
+                        for pid, cpg in local_evib_prms:
+                            evit_prop_to_child_prm[(evib_self, pid)] = cpg
+                _scan(ps + 4, pe)
+            elif cid == b"PRMB" and pe - ps >= 31:
+                slen = struct.unpack_from("<H", buf, ps + 21)[0]
+                if 23 + slen + 8 <= pe - ps:
+                    pname = buf[ps + 23 : ps + 23 + slen].decode("latin1", "replace").rstrip("\x00").strip().lower()
+                    if pname in ("rpm", "rpms"):
+                        pmin, pmax = struct.unpack_from("<ff", buf, ps + 23 + slen)
+                        rpm_prms[bytes(buf[ps : ps + 16])] = (float(pmin), float(pmax))
+            elif cid == b"PMLB" and pe - ps >= 52:
+                pg = bytes(buf[ps + 16 : ps + 32])
+                eg = bytes(buf[ps + 32 : ps + 48])
+                nb = struct.unpack_from("<H", buf, ps + 48)[0] >> 1
+                st = struct.unpack_from("<H", buf, ps + 50)[0]
+                if st >= 24 and ps + 52 + nb * st <= pe:
+                    for bi in range(nb):
+                        bo = ps + 52 + bi * st
+                        v0, vlen = struct.unpack_from("<ff", buf, bo + 16)
+                        if vlen > 10.0:
+                            cur = ev_max_rpm.get(eg, 0.0)
+                            if v0 + vlen > cur:
+                                ev_max_rpm[eg] = v0 + vlen
+            elif cid == b"CTRL" and pe - ps >= 68:
+                ctrls.append((
+                    bytes(buf[ps + 16 : ps + 32]),
+                    bytes(buf[ps + 32 : ps + 48]),
+                    bytes(buf[ps + 48 : ps + 64]),
+                    struct.unpack_from("<I", buf, ps + 64)[0],
+                ))
+
+    _scan(0, len(buf))
+
+    extend_evs = {
+        eg: mx
+        for eg, mx in ev_max_rpm.items()
+        if 2500.0 <= mx < target_max_rpm - 100.0
+    }
+    if not extend_evs:
+        return proj_payload
+
+    bumped_prms: dict[bytes, float] = {
+        pg: pmax for pg, (_pmin, pmax) in rpm_prms.items() if 2500.0 <= pmax < target_max_rpm
+    }
+
+    extended_box_ceiling: dict[bytes, float] = {}
+
+    def _patch_pmlb_and_prmb(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                _patch_pmlb_and_prmb(ps + 4, pe)
+            elif cid == b"PRMB" and pe - ps >= 31:
+                pg = bytes(buf[ps : ps + 16])
+                if pg in rpm_prms:
+                    slen = struct.unpack_from("<H", buf, ps + 21)[0]
+                    if 23 + slen + 8 <= pe - ps:
+                        _pmin, pmax = struct.unpack_from("<ff", buf, ps + 23 + slen)
+                        if 2500.0 <= pmax < target_max_rpm:
+                            struct.pack_into("<f", buf, ps + 23 + slen + 4, float(target_max_rpm))
+            elif cid == b"PMLB" and pe - ps >= 52:
+                pg = bytes(buf[ps + 16 : ps + 32])
+                eg = bytes(buf[ps + 32 : ps + 48])
+                if pg in rpm_prms and eg in extend_evs:
+                    ev_mx = extend_evs[eg]
+                    nb = struct.unpack_from("<H", buf, ps + 48)[0] >> 1
+                    st = struct.unpack_from("<H", buf, ps + 50)[0]
+                    if st >= 24 and ps + 52 + nb * st <= pe:
+                        for bi in range(nb):
+                            bo = ps + 52 + bi * st
+                            v0, vlen = struct.unpack_from("<ff", buf, bo + 16)
+                            if vlen > 10.0 and v0 + vlen >= ev_mx - 50.0:
+                                new_len = max(vlen, float(target_max_rpm) - v0)
+                                struct.pack_into("<f", buf, bo + 20, new_len)
+                                tgt_g = bytes(buf[bo : bo + 16])
+                                extended_box_ceiling[tgt_g] = max(extended_box_ceiling.get(tgt_g, 0.0), ev_mx)
+
+    _patch_pmlb_and_prmb(0, len(buf))
+
+    # Indexar posiciones de chunks MAP en LIST:MPGS para sincronizar atómicamente CURV + MAP en EVIT
+    map_spans: dict[bytes, tuple[int, int]] = {}
+
+    def _scan_maps(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                _scan_maps(ps + 4, pe)
+            elif cid == b"MAP " and pe - ps >= 28:
+                map_spans[bytes(buf[ps : ps + 16])] = (ps, pe)
+
+    _scan_maps(0, len(buf))
+
+    curv_fadeout_ceil: dict[bytes, float] = {}
+    curv_fwd_old_max: dict[bytes, float] = {}
+    map_fwd_old_max: dict[bytes, float] = {}
+    for tgt, prm, cgv, prop in ctrls:
+        if prm not in rpm_prms:
+            continue
+        if prop == 4 and tgt in extended_box_ceiling:
+            curv_fadeout_ceil[cgv] = extended_box_ceiling[tgt]
+        elif prop > 20 and prm in bumped_prms:
+            # Solo extender CURV de reenvío de parámetros a sub-evento EVIT si su MAP asociado en MPGS
+            # existe y también se actualiza atómicamente; de lo contrario, MAP(CURV(rpm)) desfasaría el pitch!
+            mg = evit_prop_to_map.get((tgt, prop))
+            cpg = evit_prop_to_child_prm.get((tgt, prop))
+            child_old_mx = bumped_prms.get(cpg, bumped_prms[prm]) if cpg is not None else bumped_prms[prm]
+            if mg and mg in map_spans:
+                mps, mpe = map_spans[mg]
+                mcnt = struct.unpack_from("<H", buf, mps + 16)[0] >> 1
+                mst = struct.unpack_from("<H", buf, mps + 18)[0]
+                if mcnt >= 2 and mst >= 8 and mps + 20 + mcnt * mst <= mpe:
+                    mx_end, my_end = struct.unpack_from("<ff", buf, mps + 20 + (mcnt - 1) * mst)
+                    if mx_end >= 0.99 and abs(my_end - child_old_mx) <= 5.0:
+                        curv_fwd_old_max[cgv] = bumped_prms[prm]
+                        map_fwd_old_max[mg] = child_old_mx
+
+    if curv_fadeout_ceil or curv_fwd_old_max or map_fwd_old_max:
+        def _patch_curv_and_map(start: int, end: int) -> None:
+            for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+                if cid == b"LIST":
+                    _patch_curv_and_map(ps + 4, pe)
+                elif cid == b"CURV" and pe - ps >= 36:
+                    cg = bytes(buf[ps : ps + 16])
+                    cnt = struct.unpack_from("<H", buf, ps + 32)[0] >> 1
+                    st = struct.unpack_from("<H", buf, ps + 34)[0]
+                    if cnt >= 2 and st >= 8 and ps + 36 + cnt * st <= pe:
+                        if cg in curv_fadeout_ceil:
+                            ev_mx = curv_fadeout_ceil[cg]
+                            x_prev, y_prev = struct.unpack_from("<ff", buf, ps + 36 + (cnt - 2) * st)
+                            x_end, y_end = struct.unpack_from("<ff", buf, ps + 36 + (cnt - 1) * st)
+                            if x_end >= ev_mx - 50.0 and y_end <= 0.01 < y_prev:
+                                struct.pack_into("<f", buf, ps + 36 + (cnt - 2) * st, max(x_prev, ev_mx))
+                                struct.pack_into("<f", buf, ps + 36 + (cnt - 1) * st, float(target_max_rpm))
+                        elif cg in curv_fwd_old_max:
+                            old_mx = curv_fwd_old_max[cg]
+                            x_end, y_end = struct.unpack_from("<ff", buf, ps + 36 + (cnt - 1) * st)
+                            if abs(x_end - old_mx) <= 5.0 and y_end >= 0.99:
+                                struct.pack_into("<f", buf, ps + 36 + (cnt - 1) * st, float(target_max_rpm))
+                elif cid == b"MAP " and map_fwd_old_max and pe - ps >= 28:
+                    mg = bytes(buf[ps : ps + 16])
+                    if mg in map_fwd_old_max:
+                        old_mx = map_fwd_old_max[mg]
+                        mcnt = struct.unpack_from("<H", buf, ps + 16)[0] >> 1
+                        mst = struct.unpack_from("<H", buf, ps + 18)[0]
+                        if mcnt >= 2 and mst >= 8 and ps + 20 + mcnt * mst <= pe:
+                            mx_end, my_end = struct.unpack_from("<ff", buf, ps + 20 + (mcnt - 1) * mst)
+                            if mx_end >= 0.99 and abs(my_end - old_mx) <= 5.0:
+                                struct.pack_into("<f", buf, ps + 20 + (mcnt - 1) * mst + 4, float(target_max_rpm))
+
+        _patch_curv_and_map(0, len(buf))
+
+    return bytes(buf)
+
+
+# Parámetros 3D Spatializer nativos de AMS2 (FMOD_DSP_TYPE_PAN / 0x1b), auditados en los 172 bancos vanilla:
+# Tupla: (rolloff, minDist, maxDist, extMode, sndSize, minExt)
+# rolloff: 0=LinearSquared (TV Replay / cámaras de pista), 2=Inverse (Chase cam / rivales IA en pista)
+AMS2_LIVE_REPLAY_PANNER: tuple[int, float, float, int, float, float] = (0, 1.0, 300.0, 0, 20.0, 120.0)
+AMS2_AI_MAIN_PANNER: tuple[int, float, float, int, float, float] = (2, 7.0, 55.0, 0, 20.0, 120.0)
+AMS2_PLAYER_EXT_PANNER: tuple[int, float, float, int, float, float] = (2, 7.0, 1000.0, 1, 20.0, 120.0)
+AMS2_EXT_TARGET_RMS_DB: float = -9.5
+AMS2_EXT_MAX_MBUS_GAIN_DB: float = 9.0
+_EXT_RMS_SKIP_KW = (
+    "pop", "backfire", "gear", "shift", "start", "limiter", "whine",
+    "turbo", "wind", "skid", "null", "blowoff", "wastegate", "cut", "tc_", "lc_",
+)
+
+
+def _parse_pmef_param_offsets(data: bytes) -> dict[int, tuple[int, int, int | float | bool | bytes]]:
+    """Parsea un payload PMEF de FMOD y devuelve {idx: (ptype, byte_offset_valor, valor)}."""
+    if len(data) < 4:
+        return {}
+    cnt = struct.unpack_from("<I", data, 0)[0]
+    off = 4
+    out: dict[int, tuple[int, int, int | float | bool | bytes]] = {}
+    for idx in range(cnt):
+        if off + 4 > len(data):
+            break
+        ptype = struct.unpack_from("<I", data, off)[0]
+        off += 4
+        val_off = off
+        if ptype == 0:
+            if off + 4 > len(data):
+                break
+            val: int | float | bool | bytes = struct.unpack_from("<f", data, off)[0]
+            off += 4
+        elif ptype == 1:
+            if off + 4 > len(data):
+                break
+            val = struct.unpack_from("<i", data, off)[0]
+            off += 4
+        elif ptype == 2:
+            if off + 1 > len(data):
+                break
+            val = bool(data[off])
+            off += 1
+        elif ptype == 3:
+            if off + 2 > len(data):
+                break
+            dlen = struct.unpack_from("<H", data, off)[0]
+            off += 2
+            if off + dlen > len(data):
+                break
+            val = bytes(data[off : off + dlen])
+            off += dlen
+        else:
+            break
+        out[idx] = (ptype, val_off, val)
+    return out
+
+
+def _extract_native_exterior_spatializers(
+    native_bank_path: Path | str | None,
+) -> dict[bytes, tuple[int, float, float, int, float, float]]:
+    """Extrae los parámetros del Spatializer 3D (BEFF 0x1b, panBlend > 0.5) por evento desde un .bank nativo."""
+    if not native_bank_path:
+        return {}
+    p = Path(native_bank_path)
+    if not p.is_file():
+        return {}
+    try:
+        raw = p.read_bytes()
+    except OSError:
+        return {}
+    proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(raw, 12, len(raw)):
+        if cid == b"LIST" and raw[ps : ps + 4] == b"PROJ":
+            proj = raw[ps + 4 : pe]
+            break
+    if not proj:
+        return {}
+    tables = dict(_iter_proj_table_items(proj))
+    mbss = {g: full for g, full, _, _ in tables.get(b"MBSS", ())}
+    befx_3d: dict[bytes, tuple[int, float, float, int, float, float]] = {}
+    for g, full, _, bpay in tables.get(b"BEFX", ()):
+        if len(bpay) < 24 or struct.unpack_from("<I", bpay, 20)[0] != 27:
+            continue
+        pmef = next(
+            (full[sps:spe] for sc, sps, spe, _ in iter_riff_chunks(full, 12, len(full)) if sc == b"PMEF"),
+            b"",
+        )
+        pm = _parse_pmef_param_offsets(pmef)
+        if 17 in pm and pm[17][0] == 0 and float(pm[17][2]) > 0.5:
+            if all(k in pm for k in (11, 12, 13, 14, 15, 16)):
+                befx_3d[g] = (
+                    int(pm[11][2]),
+                    float(pm[12][2]),
+                    float(pm[13][2]),
+                    int(pm[14][2]),
+                    float(pm[15][2]),
+                    float(pm[16][2]),
+                )
+    out: dict[bytes, tuple[int, float, float, int, float, float]] = {}
+    for g, _full, _, ev_bpay in tables.get(b"EVTS", ()):
+        mb_g = next(
+            (ev_bpay[i : i + 16] for i in range(16, len(ev_bpay) - 15) if ev_bpay[i : i + 16] in mbss),
+            None,
+        )
+        if not mb_g:
+            continue
+        mf = mbss[mb_g]
+        for i in range(0, len(mf) - 15):
+            w = mf[i : i + 16]
+            if w in befx_3d:
+                out[g] = befx_3d[w]
+                break
+    return out
+
+
+def _estimate_ac_exterior_makeup_gain_db(
+    ac_bank: FmodBank,
+    orig_proj: bytes,
+    p_ext_orig_guid: bytes | None,
+) -> float:
+    """Calcula la compensación limpia en punto flotante (dB) para igualar el nivel exterior de AC al estándar AMS2.
+
+    Mide el RMS mediano de las muestras sostenidas del motor exterior más cualquier atenuación base
+    presente en MBUS / FMOD Gain / curva Distance->MBUS, sin modificar ni saturar las muestras PCM16.
+    """
+    if not p_ext_orig_guid:
+        return 0.0
+    p_ext_ev = next((e for e in ac_bank.events if e.guid_bytes == p_ext_orig_guid), None)
+    if p_ext_ev is None:
+        return 0.0
+
+    slot_by_name = {sl.name: sl for sl in ac_bank.slots}
+    # Incluir muestras de p_ext y de sus sub-eventos EVIB anidados (ej. RSS Protech P96)
+    active_ext_locs = _compute_active_direct_sample_locs(orig_proj, ac_bank, {p_ext_orig_guid})
+    if active_ext_locs:
+        all_sls = [sl for sl in ac_bank.slots if (sl.subbank_index, sl.sample_index) in active_ext_locs]
+    else:
+        all_sls = [slot_by_name[n] for n in p_ext_ev.linked_samples if isinstance(n, str) and n in slot_by_name]
+    sustained_sls = [
+        sl for sl in all_sls
+        if sl.mode in (FSB5_MODE_PCM16, FSB5_MODE_FADPCM)
+        and not any(kw in sl.name.lower() for kw in _EXT_RMS_SKIP_KW)
+    ]
+    if not sustained_sls:
+        sustained_sls = [sl for sl in all_sls if sl.mode in (FSB5_MODE_PCM16, FSB5_MODE_FADPCM)]
+    sustained_sls.sort(key=lambda s: -s.pcm_samples)
+
+    rms_vals: list[float] = []
+    for sl in sustained_sls[:24]:
+        try:
+            if sl.mode == FSB5_MODE_PCM16 and sl.data_bytes:
+                nbytes = (len(sl.data_bytes) // 2) * 2
+                if nbytes <= 0:
+                    continue
+                arr = np.frombuffer(sl.data_bytes[:nbytes], dtype="<i2").astype(np.float64) / 32768.0
+            elif sl.mode == FSB5_MODE_FADPCM and sl.data_bytes:
+                arr = decode_fadpcm(sl.data_bytes, sl.channels, sl.pcm_samples).astype(np.float64) / 32768.0
+            else:
+                continue
+            if arr.size == 0:
+                continue
+            rms = float(np.sqrt(np.mean(arr * arr)))
+            if rms > 1e-6:
+                rms_vals.append(20.0 * math.log10(rms))
+        except Exception:
+            continue
+    rms_db = float(np.percentile(rms_vals, 75)) if rms_vals else AMS2_EXT_TARGET_RMS_DB
+
+    # Sumar atenuaciones base en MBUS (BUS static vol + FMOD Gain PEFF + curva Distance->MBUS a 25 m)
+    tables = dict(_iter_proj_table_items(orig_proj))
+    mbss = {g: full for g, full, _, _ in tables.get(b"MBSS", ())}
+    ev_bpay = next((bp for g, _, _, bp in tables.get(b"EVTS", ()) if g == p_ext_orig_guid), b"")
+    mb_g = next(
+        (ev_bpay[i : i + 16] for i in range(16, len(ev_bpay) - 15) if ev_bpay[i : i + 16] in mbss),
+        None,
+    )
+    mvol_db = 0.0
+    gain_fx_db = 0.0
+    dist_mbus_db = 0.0
+    if mb_g:
+        mf = mbss[mb_g]
+        bus_b = next(
+            (mf[sps:spe] for sc, sps, spe, _ in iter_riff_chunks(mf, 12, len(mf)) if sc == b"BUS "),
+            b"",
+        )
+        if len(bus_b) >= 16 and bus_b[-8:-4] == b"\xff\xff\xff\x7f":
+            mvol_db = float(struct.unpack_from("<f", bus_b, len(bus_b) - 16)[0])
+
+        pefx = {g: (full, bpay) for g, full, _, bpay in tables.get(b"PEFX", ())}
+        seen_pefx: set[bytes] = set()
+        for i in range(0, len(mf) - 15):
+            w = mf[i : i + 16]
+            if w in pefx and w not in seen_pefx:
+                seen_pefx.add(w)
+                pfull, pbpay = pefx[w]
+                if len(pbpay) >= 22:
+                    nlen = struct.unpack_from("<H", pbpay, 20)[0]
+                    if 22 + nlen <= len(pbpay):
+                        pname = pbpay[22 : 22 + nlen].decode("ascii", errors="replace").lower()
+                        if "gain" in pname:
+                            pmef = next(
+                                (pfull[sps:spe] for sc, sps, spe, _ in iter_riff_chunks(pfull, 12, len(pfull)) if sc == b"PMEF"),
+                                b"",
+                            )
+                            pm = _parse_pmef_param_offsets(pmef)
+                            if 0 in pm and pm[0][0] == 0:
+                                gain_fx_db += float(pm[0][2])
+
+        # Evaluar cualquier curva Distance -> MBUS (prop==0) a 25 m (distancia típica de cámara de pista)
+        dist_prms: set[bytes] = set()
+        for _, _, _, pb in tables.get(b"PRMS", ()):
+            for idx_n in range(16, min(32, len(pb) - 4)):
+                nl = struct.unpack_from("<H", pb, idx_n)[0]
+                if 2 <= nl <= 32 and idx_n + 2 + nl + 12 <= len(pb):
+                    cand = pb[idx_n + 2 : idx_n + 2 + nl]
+                    if all(32 <= c < 127 for c in cand):
+                        if cand.decode("ascii").lower() == "distance":
+                            dist_prms.add(pb[:16])
+                        break
+        curvs: dict[bytes, list[tuple[float, float]]] = {}
+        for cg, _, _, cb in tables.get(b"CRVS", ()):
+            if len(cb) >= 36:
+                cnt_r, st = struct.unpack_from("<HH", cb, 32)
+                cnt_p = cnt_r >> 1
+                if st >= 8:
+                    curvs[cg] = [
+                        struct.unpack_from("<ff", cb, 36 + pi * st)
+                        for pi in range(cnt_p)
+                        if 36 + pi * st + 8 <= len(cb)
+                    ]
+        for _, _, _, cb in tables.get(b"CTRS", ()):
+            if len(cb) >= 68 and cb[16:32] == mb_g and cb[32:48] in dist_prms and struct.unpack_from("<I", cb, 64)[0] == 0:
+                pts = curvs.get(cb[48:64], ())
+                if pts:
+                    x_eval = 25.0
+                    if x_eval <= pts[0][0]:
+                        val_d = pts[0][1]
+                    elif x_eval >= pts[-1][0]:
+                        val_d = pts[-1][1]
+                    else:
+                        val_d = pts[-1][1]
+                        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+                            if x0 <= x_eval <= x1:
+                                val_d = y1 if abs(x1 - x0) < 1e-6 else (y0 + (x_eval - x0) / (x1 - x0) * (y1 - y0))
+                                break
+                    dist_mbus_db += float(val_d)
+
+    effective_db = rms_db + mvol_db + gain_fx_db + dist_mbus_db
+    desired_add = AMS2_EXT_TARGET_RMS_DB - effective_db
+    # Tope estricto e idempotente sobre el fader MBUS final (<= AMS2_EXT_MAX_MBUS_GAIN_DB)
+    max_headroom = max(0.0, AMS2_EXT_MAX_MBUS_GAIN_DB - mvol_db)
+    return max(0.0, min(AMS2_EXT_MAX_MBUS_GAIN_DB, max_headroom, desired_add))
+
+
+def _match_ams2_exterior_loudness_in_proj(
+    proj_buf: bytes,
+    ac_bank: FmodBank,
+    orig_proj_payload: bytes,
+    p_ext_orig_guid: bytes | None,
+    ext_event_profiles: dict[bytes, tuple[tuple[int, float, float, int, float, float], float]],
+) -> bytes:
+    """Iguala el volumen y alcance exterior/replay de eventos AC al estándar vanilla de AMS2 sin saturar audio.
+
+    Opera estrictamente in-place (sin cambiar tamaños ni orden de tablas):
+    1) Alinea el 3D Spatializer (BEFF 0x1b, panBlend > 0.5) de cada evento exterior al perfil nativo AMS2
+       (p.ej. LinearSquared 1..300m en AI_EngineMAIN_LIVE para TV Replays, Inverse 7..1000m en Player EngineExt).
+    2) Suaviza el FMOD Distance Filter (PEFF) de AC (ausente en AMS2 vanilla) ampliando su distancia máxima.
+    3) Aplica compensación de sonoridad en 32-bit float sobre el fader MBUS (BUS static vol, <= +10 dB)
+       antes de los limitadores nativos del MasterBank de AMS2, evitando clipeo de muestras PCM16.
+    """
+    if not ext_event_profiles:
+        return proj_buf
+
+    makeup_db = _estimate_ac_exterior_makeup_gain_db(ac_bank, orig_proj_payload, p_ext_orig_guid)
+    buf = bytearray(proj_buf)
+    tables = dict(_iter_proj_table_items(proj_buf))
+    mbss_items = {g: full for g, full, _, _ in tables.get(b"MBSS", ())}
+    evts_bpay = {g: bpay for g, _, _, bpay in tables.get(b"EVTS", ())}
+
+    # Mapear MBUS -> (panner_params, min_df_dist), BEFF -> panner_params, PEFF -> min_df_dist
+    mbus_to_cfg: dict[bytes, tuple[tuple[int, float, float, int, float, float], float]] = {}
+    befx_set = {g for g, _, _, bp in tables.get(b"BEFX", ()) if len(bp) >= 24 and struct.unpack_from("<I", bp, 20)[0] == 27}
+    pefx_df_set: set[bytes] = set()
+    for g, _, _, bp in tables.get(b"PEFX", ()):
+        if len(bp) >= 22:
+            nl = struct.unpack_from("<H", bp, 20)[0]
+            if 22 + nl <= len(bp) and "distance filter" in bp[22 : 22 + nl].decode("ascii", errors="replace").lower():
+                pefx_df_set.add(g)
+
+    befx_to_pan: dict[bytes, tuple[int, float, float, int, float, float]] = {}
+    pefx_to_min_d: dict[bytes, float] = {}
+    for ev_g, (pan_cfg, min_df_d) in ext_event_profiles.items():
+        eb = evts_bpay.get(ev_g)
+        if not eb:
+            continue
+        mb_g = next(
+            (eb[i : i + 16] for i in range(16, len(eb) - 15) if eb[i : i + 16] in mbss_items),
+            None,
+        )
+        if not mb_g or mb_g in mbus_to_cfg:
+            continue
+        mbus_to_cfg[mb_g] = (pan_cfg, min_df_d)
+        mf = mbss_items[mb_g]
+        for i in range(0, len(mf) - 15):
+            w = mf[i : i + 16]
+            if w in befx_set and w not in befx_to_pan:
+                befx_to_pan[w] = pan_cfg
+            elif w in pefx_df_set and w not in pefx_to_min_d:
+                pefx_to_min_d[w] = min_df_d
+
+    if not mbus_to_cfg:
+        return proj_buf
+
+    # Parchear in-place MBSS (volumen float), BEFX (Spatializer 3D) y PEFX (Distance Filter)
+    for cid, ps, pe, _ in iter_riff_chunks(buf, 0, len(buf)):
+        if cid != b"LIST":
+            continue
+        lt = bytes(buf[ps : ps + 4])
+        if lt == b"MBSS" and abs(makeup_db) > 0.05:
+            for sc, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
+                if sc != b"LIST":
+                    continue
+                mg: bytes | None = None
+                bus_span: tuple[int, int] | None = None
+                for c2, a2, z2, _ in iter_riff_chunks(buf, sps + 4, spe):
+                    if c2 == b"MBSB" and z2 - a2 >= 16:
+                        mg = bytes(buf[a2 : a2 + 16])
+                    elif c2 == b"BUS " and z2 - a2 >= 16:
+                        bus_span = (a2, z2)
+                if mg in mbus_to_cfg and bus_span is not None:
+                    ba, bz = bus_span
+                    if buf[bz - 8 : bz - 4] == b"\xff\xff\xff\x7f":
+                        cur_v = struct.unpack_from("<f", buf, bz - 16)[0]
+                        new_v = max(-80.0, min(10.0, cur_v + makeup_db))
+                        struct.pack_into("<f", buf, bz - 16, float(new_v))
+        elif lt == b"BEFX" and befx_to_pan:
+            for sc, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
+                if sc != b"LIST":
+                    continue
+                bg: bytes | None = None
+                pmef_span: tuple[int, int] | None = None
+                for c2, a2, z2, _ in iter_riff_chunks(buf, sps + 4, spe):
+                    if c2 == b"BEFB" and z2 - a2 >= 24:
+                        bg = bytes(buf[a2 : a2 + 16])
+                    elif c2 == b"PMEF" and z2 - a2 >= 16:
+                        pmef_span = (a2, z2)
+                if bg in befx_to_pan and pmef_span is not None:
+                    pa, pz = pmef_span
+                    pm = _parse_pmef_param_offsets(bytes(buf[pa:pz]))
+                    # Solo modificar el Spatializer 3D real (panBlend > 0.5), nunca el panner 2D
+                    if 17 in pm and pm[17][0] == 0 and float(pm[17][2]) > 0.5:
+                        rolloff, min_d, max_d, ext_mode, snd_size, min_ext = befx_to_pan[bg]
+                        if 11 in pm and pm[11][0] == 1:
+                            struct.pack_into("<i", buf, pa + pm[11][1], int(rolloff))
+                        if 12 in pm and pm[12][0] == 0:
+                            struct.pack_into("<f", buf, pa + pm[12][1], float(min_d))
+                        if 13 in pm and pm[13][0] == 0:
+                            struct.pack_into("<f", buf, pa + pm[13][1], float(max_d))
+                        if 14 in pm and pm[14][0] == 1:
+                            struct.pack_into("<i", buf, pa + pm[14][1], int(ext_mode))
+                        if 15 in pm and pm[15][0] == 0:
+                            struct.pack_into("<f", buf, pa + pm[15][1], float(snd_size))
+                        if 16 in pm and pm[16][0] == 0:
+                            struct.pack_into("<f", buf, pa + pm[16][1], float(min_ext))
+        elif lt == b"PEFX" and pefx_to_min_d:
+            for sc, sps, spe, _ in iter_riff_chunks(buf, ps + 4, pe):
+                if sc != b"LIST":
+                    continue
+                pg_fx: bytes | None = None
+                pmef_span = None
+                for c2, a2, z2, _ in iter_riff_chunks(buf, sps + 4, spe):
+                    if c2 == b"PEFB" and z2 - a2 >= 22:
+                        pg_fx = bytes(buf[a2 : a2 + 16])
+                    elif c2 == b"PMEF" and z2 - a2 >= 12:
+                        pmef_span = (a2, z2)
+                if pg_fx in pefx_to_min_d and pmef_span is not None:
+                    pa, pz = pmef_span
+                    pm = _parse_pmef_param_offsets(bytes(buf[pa:pz]))
+                    if 0 in pm and pm[0][0] == 0:
+                        cur_df_d = float(pm[0][2])
+                        min_df_d = pefx_to_min_d[pg_fx]
+                        if cur_df_d < min_df_d:
+                            struct.pack_into("<f", buf, pa + pm[0][1], float(min_df_d))
+
+    return bytes(buf)
+
+
+def _collect_mapping_patches_for_direct_bank(
+    bank: FmodBank,
+    mappings: list[SlotMappingConfig] | None,
+    rpm_bands: list[RpmBandConfig] | None = None,
+    library: SourceAudioLibrary | None = None,
+) -> tuple[
+    dict[bytes, tuple[int, int]],
+    dict[bytes, float],
+    dict[bytes, float],
+    set[bytes],
+    set[bytes],
+    dict[int, Path],
+]:
+    """Traduce mappings + rpm_bands en diccionarios de parcheo para _patch_proj_chunks y reemplazos WAV."""
+    wav_redirects: dict[bytes, tuple[int, int]] = {}
+    autopitch_updates: dict[bytes, float] = {}
+    gain_db_deltas: dict[bytes, float] = {}
+    silence_wav_guids: set[bytes] = set()
+    unmute_wav_guids: set[bytes] = set()
+    custom_wav_replacements: dict[int, Path] = {}
+
+    if rpm_bands:
+        band_muted_slots: set[int] = set()
+        band_active_slots: set[int] = set()
+        for b in rpm_bands:
+            for gidx in b.donor_slot_indices:
+                if b.is_muted_bus:
+                    band_muted_slots.add(gidx)
+                else:
+                    band_active_slots.add(gidx)
+        for sl in bank.slots:
+            if sl.wav_guid is None:
+                continue
+            if sl.global_index in band_active_slots:
+                unmute_wav_guids.add(sl.wav_guid)
+            elif sl.global_index in band_muted_slots:
+                silence_wav_guids.add(sl.wav_guid)
+
+    if mappings:
+        map_by_gidx = {c.donor_global_index: c for c in mappings}
+        for sl in bank.slots:
+            if sl.wav_guid is None:
+                continue
+            cfg = map_by_gidx.get(sl.global_index)
+            if cfg is None:
+                continue
+            if cfg.override_root_rpm is not None and cfg.override_root_rpm > 100.0:
+                if sl.autopitch_ref_rpm is None or abs(cfg.override_root_rpm - sl.autopitch_ref_rpm) > 0.1:
+                    autopitch_updates[sl.wav_guid] = float(cfg.override_root_rpm)
+            if cfg.action == "silence":
+                silence_wav_guids.add(sl.wav_guid)
+                unmute_wav_guids.discard(sl.wav_guid)
+            else:
+                if abs(float(cfg.gain_db or 0.0)) > 1e-4:
+                    gain_db_deltas[sl.wav_guid] = float(cfg.gain_db)
+                if cfg.action == "replace_source" and cfg.source_index is not None and library is not None:
+                    if 0 <= cfg.source_index < len(library.items):
+                        src_it = library.items[cfg.source_index]
+                        if src_it._slot_ref is not None:
+                            new_loc = (src_it._slot_ref.subbank_index, src_it._slot_ref.sample_index)
+                            if new_loc != (sl.subbank_index, sl.sample_index):
+                                wav_redirects[sl.wav_guid] = new_loc
+                        elif src_it._wav_path is not None and Path(src_it._wav_path).is_file():
+                            custom_wav_replacements[sl.global_index] = Path(src_it._wav_path)
+                elif cfg.action == "replace_wav" and cfg.custom_wav_path is not None:
+                    wp = Path(cfg.custom_wav_path)
+                    if wp.is_file():
+                        custom_wav_replacements[sl.global_index] = wp
+
+    return (
+        wav_redirects,
+        autopitch_updates,
+        gain_db_deltas,
+        silence_wav_guids,
+        unmute_wav_guids,
+        custom_wav_replacements,
+    )
+
+
+def _apply_custom_wav_replacements_to_subbanks(
+    bank: FmodBank,
+    final_fsb_blobs: list[bytearray],
+    custom_wav_replacements: dict[int, Path],
+) -> None:
+    """Re-codifica únicamente los sub-bancos afectados por reemplazos WAV externos preservando su códec."""
+    if not custom_wav_replacements:
+        return
+    affected_sbs: set[int] = set()
+    for sl in bank.slots:
+        if sl.global_index in custom_wav_replacements:
+            affected_sbs.add(sl.subbank_index)
+
+    for sb_idx in sorted(affected_sbs):
+        if not (0 <= sb_idx < len(final_fsb_blobs)):
+            continue
+        blob = final_fsb_blobs[sb_idx]
+        sb_mode = struct.unpack_from("<I", blob, 24)[0] if len(blob) >= 28 else FSB5_MODE_PCM16
+        if sb_mode not in (FSB5_MODE_PCM16, FSB5_MODE_FADPCM):
+            sb_mode = FSB5_MODE_FADPCM
+        slots_in_sb = sorted(
+            (sl for sl in bank.slots if sl.subbank_index == sb_idx),
+            key=lambda s: s.sample_index,
+        )
+        fsb_samples: list[FsbBuildSample] = []
+        for sl in slots_in_sb:
+            wav_p = custom_wav_replacements.get(sl.global_index)
+            if wav_p is not None:
+                raw_wav = read_wav_file(wav_p)
+                buf = conform_audio(
+                    raw_wav,
+                    target_sr=int(sl.sample_rate or 48000),
+                    target_channels=max(1, min(2, int(sl.channels or 1))),
+                    gain_db=0.0,
+                    need_loop=bool(sl.loop_start is not None or sl.loop_end is not None),
+                )
+                fsb_samples.append(FsbBuildSample(name=sl.name, audio=buf))
+            else:
+                fsb_samples.append(FsbBuildSample(name=sl.name, audio=bank.decode_slot_to_buffer(sl)))
+        final_fsb_blobs[sb_idx] = bytearray(build_fsb5_container(fsb_samples, mode=sb_mode))
+
+
+def uninvert_spatial_cone_in_bank_bytes(bank_bytes: bytes) -> bytes:
+    """Aplica invert_event_cone_curves_in_proj (involución exacta) sobre PROJ de un .bank sin alterar tamaños ni SNDH."""
+    if len(bank_bytes) < 20 or bank_bytes[:4] != b"RIFF" or bank_bytes[8:12] != b"FEV ":
+        return bank_bytes
+    out = bytearray(bank_bytes)
+    for cid, ps, pe, _ in iter_riff_chunks(out, 12, len(out)):
+        if cid == b"LIST" and out[ps : ps + 4] == b"PROJ":
+            proj_inner = bytes(out[ps + 4 : pe])
+            patched, cnt = invert_event_cone_curves_in_proj(proj_inner)
+            if cnt > 0 and len(patched) == len(proj_inner):
+                out[ps + 4 : pe] = patched
+            break
+    return bytes(out)
+
+
+def apply_band_edits_to_bank(
+    bank: FmodBank,
+    rpm_bands: list[RpmBandConfig] | None = None,
+    mappings: list[SlotMappingConfig] | None = None,
+    library: SourceAudioLibrary | None = None,
+) -> bytes:
+    """Aplica ediciones de bandas RPM, pitch, ganancia, silencios y muestras en un .bank ya modificado.
+
+    Preserva al 100% los GUIDs de banco/eventos, tabla STDT, buses IBSB, variantes extra,
+    orientación espacial del cono y sub-bancos FSB5 no modificados.
+    """
+    fmt_payload = struct.pack("<II", bank.file_version or 0x50, bank.compat_version or 0x46)
+    orig_proj_payload = b""
+    for cid, ps, pe, _ in iter_riff_chunks(bank.raw, 12, len(bank.raw)):
+        if cid == b"FMT ":
+            fmt_payload = bank.raw[ps:pe]
+        elif cid == b"LIST" and bank.raw[ps : ps + 4] == b"PROJ":
+            orig_proj_payload = bank.raw[ps + 4 : pe]
+
+    (
+        wav_redirects,
+        autopitch_updates,
+        gain_db_deltas,
+        silence_wav_guids,
+        unmute_wav_guids,
+        custom_wav_replacements,
+    ) = _collect_mapping_patches_for_direct_bank(bank, mappings, rpm_bands, library)
+
+    patched_proj_body = _patch_proj_chunks(
+        proj_payload=orig_proj_payload,
+        wav_redirects=wav_redirects,
+        autopitch_updates=autopitch_updates,
+        guid_map=None,
+        rpm_bands=rpm_bands,
+        gain_db_deltas=gain_db_deltas,
+        silence_wav_guids=silence_wav_guids,
+        unmute_wav_guids=unmute_wav_guids,
+    )
+
+    final_fsb_blobs = [bytearray(sb.raw_fsb_bytes) for sb in bank.subbanks]
+    _apply_custom_wav_replacements_to_subbanks(bank, final_fsb_blobs, custom_wav_replacements)
+
+    sndh_ver = bank.sndh_version or (0x00080000 | (2 * len(final_fsb_blobs) + 1))
+    dummy_sndh = struct.pack("<I", sndh_ver) + b"\x00" * (8 * len(final_fsb_blobs))
+    temp_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, dummy_sndh, None)
+
+    fmt_chunk_bytes = b"FMT " + struct.pack("<I", len(fmt_payload)) + fmt_payload
+    if len(fmt_payload) & 1:
+        fmt_chunk_bytes += b"\x00"
+
+    proj_list_size = 4 + len(temp_proj_body)
+    proj_total_bytes = 8 + proj_list_size + (proj_list_size & 1)
+
+    cur_file_pos = 12 + len(fmt_chunk_bytes) + proj_total_bytes
+    sndh_entries: list[tuple[int, int]] = []
+    snd_chunks_built: list[bytes] = []
+
+    for fsb_blob in final_fsb_blobs:
+        snd_payload_start = cur_file_pos + 8
+        pad_before = (32 - (snd_payload_start % 32)) % 32
+        fsb_pos = snd_payload_start + pad_before
+        fsb_len = len(fsb_blob)
+        snd_payload = (b"\x00" * pad_before) + bytes(fsb_blob)
+        snd_chunk = b"SND " + struct.pack("<I", len(snd_payload)) + snd_payload
+        if len(snd_payload) & 1:
+            snd_chunk += b"\x00"
+        sndh_entries.append((fsb_pos, fsb_len))
+        snd_chunks_built.append(snd_chunk)
+        cur_file_pos += len(snd_chunk)
+
+    real_sndh = struct.pack("<I", sndh_ver) + b"".join(
+        struct.pack("<II", fpos, flen) for fpos, flen in sndh_entries
+    )
+    final_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, real_sndh, None)
+    assert len(final_proj_body) == len(temp_proj_body), "Tamaño inesperado al actualizar SNDH"
+
+    proj_chunk_bytes = (
+        b"LIST"
+        + struct.pack("<I", 4 + len(final_proj_body))
+        + b"PROJ"
+        + final_proj_body
+        + (b"\x00" if (len(final_proj_body) & 1) else b"")
+    )
+
+    body = fmt_chunk_bytes + proj_chunk_bytes + b"".join(snd_chunks_built)
+    return b"RIFF" + struct.pack("<I", 4 + len(body)) + b"FEV " + body
+
+
+def _extract_event_subgraph_closure(
+    tables: list[tuple[bytes, list[tuple[bytes, bytes, bytes, bytes]]]],
+    root_event_guids: set[bytes],
+) -> set[bytes]:
+    """Calcula el subgrafo completo de objetos PROJ alcanzables desde un conjunto de eventos raíz.
+
+    Sigue referencias hacia adelante (EVTB -> IBSB/MBSB/TLNB/PRMB, EVIB -> sub-evento EVTB,
+    WAIB -> WAV/PRMB/GBSB/CURV/MAP, etc.) y únicamente aristas inversas de propiedad real
+    (PMLB[32:48], TLNB[16:32], CTRL[16:32], MODS[16:32], GBSB/RBSB[18:34], efectos sobre buses),
+    evitando contaminar el subgrafo con otros eventos raíz que compartan parámetros o muestras.
+    """
+    index: dict[bytes, list[tuple[bytes, bytes, bytes, bytes]]] = {}
+    for lt, items in tables:
+        for k, full, base, bpay in items:
+            index.setdefault(k, []).append((lt, full, base, bpay))
+
+    fwd: dict[bytes, set[bytes]] = {}
+    for k, parts in index.items():
+        s: set[bytes] = set()
+        for _lt, full, _base, _bpay in parts:
+            for i in range(0, len(full) - 15):
+                w = full[i : i + 16]
+                if w != k and w in index:
+                    s.add(w)
+        fwd[k] = s
+
+    bus_bases = {b"IBSB", b"GBSB", b"MBSB", b"RBSB"}
+    fx_bases = {b"BEFB", b"PEFB", b"SEFB", b"SCFB", b"SCEF"}
+    rev_owned: dict[bytes, set[bytes]] = {}
+    for lt, items in tables:
+        for w, full, base, bpay in items:
+            if base == b"PMLB" and len(bpay) >= 48:
+                rev_owned.setdefault(bpay[32:48], set()).add(w)
+            elif base == b"TLNB" and len(bpay) >= 32:
+                rev_owned.setdefault(bpay[16:32], set()).add(w)
+            elif base == b"CTRL" and len(bpay) >= 32:
+                rev_owned.setdefault(bpay[16:32], set()).add(w)
+            elif lt == b"MODS" and len(bpay) >= 32:
+                rev_owned.setdefault(bpay[16:32], set()).add(w)
+            elif base in (b"GBSB", b"RBSB") and len(bpay) >= 34:
+                rev_owned.setdefault(bpay[18:34], set()).add(w)
+            elif base in fx_bases:
+                for ref_g in fwd.get(w, ()):
+                    if any(eb in bus_bases for _, _, eb, _ in index.get(ref_g, ())):
+                        rev_owned.setdefault(ref_g, set()).add(w)
+
+    closure: set[bytes] = {g for g in root_event_guids if g in index}
+    queue: list[bytes] = list(closure)
+    while queue:
+        g = queue.pop()
+        for w in fwd.get(g, ()):
+            if w not in closure:
+                closure.add(w)
+                queue.append(w)
+        for w in rev_owned.get(g, ()):
+            if w not in closure:
+                closure.add(w)
+                queue.append(w)
+
+    return closure
+
+
+def _remap_chunk_guids_leaves(chunk_bytes: bytes, remap: dict[bytes, bytes]) -> bytes:
+    """Remapea GUIDs dentro de los chunks hoja de un item RIFF sin alterar cabeceras RIFF ni LCNT."""
+    if not remap:
+        return chunk_bytes
+    buf = bytearray(chunk_bytes)
+
+    def _walk(start: int, end: int) -> None:
+        for cid, ps, pe, _ in iter_riff_chunks(buf, start, end):
+            if cid == b"LIST":
+                _walk(ps + 4, pe)
+            elif cid not in (b"LCNT", b"SNDH", b"STDT", b"STBL") and pe - ps >= 16:
+                i = ps
+                limit = pe - 16
+                while i <= limit:
+                    rep = remap.get(bytes(buf[i : i + 16]))
+                    if rep is not None:
+                        buf[i : i + 16] = rep
+                        i += 16
+                    else:
+                        i += 1
+
+    _walk(0, len(buf))
+    return bytes(buf)
+
+
+def _patch_wav_chunk_subbank(wav_chunk_bytes: bytes, new_sb: int) -> bytes:
+    """Actualiza el índice de sub-banco (u16 en WAV[18:20]) preservando flags, sample_index y load_mode."""
+    if len(wav_chunk_bytes) < 38 or wav_chunk_bytes[:4] != b"WAV ":
+        return wav_chunk_bytes
+    out = bytearray(wav_chunk_bytes)
+    f0, _old_sb, flags, smp_idx, load_mode = struct.unpack_from("<HHHII", out, 24)
+    struct.pack_into("<HHHII", out, 24, f0, int(new_sb), flags, smp_idx, load_mode)
+    return bytes(out)
+
+
+def collect_vanilla_scope_targets(
+    vehicle: object,
+    ac_bank: FmodBank | None,
+    audio_scope: str,
+    is_ai: bool = False,
+) -> tuple[set[bytes], set[bytes], dict[bytes, str], dict[str, list[tuple]]]:
+    """Determina los eventos a reemplazar/silenciar y el mapa de rutas para un alcance parcial ('interior'/'exterior').
+
+    Retorna: (replace_event_guids, silence_native_event_guids, event_paths_map, augmented_extra_variants)
+    """
+    event_guids: dict[str, str] = dict(getattr(vehicle, "ai_event_guids" if is_ai else "event_guids", {}) or {})
+    event_paths: dict[str, str] = dict(getattr(vehicle, "ai_event_paths" if is_ai else "event_paths", {}) or {})
+    raw_extras: dict[str, list[tuple]] = {
+        k: list(v)
+        for k, v in (getattr(vehicle, "extra_ai_event_variants" if is_ai else "extra_event_variants", {}) or {}).items()
+    }
+
+    paths_by_bytes: dict[bytes, str] = {}
+    for role, g_str in event_guids.items():
+        if not g_str:
+            continue
+        gb = guid_str_to_bytes(g_str)
+        if role in event_paths and event_paths[role]:
+            paths_by_bytes[gb] = event_paths[role]
+    for _role, items in raw_extras.items():
+        for it in items:
+            if it and it[0]:
+                gb = guid_str_to_bytes(it[0])
+                if len(it) >= 2 and it[1]:
+                    paths_by_bytes.setdefault(gb, it[1])
+
+    replace_guids: set[bytes] = set()
+    silence_guids: set[bytes] = set()
+
+    if is_ai:
+        if audio_scope == "exterior":
+            for role, g_str in event_guids.items():
+                if not g_str:
+                    continue
+                if role.startswith(("ai_engine_main", "ai_engine_live", "ai_engine_ext")):
+                    replace_guids.add(guid_str_to_bytes(g_str))
+            for role in ("ai_engine_main", "ai_engine_live", "ai_engine_ext"):
+                for it in raw_extras.get(role, ()):
+                    if it and it[0]:
+                        replace_guids.add(guid_str_to_bytes(it[0]))
+        return replace_guids, silence_guids, paths_by_bytes, raw_extras
+
+    # Player bank
+    if audio_scope == "interior":
+        if "EngineInt" in event_guids:
+            replace_guids.add(guid_str_to_bytes(event_guids["EngineInt"]))
+        if "AuxInt" in event_guids:
+            aux_str = event_guids["AuxInt"]
+            aux_b = guid_str_to_bytes(aux_str)
+            replace_guids.add(aux_b)
+            existing_int_ex = {it[0].lower() for it in raw_extras.get("EngineInt", ()) if it and it[0]}
+            if aux_str.lower() != event_guids.get("EngineInt", "").lower() and aux_str.lower() not in existing_int_ex:
+                raw_extras.setdefault("EngineInt", []).append((aux_str, event_paths.get("AuxInt", "")))
+        for it in raw_extras.get("EngineInt", ()):
+            if it and it[0]:
+                replace_guids.add(guid_str_to_bytes(it[0]))
+    elif audio_scope == "exterior":
+        if "EngineExt" in event_guids:
+            replace_guids.add(guid_str_to_bytes(event_guids["EngineExt"]))
+        for it in raw_extras.get("EngineExt", ()):
+            if it and it[0]:
+                replace_guids.add(guid_str_to_bytes(it[0]))
+
+        # Exhaust en AMS2 es el canal trasero 3D en exterior/chase: reemplazar con AC si AC trae Exhaust,
+        # o neutralizarlo para que no se superponga el escape vanilla sobre el exterior de AC.
+        exhaust_guids: set[bytes] = set()
+        if "Exhaust" in event_guids:
+            exhaust_guids.add(guid_str_to_bytes(event_guids["Exhaust"]))
+        for it in raw_extras.get("Exhaust", ()):
+            if it and it[0]:
+                exhaust_guids.add(guid_str_to_bytes(it[0]))
+        has_ac_exhaust = bool(
+            ac_bank
+            and any(
+                any(k in (ev.path or "").lower() for k in ("exhaust", "tailpipe", "muffler"))
+                for ev in ac_bank.events
+            )
+        )
+        if has_ac_exhaust:
+            replace_guids.update(exhaust_guids)
+        else:
+            silence_guids.update(exhaust_guids)
+
+    return replace_guids, silence_guids, paths_by_bytes, raw_extras
+
+
+def merge_ported_events_into_native_bank(
+    native_bank: FmodBank,
+    ported_bank: FmodBank,
+    replace_event_guids: set[bytes],
+    silence_native_event_guids: set[bytes] | None = None,
+    event_paths_map: dict[bytes, str] | None = None,
+    mod_identifier: str = "custom_mod",
+    seed_tag: str = "hybrid",
+    silence_bus_guid: bytes | None = None,
+) -> bytes:
+    """Combina eventos específicos del banco porteado dentro del banco vanilla original de AMS2.
+
+    Mantiene 100% intactos los eventos vanilla no seleccionados (y sus sub-bancos FSB5 originales),
+    mientras trasplanta únicamente el subgrafo y las muestras FSB5 de los eventos seleccionados
+    desde `ported_bank` con GUIDs remapeados sin colisiones y tablas FMOD ordenadas.
+    """
+    fmt_payload = struct.pack("<II", native_bank.file_version or 0x50, native_bank.compat_version or 0x46)
+    native_proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(native_bank.raw, 12, len(native_bank.raw)):
+        if cid == b"FMT ":
+            fmt_payload = native_bank.raw[ps:pe]
+        elif cid == b"LIST" and native_bank.raw[ps : ps + 4] == b"PROJ":
+            native_proj = native_bank.raw[ps + 4 : pe]
+
+    ported_proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(ported_bank.raw, 12, len(ported_bank.raw)):
+        if cid == b"LIST" and ported_bank.raw[ps : ps + 4] == b"PROJ":
+            ported_proj = ported_bank.raw[ps + 4 : pe]
+            break
+
+    if not native_proj or not ported_proj:
+        raise ValueError("Invalid FMOD bank: missing LIST:PROJ payload for partial merge.")
+
+    native_tables = list(_iter_proj_table_items(native_proj))
+    ported_tables = list(_iter_proj_table_items(ported_proj))
+
+    native_evts_all: set[bytes] = {
+        k for lt, items in native_tables if lt == b"EVTS" for k, _, _, _ in items
+    }
+    ported_evts_all: set[bytes] = {
+        k for lt, items in ported_tables if lt == b"EVTS" for k, _, _, _ in items
+    }
+
+    actual_replace = {g for g in replace_event_guids if g in ported_evts_all}
+    if not actual_replace:
+        raise ValueError("Selected audio scope has no matching ported events to inject.")
+
+    actual_silence = {
+        g for g in (silence_native_event_guids or set()) if g in native_evts_all and g not in actual_replace
+    }
+
+    native_evib_targets = _collect_evib_targets(native_proj)
+    kept_native_roots = {
+        g
+        for g in native_evts_all
+        if g not in actual_replace and g not in actual_silence and g not in native_evib_targets
+    }
+
+    # Si no queda ningún evento vanilla que conservar (ej. un _AI.bank sin ai_engine_int en modo exterior),
+    # devolver el banco porteado directamente.
+    if not kept_native_roots and not actual_silence:
+        return ported_bank.raw
+
+    k_native = _extract_event_subgraph_closure(native_tables, kept_native_roots)
+    c_ac = _extract_event_subgraph_closure(ported_tables, actual_replace)
+
+    # Remapear todos los GUIDs internos de C_ac (excepto los eventos raíz destino) garantizando 0 colisiones
+    all_native_guids: set[bytes] = set(collect_local_proj_guids(native_proj))
+    all_native_guids.add(native_bank.bank_guid)
+    reserved_guids: set[bytes] = all_native_guids | actual_replace | actual_silence
+
+    seed_bytes = f"{seed_tag}:{mod_identifier}".encode("utf-8")
+    remap_ac: dict[bytes, bytes] = {}
+    ctr = 0
+    for g in sorted(c_ac):
+        if g in actual_replace:
+            remap_ac[g] = g
+            continue
+        while True:
+            cand = bytearray(hashlib.sha256(seed_bytes + struct.pack("<I", ctr) + g).digest()[:16])
+            ctr += 1
+            cand[7] = (cand[7] & 0x0F) | 0x40
+            cand[8] = (cand[8] & 0x3F) | 0x80
+            cb = bytes(cand)
+            if cb not in reserved_guids and cb != b"\x00" * 16:
+                remap_ac[g] = cb
+                reserved_guids.add(cb)
+                break
+
+    # Crear stubs silenciosos para los eventos nativos neutralizados (ej. Exhaust vanilla en modo Exterior)
+    ex_bus = silence_bus_guid or guid_str_to_bytes("{ffe57d5c-46ed-4b06-86d5-8fa6f8ffdf07}")
+    silent_evnt_items: list[tuple[bytes, bytes]] = []
+    silent_ibs_items: list[tuple[bytes, bytes]] = []
+    for sg in sorted(actual_silence):
+        s_ctr = 0
+        while True:
+            s_cand = bytearray(hashlib.sha256(seed_bytes + b":sil:" + struct.pack("<I", s_ctr) + sg).digest()[:16])
+            s_ctr += 1
+            s_cand[7] = (s_cand[7] & 0x0F) | 0x40
+            s_cand[8] = (s_cand[8] & 0x3F) | 0x80
+            s_ibg = bytes(s_cand)
+            if s_ibg not in reserved_guids and s_ibg != b"\x00" * 16:
+                reserved_guids.add(s_ibg)
+                break
+        silent_evnt_items.append((sg, _make_trigger_evnt(sg, s_ibg, ex_bus)))
+        silent_ibs_items.append((s_ibg, _make_trigger_ibus(s_ibg, ex_bus)))
+
+    # Recolectar únicamente los sub-bancos FSB5 referenciados por cada lado y construir el remapeo de índices
+    used_nat_sbs: set[int] = set()
+    for lt, items in native_tables:
+        if lt == b"WAVS":
+            for k, _full, _base, bpay in items:
+                if k in k_native and len(bpay) >= 30:
+                    _, sb_i, _, _, _ = struct.unpack_from("<HHHII", bpay, 16)
+                    if 0 <= sb_i < len(native_bank.subbanks):
+                        used_nat_sbs.add(sb_i)
+
+    used_ac_sbs: set[int] = set()
+    for lt, items in ported_tables:
+        if lt == b"WAVS":
+            for k, _full, _base, bpay in items:
+                if k in c_ac and len(bpay) >= 30:
+                    _, sb_i, _, _, _ = struct.unpack_from("<HHHII", bpay, 16)
+                    if 0 <= sb_i < len(ported_bank.subbanks):
+                        used_ac_sbs.add(sb_i)
+
+    ordered_nat_sbs = sorted(used_nat_sbs)
+    ordered_ac_sbs = sorted(used_ac_sbs)
+    nat_sb_remap = {old_sb: new_idx for new_idx, old_sb in enumerate(ordered_nat_sbs)}
+    ac_sb_remap = {old_sb: len(ordered_nat_sbs) + new_idx for new_idx, old_sb in enumerate(ordered_ac_sbs)}
+
+    final_fsb_blobs: list[bytes] = (
+        [bytes(native_bank.subbanks[sb].raw_fsb_bytes) for sb in ordered_nat_sbs]
+        + [bytes(ported_bank.subbanks[sb].raw_fsb_bytes) for sb in ordered_ac_sbs]
+    )
+    if not final_fsb_blobs and native_bank.subbanks:
+        final_fsb_blobs = [bytes(native_bank.subbanks[0].raw_fsb_bytes)]
+
+    # Agrupar items de ported_bank por tabla ya remapeados
+    ac_items_by_table: dict[bytes, list[tuple[bytes, bytes]]] = {}
+    for lt, items in ported_tables:
+        out_list: list[tuple[bytes, bytes]] = []
+        for k, full, _base, bpay in items:
+            if k not in c_ac:
+                continue
+            new_k = remap_ac.get(k, k)
+            new_full = _remap_chunk_guids_leaves(full, remap_ac)
+            if lt == b"WAVS" and len(bpay) >= 30:
+                _, old_sb, _, _, _ = struct.unpack_from("<HHHII", bpay, 16)
+                new_sb = ac_sb_remap.get(old_sb, 0)
+                new_full = _patch_wav_chunk_subbank(new_full, new_sb)
+            out_list.append((new_k, new_full))
+        if out_list:
+            ac_items_by_table[lt] = out_list
+
+    nat_items_by_table: dict[bytes, list[tuple[bytes, bytes]]] = {}
+    for lt, items in native_tables:
+        out_list = []
+        for k, full, _base, bpay in items:
+            if k not in k_native:
+                continue
+            new_full = full
+            if lt == b"WAVS" and len(bpay) >= 30:
+                _, old_sb, _, _, _ = struct.unpack_from("<HHHII", bpay, 16)
+                new_sb = nat_sb_remap.get(old_sb, old_sb)
+                if new_sb != old_sb:
+                    new_full = _patch_wav_chunk_subbank(new_full, new_sb)
+            out_list.append((k, new_full))
+        nat_items_by_table[lt] = out_list
+
+    # Reconstruir LIST:PROJ preservando exactamente el orden de chunks del banco nativo
+    merged_proj_parts = bytearray()
+    seen_tables: set[bytes] = set()
+    for cid, ps, pe, pos in iter_riff_chunks(native_proj, 0, len(native_proj)):
+        pad_end = pe + ((pe - ps) & 1)
+        if cid != b"LIST":
+            merged_proj_parts += native_proj[pos:pad_end]
+            continue
+        lt = bytes(native_proj[ps : ps + 4])
+        seen_tables.add(lt)
+        combined_map: dict[bytes, bytes] = {}
+        for k, f in nat_items_by_table.get(lt, ()):
+            combined_map[k] = f
+        for k, f in ac_items_by_table.get(lt, ()):
+            combined_map[k] = f
+        if lt == b"EVTS":
+            for k, f in silent_evnt_items:
+                combined_map[k] = f
+        elif lt == b"IBSS":
+            for k, f in silent_ibs_items:
+                combined_map[k] = f
+
+        combined_sorted = sorted(combined_map.items(), key=lambda x: x[0])
+        lcnt_ch = _riff_chunk(b"LCNT", struct.pack("<I", len(combined_sorted)))
+        body_lt = lt + lcnt_ch + b"".join(f for _, f in combined_sorted)
+        merged_proj_parts += _riff_chunk(b"LIST", body_lt)
+
+    exported_ev_guids = kept_native_roots | actual_replace | actual_silence
+    patched_proj_body = bytes(_sync_evts_partition_and_bnki(merged_proj_parts, exported_ev_guids))
+
+    # Construir STDT con las rutas de eventos exportados y el banco
+    safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_mod"
+    stdt_entries: list[tuple[str, bytes]] = []
+    if native_bank.bank_guid:
+        stdt_entries.append((f"bank:/{safe_mod}", native_bank.bank_guid))
+    pmap = event_paths_map or {}
+    for ev_i, eg in enumerate(sorted(exported_ev_guids)):
+        ep = pmap.get(eg) or f"event:/AMS2/Vehicles/{safe_mod}/Event_{ev_i:02d}"
+        stdt_entries.append((ep, eg))
+    new_stdt_payload = build_stdt_chunk(stdt_entries) if stdt_entries else None
+
+    sndh_ver = 0x00080000 | (2 * len(final_fsb_blobs) + 1)
+    dummy_sndh = struct.pack("<I", sndh_ver) + b"\x00" * (8 * len(final_fsb_blobs))
+    temp_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, dummy_sndh, new_stdt_payload)
+
+    fmt_chunk_bytes = b"FMT " + struct.pack("<I", len(fmt_payload)) + fmt_payload
+    if len(fmt_payload) & 1:
+        fmt_chunk_bytes += b"\x00"
+
+    proj_list_size = 4 + len(temp_proj_body)
+    proj_total_bytes = 8 + proj_list_size + (proj_list_size & 1)
+
+    cur_file_pos = 12 + len(fmt_chunk_bytes) + proj_total_bytes
+    sndh_entries: list[tuple[int, int]] = []
+    snd_chunks_built: list[bytes] = []
+
+    for fsb_blob in final_fsb_blobs:
+        snd_payload_start = cur_file_pos + 8
+        pad_before = (32 - (snd_payload_start % 32)) % 32
+        fsb_pos = snd_payload_start + pad_before
+        fsb_len = len(fsb_blob)
+        snd_payload = (b"\x00" * pad_before) + bytes(fsb_blob)
+        snd_chunk = b"SND " + struct.pack("<I", len(snd_payload)) + snd_payload
+        if len(snd_payload) & 1:
+            snd_chunk += b"\x00"
+        sndh_entries.append((fsb_pos, fsb_len))
+        snd_chunks_built.append(snd_chunk)
+        cur_file_pos += len(snd_chunk)
+
+    real_sndh = struct.pack("<I", sndh_ver) + b"".join(
+        struct.pack("<II", fpos, flen) for fpos, flen in sndh_entries
+    )
+    final_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, real_sndh, new_stdt_payload)
+    assert len(final_proj_body) == len(temp_proj_body), "Tamaño inesperado al actualizar SNDH/STDT en banco híbrido"
+
+    proj_chunk_bytes = (
+        b"LIST"
+        + struct.pack("<I", 4 + len(final_proj_body))
+        + b"PROJ"
+        + final_proj_body
+        + (b"\x00" if (len(final_proj_body) & 1) else b"")
+    )
+
+    body = fmt_chunk_bytes + proj_chunk_bytes + b"".join(snd_chunks_built)
+    return b"RIFF" + struct.pack("<I", 4 + len(body)) + b"FEV " + body
+
+
 def build_direct_ported_bank_from_ac(
     ac_bank: FmodBank,
     mod_identifier: str = "custom_mod",
@@ -3221,6 +4570,11 @@ def build_direct_ported_bank_from_ac(
     output_codec_mode: int | None = None,
     prune_unused_samples: bool = False,
     cached_fsb_blobs: list[bytes] | None = None,
+    extra_role_variants: dict[str, list[tuple[str, str]] | list[tuple[str, str, str]]] | None = None,
+    prefer_throttle_param: bool = False,
+    target_max_rpm: float | None = None,
+    library: SourceAudioLibrary | None = None,
+    active_scope: str = "full",
 ) -> PortedBankResult:
     """Construye un nuevo archivo .bank para Automobilista 2 directamente desde un banco .bank de Assetto Corsa.
 
@@ -3284,14 +4638,21 @@ def build_direct_ported_bank_from_ac(
         proj_buf = bytearray(invert_event_cone_curves_in_proj(bytes(proj_buf))[0])
 
     # 'throttle' de AC: AMS2 no lo alimenta en repeticiones / IA (usa 'load'). Renombrar a 'load' en bancos
-    # directos (Jugador e IA) cuando el banco no tenga ya 'load', y fijar default=1.0 por seguridad.
-    proj_buf = bytearray(_patch_throttle_params_in_proj(bytes(proj_buf), rename_to_load=True))
+    # estándar; si el banco objetivo opera con 'throttle' (prefer_throttle_param=True), conservarlo intacto.
+    proj_buf = bytearray(
+        _patch_throttle_params_in_proj(
+            bytes(proj_buf),
+            rename_to_load=True,
+            keep_throttle=bool(prefer_throttle_param),
+        )
+    )
 
     p_ext_sel, p_int_sel = _select_primary_engine_events(ac_bank)
     # Clones profundos a generar tras el parcheo: (guid_origen_ya_remapeado, guid_destino, bus_destino | None)
     pending_clones: list[tuple[bytes, bytes, bytes | None]] = []
     # Eventos de IA a los que se aplica límite de instancias y bus de salida: guid_final -> bus | None
     ai_event_outputs: dict[bytes, bytes | None] = {}
+    extra_player_clones_count = 0
 
     def _bus_for(role: str, default: str | None) -> bytes | None:
         raw_b = (target_role_buses or {}).get(role) or default
@@ -3332,9 +4693,9 @@ def build_direct_ported_bank_from_ac(
         int_cands.sort(key=lambda x: -len(x.linked_samples))
         p_int = int_cands[0] if int_cands else next((e for e in ac_bank.events if e.role == "EngineInt"), None)
 
-        if p_ext:
+        if p_ext and active_scope in ("full", "exterior"):
             active_root_orig_evs.add(p_ext.guid_bytes)
-        if p_int:
+        if p_int and active_scope in ("full", "interior"):
             active_root_orig_evs.add(p_int.guid_bytes)
 
         if is_ai_bank:
@@ -3344,6 +4705,10 @@ def build_direct_ported_bank_from_ac(
                 guid_str_to_bytes(g) if isinstance(g, str) else bytes(g)
                 for g in target_role_guids.values()
             }
+            if extra_role_variants:
+                for _items in extra_role_variants.values():
+                    for _it in _items:
+                        used_guids.add(guid_str_to_bytes(_it[0]))
             if target_bank_guid:
                 used_guids.add(guid_str_to_bytes(target_bank_guid) if isinstance(target_bank_guid, str) else bytes(target_bank_guid))
 
@@ -3406,6 +4771,28 @@ def build_direct_ported_bank_from_ac(
                 role_to_event_path["ai_engine_int"] = ai_int_p
                 stdt_entries.append((ai_int_p, ai_int_bg))
 
+            if extra_role_variants:
+                assigned_ai_targets = set(ai_event_outputs.keys())
+                for ai_role in ("ai_engine_main", "ai_engine_live", "ai_engine_ext", "ai_engine_int"):
+                    src_ai_ev = p_int if ai_role == "ai_engine_int" else p_ext
+                    if not src_ai_ev:
+                        continue
+                    for idx_ex, item in enumerate(extra_role_variants.get(ai_role, ()), start=2):
+                        ex_g = guid_str_to_bytes(item[0])
+                        if ex_g in assigned_ai_targets:
+                            continue
+                        assigned_ai_targets.add(ex_g)
+                        pending_clones.append((src_ai_ev.guid_bytes, ex_g, None))
+                        used_guids.add(ex_g)
+                        raw_b = item[2] if len(item) >= 3 and item[2] else None
+                        ai_event_outputs[ex_g] = (
+                            guid_str_to_bytes(raw_b) if raw_b else _bus_for(ai_role, ai_default_bus.get(ai_role))
+                        )
+                        ex_p = (item[1] if len(item) >= 2 and item[1] else "") or (
+                            f"event:/AMS2/Vehicles/{safe_mod}/{ai_role}_{idx_ex}"
+                        )
+                        stdt_entries.append((ex_p, ex_g))
+
             for ev in ac_bank.events:
                 if ev.guid_bytes in assigned_orig_evs:
                     continue
@@ -3433,6 +4820,10 @@ def build_direct_ported_bank_from_ac(
         else:
             guid_map = {}
             used_guids = set()
+            if extra_role_variants:
+                for _items in extra_role_variants.values():
+                    for _it in _items:
+                        used_guids.add(guid_str_to_bytes(_it[0]))
 
             if p_ext and "EngineExt" in target_role_guids:
                 ee_bg = guid_str_to_bytes(target_role_guids["EngineExt"])
@@ -3454,6 +4845,28 @@ def build_direct_ported_bank_from_ac(
                 role_to_event_path["EngineInt"] = ei_path
                 stdt_entries.append((ei_path, ei_bg))
 
+            if extra_role_variants:
+                # Clonar variantes extra de motor únicamente en bancos multi-variante (ej. F_Ultimate_2022, F_V8_Gen1)
+                assigned_p_extras = set(used_guids) - {
+                    guid_str_to_bytes(_it[0])
+                    for _items in extra_role_variants.values()
+                    for _it in _items
+                }
+                for p_role, p_src in (("EngineExt", p_ext), ("EngineInt", p_int)):
+                    if not p_src or p_role not in target_role_guids:
+                        continue
+                    for idx_ex, item in enumerate(extra_role_variants.get(p_role, ()), start=2):
+                        ex_g = guid_str_to_bytes(item[0])
+                        if ex_g in assigned_p_extras:
+                            continue
+                        assigned_p_extras.add(ex_g)
+                        pending_clones.append((p_src.guid_bytes, ex_g, None))
+                        extra_player_clones_count += 1
+                        ex_p = (item[1] if len(item) >= 2 and item[1] else "") or (
+                            f"event:/AMS2/Vehicles/{safe_mod}/{p_role}_{idx_ex}"
+                        )
+                        stdt_entries.append((ex_p, ex_g))
+
             # Comprobar si AC tiene evento de encendido / starter
             starter_ac_ev = next(
                 (ev for ev in ac_bank.events if any(k in (ev.path or "").lower() or k in (ev.role or "").lower() for k in ("starter", "starting", "startup", "start_ext", "start_int", "ignition"))),
@@ -3471,8 +4884,36 @@ def build_direct_ported_bank_from_ac(
                     s_path = (target_role_paths or {}).get(s_role) or (starter_ac_ev.path or f"event:/AMS2/Vehicles/{safe_mod}/{s_role}")
                     role_to_event_path[s_role] = s_path
                     stdt_entries.append((s_path, s_bg))
+                if extra_role_variants:
+                    seen_st_clones = {guid_str_to_bytes(target_role_guids[r]) for r in starter_roles}
+                    for s_role in ("Starter", "Starting"):
+                        for idx_ex, item in enumerate(extra_role_variants.get(s_role, ()), start=2):
+                            ex_g = guid_str_to_bytes(item[0])
+                            if ex_g in seen_st_clones:
+                                continue
+                            seen_st_clones.add(ex_g)
+                            pending_clones.append((starter_ac_ev.guid_bytes, ex_g, None))
+                            extra_player_clones_count += 1
+                            ex_p = (item[1] if len(item) >= 2 and item[1] else "") or (
+                                f"event:/AMS2/Vehicles/{safe_mod}/{s_role}_{idx_ex}"
+                            )
+                            stdt_entries.append((ex_p, ex_g))
             elif starter_roles:
                 st_guids_to_extract = [guid_str_to_bytes(target_role_guids[r]) for r in starter_roles]
+                extra_st_entries: list[tuple[bytes, str]] = []
+                if extra_role_variants:
+                    seen_st_ext = set(st_guids_to_extract)
+                    for s_role in ("Starter", "Starting"):
+                        for idx_ex, item in enumerate(extra_role_variants.get(s_role, ()), start=2):
+                            ex_g = guid_str_to_bytes(item[0])
+                            if ex_g in seen_st_ext:
+                                continue
+                            seen_st_ext.add(ex_g)
+                            st_guids_to_extract.append(ex_g)
+                            ex_p = (item[1] if len(item) >= 2 and item[1] else "") or (
+                                f"event:/AMS2/Vehicles/{safe_mod}/{s_role}_{idx_ex}"
+                            )
+                            extra_st_entries.append((ex_g, ex_p))
                 evnts = []
                 ibses = []
                 if native_bank_path and Path(native_bank_path).is_file():
@@ -3492,6 +4933,8 @@ def build_direct_ported_bank_from_ac(
                         role_to_event_guid[s_role] = bytes_to_guid_str(s_bg)
                         role_to_event_path[s_role] = s_path
                         stdt_entries.append((s_path, s_bg))
+                    for ex_g, ex_p in extra_st_entries:
+                        stdt_entries.append((ex_p, ex_g))
 
             # Evento de escape (Exhaust) si el objetivo lo requiere
             if "Exhaust" in target_role_guids and "Exhaust" not in role_to_event_guid:
@@ -3508,11 +4951,38 @@ def build_direct_ported_bank_from_ac(
                     ex_path = (target_role_paths or {}).get("Exhaust") or (ex_ev.path or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust")
                     role_to_event_path["Exhaust"] = ex_path
                     stdt_entries.append((ex_path, ex_bg))
+                    if extra_role_variants:
+                        seen_ex_clones = {ex_bg}
+                        for idx_ex, item in enumerate(extra_role_variants.get("Exhaust", ()), start=2):
+                            eg_extra = guid_str_to_bytes(item[0])
+                            if eg_extra in seen_ex_clones:
+                                continue
+                            seen_ex_clones.add(eg_extra)
+                            pending_clones.append((ex_ev.guid_bytes, eg_extra, None))
+                            extra_player_clones_count += 1
+                            ep_extra = (item[1] if len(item) >= 2 and item[1] else "") or (
+                                f"event:/AMS2/Vehicles/{safe_mod}/Exhaust_{idx_ex}"
+                            )
+                            stdt_entries.append((ep_extra, eg_extra))
                 else:
+                    ex_guids_to_extract = [ex_bg]
+                    extra_ex_entries: list[tuple[bytes, str]] = []
+                    if extra_role_variants:
+                        seen_ex_ext = {ex_bg}
+                        for idx_ex, item in enumerate(extra_role_variants.get("Exhaust", ()), start=2):
+                            eg_extra = guid_str_to_bytes(item[0])
+                            if eg_extra in seen_ex_ext:
+                                continue
+                            seen_ex_ext.add(eg_extra)
+                            ex_guids_to_extract.append(eg_extra)
+                            ep_extra = (item[1] if len(item) >= 2 and item[1] else "") or (
+                                f"event:/AMS2/Vehicles/{safe_mod}/Exhaust_{idx_ex}"
+                            )
+                            extra_ex_entries.append((eg_extra, ep_extra))
                     ex_evnts = []
                     ex_ibses = []
                     if native_bank_path and Path(native_bank_path).is_file():
-                        ex_evnts, ex_ibses = extract_native_starters(Path(native_bank_path), [ex_bg])
+                        ex_evnts, ex_ibses = extract_native_starters(Path(native_bank_path), ex_guids_to_extract)
                     if not ex_evnts:
                         EXHAUST_BUS = guid_str_to_bytes("{ffe57d5c-46ed-4b06-86d5-8fa6f8ffdf07}")
                         ex_ibg = hashlib.sha256(ex_bg + b"_ibus_ams2").digest()[:16]
@@ -3525,6 +4995,8 @@ def build_direct_ported_bank_from_ac(
                         ex_path = (target_role_paths or {}).get("Exhaust") or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust"
                         role_to_event_path["Exhaust"] = ex_path
                         stdt_entries.append((ex_path, ex_bg))
+                        for eg_extra, ep_extra in extra_ex_entries:
+                            stdt_entries.append((ep_extra, eg_extra))
 
             # Asignar resto de eventos secundarios de AC con GUIDs únicos garantizados
             for ev in ac_bank.events:
@@ -3646,23 +5118,24 @@ def build_direct_ported_bank_from_ac(
         active_root_orig_evs.update(_muted_event_guids_for_bank(ac_bank))
 
     # Parchear PROJ
-    autopitch_updates: dict[bytes, float] = {}
-    if mappings:
-        map_by_gidx = {c.donor_global_index: c for c in mappings}
-        for sl in ac_bank.slots:
-            if sl.wav_guid is None:
-                continue
-            cfg = map_by_gidx.get(sl.global_index)
-            if cfg and cfg.override_root_rpm is not None and cfg.override_root_rpm > 100.0:
-                if sl.autopitch_ref_rpm is None or abs(cfg.override_root_rpm - sl.autopitch_ref_rpm) > 0.1:
-                    autopitch_updates[sl.wav_guid] = float(cfg.override_root_rpm)
+    (
+        wav_redirects,
+        autopitch_updates,
+        gain_db_deltas,
+        silence_wav_guids,
+        unmute_wav_guids,
+        custom_wav_replacements,
+    ) = _collect_mapping_patches_for_direct_bank(ac_bank, mappings, rpm_bands, library)
 
     patched_proj_body = _patch_proj_chunks(
         proj_payload=proj_buf,
-        wav_redirects={},
+        wav_redirects=wav_redirects,
         autopitch_updates=autopitch_updates,
         guid_map=guid_map,
         rpm_bands=rpm_bands,
+        gain_db_deltas=gain_db_deltas,
+        silence_wav_guids=silence_wav_guids,
+        unmute_wav_guids=unmute_wav_guids,
     )
 
     # Clones profundos de eventos (roles de IA vanilla con GUIDs propias) y límites/buses de IA
@@ -3691,6 +5164,14 @@ def build_direct_ported_bank_from_ac(
         patched_proj_body = set_event_instance_limits_in_proj(
             patched_proj_body, None, 4, AI_EVENT_STEAL_VIRTUALIZE
         )
+        if extra_player_clones_count > 0:
+            proj_mut = bytearray(patched_proj_body)
+            for cid, ps, pe, _ in iter_riff_chunks(proj_mut, 0, len(proj_mut)):
+                if cid == b"BNKI" and pe - ps >= 28:
+                    cur_exp = struct.unpack_from("<I", proj_mut, ps + 24)[0]
+                    struct.pack_into("<I", proj_mut, ps + 24, cur_exp + extra_player_clones_count)
+                    break
+            patched_proj_body = bytes(proj_mut)
 
     # Silenciar cajas de TC / LC y capas esparsas de petardeo en pistas PMLB y ganancia INST
     # (Se ejecuta DESPUÉS de _patch_proj_chunks para garantizar que rpm_bands no reabra las cajas)
@@ -3709,6 +5190,70 @@ def build_direct_ported_bank_from_ac(
             non_sustained_locs=non_sustained_locs,
             out_muted_locs=muted_locs,
         )
+
+    eff_target_max_rpm = target_max_rpm
+    if eff_target_max_rpm is None and native_bank_path:
+        eff_target_max_rpm = _extract_native_engine_max_rpm(native_bank_path)
+    if eff_target_max_rpm and eff_target_max_rpm > 3000.0:
+        patched_proj_body = _extend_top_rpm_boxes_in_proj(patched_proj_body, eff_target_max_rpm)
+
+    # Igualar sonoridad y alcance 3D exterior/replay al estándar vanilla de AMS2 sin saturar audio PCM16
+    if active_scope != "interior":
+        ext_loudness_profiles: dict[bytes, tuple[tuple[int, float, float, int, float, float], float]] = {}
+        native_panners = _extract_native_exterior_spatializers(native_bank_path) if native_bank_path else {}
+        eff_p_ext_guid: bytes | None = (
+            p_ext.guid_bytes if (target_role_guids and "p_ext" in locals() and p_ext is not None)
+            else (p_ext_sel.guid_bytes if p_ext_sel is not None else None)
+        )
+        if target_role_guids:
+            if is_ai_bank:
+                for role_k, def_pan, df_dist in (
+                    ("ai_engine_live", AMS2_LIVE_REPLAY_PANNER, 5000.0),
+                    ("ai_engine_main", AMS2_AI_MAIN_PANNER, 3000.0),
+                    ("ai_engine_ext", AMS2_LIVE_REPLAY_PANNER, 5000.0),
+                ):
+                    if role_k in target_role_guids:
+                        rg = guid_str_to_bytes(target_role_guids[role_k])
+                        ext_loudness_profiles[rg] = (native_panners.get(rg) or def_pan, df_dist)
+                    if extra_role_variants:
+                        for item in extra_role_variants.get(role_k, ()):
+                            eg = guid_str_to_bytes(item[0])
+                            ext_loudness_profiles[eg] = (native_panners.get(eg) or def_pan, df_dist)
+            else:
+                if "EngineExt" in target_role_guids:
+                    rg = guid_str_to_bytes(target_role_guids["EngineExt"])
+                    ext_loudness_profiles[rg] = (native_panners.get(rg) or AMS2_PLAYER_EXT_PANNER, 3000.0)
+                if extra_role_variants:
+                    for item in extra_role_variants.get("EngineExt", ()):
+                        eg = guid_str_to_bytes(item[0])
+                        ext_loudness_profiles[eg] = (native_panners.get(eg) or AMS2_PLAYER_EXT_PANNER, 3000.0)
+        elif standalone_guids:
+            if is_ai_bank:
+                if "ai_engine_live" in role_to_event_guid:
+                    ext_loudness_profiles[guid_str_to_bytes(role_to_event_guid["ai_engine_live"])] = (
+                        AMS2_LIVE_REPLAY_PANNER, 5000.0
+                    )
+                if "ai_engine_ext" in role_to_event_guid:
+                    ext_loudness_profiles[guid_str_to_bytes(role_to_event_guid["ai_engine_ext"])] = (
+                        AMS2_AI_MAIN_PANNER, 3000.0
+                    )
+            elif "EngineExt" in role_to_event_guid:
+                ext_loudness_profiles[guid_str_to_bytes(role_to_event_guid["EngineExt"])] = (
+                    AMS2_PLAYER_EXT_PANNER, 3000.0
+                )
+        elif eff_p_ext_guid is not None:
+            ext_loudness_profiles[eff_p_ext_guid] = (
+                (AMS2_LIVE_REPLAY_PANNER, 5000.0) if is_ai_bank else (AMS2_PLAYER_EXT_PANNER, 3000.0)
+            )
+
+        if ext_loudness_profiles:
+            patched_proj_body = _match_ams2_exterior_loudness_in_proj(
+                proj_buf=patched_proj_body,
+                ac_bank=ac_bank,
+                orig_proj_payload=orig_proj_payload,
+                p_ext_orig_guid=eff_p_ext_guid,
+                ext_event_profiles=ext_loudness_profiles,
+            )
 
     codec_label = "Nativo AC (Transmutación Directa Sin Donante)"
     if cached_fsb_blobs is not None and len(cached_fsb_blobs) == len(ac_bank.subbanks):
@@ -3742,6 +5287,9 @@ def build_direct_ported_bank_from_ac(
                         end = start + len(sl.data_bytes)
                         if end <= len(fbuf):
                             fbuf[start:end] = b"\x00" * len(sl.data_bytes)
+
+    if cached_fsb_blobs is None and custom_wav_replacements:
+        _apply_custom_wav_replacements_to_subbanks(ac_bank, final_fsb_blobs, custom_wav_replacements)
 
     sndh_ver = ac_bank.sndh_version or (0x00080000 | (2 * len(final_fsb_blobs) + 1))
     dummy_sndh = struct.pack("<I", sndh_ver) + b"\x00" * (8 * len(final_fsb_blobs))
