@@ -67,6 +67,16 @@ def calculate_file_sha256(path: Path | str) -> str:
 
 
 @dataclass
+class VanillaEventVariant:
+    """Descriptor legible de un evento de motor dentro de un .bank vanilla (Jugador o IA)."""
+    guid_str: str
+    path: str
+    short_name: str
+    role: str        # 'EngineInt', 'EngineExt', 'ai_engine_int', 'ai_engine_main', 'ai_engine_live', 'ai_engine_ext'
+    bank_kind: str   # 'player' o 'ai'
+
+
+@dataclass
 class VanillaVehicle:
     """Información completa de un vehículo vanilla / base de Automobilista 2."""
     vehicle_id: str                      # Clave normalizada única (e.g. 'super_v8_superv8_set1')
@@ -98,9 +108,30 @@ class VanillaVehicle:
     ctrl_parameters: set[str] = field(default_factory=set)     # Parámetros activos en CTRS/CTRL (load, throttle, rpm)
     extra_event_variants: dict[str, list[tuple[str, str]]] = field(default_factory=dict)         # role -> [(guid_str, path), ...] extras (sólo si hay >1 variante)
     extra_ai_event_variants: dict[str, list[tuple[str, str, str]]] = field(default_factory=dict) # role -> [(guid_str, path, bus_guid), ...] extras
+    player_engine_variants: list[VanillaEventVariant] = field(default_factory=list)
+    ai_engine_variants: list[VanillaEventVariant] = field(default_factory=list)
+    surgical_mode: bool = False
+    modified_player_event_guids: list[str] = field(default_factory=list)
+    modified_ai_event_guids: list[str] = field(default_factory=list)
+    surgical_ac_int_guid: str = ""
+    surgical_ac_ext_guid: str = ""
     prefers_throttle_player: bool = False
     prefers_throttle_ai: bool = False
     _profile_loaded: bool = False
+
+    @property
+    def has_multi_engine_variants(self) -> bool:
+        """True si el banco contiene >1 variante de motor (bancos multi-auto o con eventos legacy)."""
+        p_int = sum(1 for ev in self.player_engine_variants if ev.role == "EngineInt")
+        p_ext = sum(1 for ev in self.player_engine_variants if ev.role == "EngineExt")
+        if p_int > 1 or p_ext > 1:
+            return True
+        if any(len(self.extra_event_variants.get(r, ())) > 0 for r in ("EngineInt", "EngineExt")):
+            return True
+        ai_counts: dict[str, int] = {}
+        for ev in self.ai_engine_variants:
+            ai_counts[ev.role] = ai_counts.get(ev.role, 0) + 1
+        return any(cnt > 1 for cnt in ai_counts.values())
 
 
 def _extract_bank_param_profile(
@@ -327,6 +358,11 @@ class VanillaVehicleManager:
                 backup_time = None
                 is_modified = False
                 modified_scope = "full"
+                surgical_mode = False
+                mod_p_guids: list[str] = []
+                mod_ai_guids: list[str] = []
+                surg_int_g = ""
+                surg_ext_g = ""
 
                 if manifest_entry:
                     has_backup = True
@@ -334,6 +370,11 @@ class VanillaVehicleManager:
                     backup_time = manifest_entry.get("backup_timestamp")
                     is_modified = manifest_entry.get("is_modified", False)
                     modified_scope = manifest_entry.get("modified_scope", "full") or "full"
+                    surgical_mode = bool(manifest_entry.get("surgical_mode", False))
+                    mod_p_guids = list(manifest_entry.get("modified_player_event_guids") or [])
+                    mod_ai_guids = list(manifest_entry.get("modified_ai_event_guids") or [])
+                    surg_int_g = str(manifest_entry.get("surgical_ac_int_guid") or "")
+                    surg_ext_g = str(manifest_entry.get("surgical_ac_ext_guid") or "")
                 elif orig_file.is_file():
                     has_backup = True
                     is_modified = True
@@ -353,6 +394,11 @@ class VanillaVehicleManager:
                     has_backup=has_backup,
                     original_sha256=original_sha,
                     backup_timestamp=backup_time,
+                    surgical_mode=surgical_mode,
+                    modified_player_event_guids=mod_p_guids,
+                    modified_ai_event_guids=mod_ai_guids,
+                    surgical_ac_int_guid=surg_int_g,
+                    surgical_ac_ext_guid=surg_ext_g,
                 )
                 vehicles.append(v)
             except Exception:
@@ -469,6 +515,26 @@ class VanillaVehicleManager:
                 if len(items) > 1 and extras:
                     extra_p[vr] = extras
             vehicle.extra_event_variants = extra_p
+            p_variants: list[VanillaEventVariant] = []
+            seen_pv: set[str] = set()
+            for vr in ("EngineInt", "EngineExt"):
+                for g_s, p_s in all_variants.get(vr, ()):
+                    gl = g_s.lower()
+                    if gl in seen_pv:
+                        continue
+                    seen_pv.add(gl)
+                    sn = p_s.split("/")[-1] if p_s else f"{vr}_{g_s[1:9]}"
+                    p_variants.append(
+                        VanillaEventVariant(
+                            guid_str=g_s,
+                            path=p_s,
+                            short_name=sn,
+                            role=vr,
+                            bank_kind="player",
+                        )
+                    )
+            p_variants.sort(key=lambda x: (0 if x.role == "EngineInt" else 1, x.short_name.lower()))
+            vehicle.player_engine_variants = p_variants
 
             vehicle.target_parameters, vehicle.ctrl_parameters, vehicle.prefers_throttle_player = (
                 _extract_bank_param_profile(b, master_strings, is_ai=False)
@@ -543,6 +609,27 @@ class VanillaVehicleManager:
                         if len(items) > 1 and extras:
                             extra_ai[ar] = extras
                     vehicle.extra_ai_event_variants = extra_ai
+                    ai_variants: list[VanillaEventVariant] = []
+                    seen_av: set[str] = set()
+                    ai_role_ord = {"ai_engine_int": 0, "ai_engine_main": 1, "ai_engine_live": 2, "ai_engine_ext": 3}
+                    for ar in ("ai_engine_int", "ai_engine_main", "ai_engine_live", "ai_engine_ext"):
+                        for g_s, p_s, _b_s in ai_all_variants.get(ar, ()):
+                            gl = g_s.lower()
+                            if gl in seen_av:
+                                continue
+                            seen_av.add(gl)
+                            sn = p_s.split("/")[-1] if p_s else f"{ar}_{g_s[1:9]}"
+                            ai_variants.append(
+                                VanillaEventVariant(
+                                    guid_str=g_s,
+                                    path=p_s,
+                                    short_name=sn,
+                                    role=ar,
+                                    bank_kind="ai",
+                                )
+                            )
+                    ai_variants.sort(key=lambda x: (ai_role_ord.get(x.role, 9), x.short_name.lower()))
+                    vehicle.ai_engine_variants = ai_variants
                     _ai_p, _ai_c, vehicle.prefers_throttle_ai = _extract_bank_param_profile(
                         ai_b, master_strings, is_ai=True
                     )
@@ -659,6 +746,11 @@ class VanillaVehicleManager:
         ai_bank_bytes: bytes | None = None,
         csdbin_bytes: bytes | None = None,
         audio_scope: str = "full",
+        surgical_mode: bool = False,
+        modified_player_event_guids: list[str] | None = None,
+        modified_ai_event_guids: list[str] | None = None,
+        surgical_ac_int_guid: str = "",
+        surgical_ac_ext_guid: str = "",
     ) -> tuple[bool, str]:
         """Inyecta el nuevo sonido compilado en el vehículo vanilla, creando primero el respaldo seguro."""
         if not bank_bytes:
@@ -712,14 +804,26 @@ class VanillaVehicleManager:
 
             # 4. Actualizar estado en el manifiesto
             norm_scope = audio_scope if audio_scope in ("full", "interior", "exterior") else "full"
+            p_ev_list = list(modified_player_event_guids) if modified_player_event_guids else []
+            ai_ev_list = list(modified_ai_event_guids) if modified_ai_event_guids else []
             if vehicle.vehicle_id in self._manifest_cache:
                 self._manifest_cache[vehicle.vehicle_id]["is_modified"] = True
                 self._manifest_cache[vehicle.vehicle_id]["modified_scope"] = norm_scope
+                self._manifest_cache[vehicle.vehicle_id]["surgical_mode"] = bool(surgical_mode)
+                self._manifest_cache[vehicle.vehicle_id]["modified_player_event_guids"] = p_ev_list
+                self._manifest_cache[vehicle.vehicle_id]["modified_ai_event_guids"] = ai_ev_list
+                self._manifest_cache[vehicle.vehicle_id]["surgical_ac_int_guid"] = surgical_ac_int_guid or ""
+                self._manifest_cache[vehicle.vehicle_id]["surgical_ac_ext_guid"] = surgical_ac_ext_guid or ""
                 self._manifest_cache[vehicle.vehicle_id]["modified_timestamp"] = datetime.now().isoformat()
                 self._save_manifest()
 
             vehicle.is_modified = True
             vehicle.modified_scope = norm_scope
+            vehicle.surgical_mode = bool(surgical_mode)
+            vehicle.modified_player_event_guids = p_ev_list
+            vehicle.modified_ai_event_guids = ai_ev_list
+            vehicle.surgical_ac_int_guid = surgical_ac_int_guid or ""
+            vehicle.surgical_ac_ext_guid = surgical_ac_ext_guid or ""
             return True, (
                 f"¡Sonido inyectado con éxito en '{vehicle.display_name}'!\n"
                 f"• Banco Jugador: {target_path.name} ({len(bank_bytes):,} bytes){ai_msg_part}\n"
@@ -805,10 +909,20 @@ class VanillaVehicleManager:
             if vehicle.vehicle_id in self._manifest_cache:
                 self._manifest_cache[vehicle.vehicle_id]["is_modified"] = False
                 self._manifest_cache[vehicle.vehicle_id]["modified_scope"] = "full"
+                self._manifest_cache[vehicle.vehicle_id]["surgical_mode"] = False
+                self._manifest_cache[vehicle.vehicle_id]["modified_player_event_guids"] = []
+                self._manifest_cache[vehicle.vehicle_id]["modified_ai_event_guids"] = []
+                self._manifest_cache[vehicle.vehicle_id]["surgical_ac_int_guid"] = ""
+                self._manifest_cache[vehicle.vehicle_id]["surgical_ac_ext_guid"] = ""
                 self._save_manifest()
 
             vehicle.is_modified = False
             vehicle.modified_scope = "full"
+            vehicle.surgical_mode = False
+            vehicle.modified_player_event_guids = []
+            vehicle.modified_ai_event_guids = []
+            vehicle.surgical_ac_int_guid = ""
+            vehicle.surgical_ac_ext_guid = ""
             return True, f"Vehículo '{vehicle.display_name}' restaurado con éxito al 100% original de Steam (SHA256 verificado)."
         except Exception as e:
             return False, f"Error durante la restauración: {e}"

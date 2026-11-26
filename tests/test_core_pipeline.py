@@ -627,7 +627,7 @@ def main() -> None:
             # Verificar que el banco resultante se parsea limpiamente por FmodBank
             out_bank = FmodBank(summary_direct.bank_file)
             assert len(out_bank.events) >= 15
-            assert len(out_bank.slots) == len(ac_488.slots)
+            assert len(out_bank.slots) >= len(ac_488.slots)
             assert len(out_bank.stdt_bytes) > 0
 
             # Verificar banco de IA y TV Replay
@@ -639,6 +639,7 @@ def main() -> None:
             assert any("AI_EngineMAIN" in p for p in ai_paths.values()), "Falta evento AI_EngineMAIN para rivales"
 
             # Verificar que el .csdbin contiene todos los enlaces de jugador e IA
+            # y conserva intactos Starter/Starting + Transmisión/Gearshift originales de AMS2
             csd_loaded = CsdbinDocument.from_file(summary_direct.csdbin_file)
             assert csd_loaded.links["engine_bank"] == "Audio/AMS2/Vehicles/Mods/f488_direct/f488_direct_Engine"
             assert "engine_ext" in csd_loaded.links
@@ -647,12 +648,17 @@ def main() -> None:
             assert "AI_EngineMAIN" in csd_loaded.links["ai_engine_ext"]
             assert "AI_EngineMAIN_LIVE" in csd_loaded.links["ai_engine_live"]
             assert "AI_EngineInt" in csd_loaded.links["ai_engine_int"]
-            assert "gearshift_bank" in csd_loaded.links
-            assert "gearshift_up" in csd_loaded.links
+            assert "starter" in csd_loaded.links and "Starter" in csd_loaded.links["starter"]
+            assert "starting" in csd_loaded.links and "Starting" in csd_loaded.links["starting"]
+            assert csd_loaded.links.get("transmission_bank") == "Audio/AMS2/Vehicles/Drivetrain/GearWhine/GearWhine_SuperV8"
+            assert csd_loaded.links.get("transmission") == "event:/AMS2/Drivetrain_GLOBAL/GearWhine/SuperV8/SuperV8_Tranny_INT"
+            assert csd_loaded.links.get("gearshift_bank") == "Audio/AMS2/Vehicles/Drivetrain/GearChangeGrinding/GearShift_SuperV8"
+            assert csd_loaded.links.get("gearshift_up") == "event:/AMS2/Drivetrain_GLOBAL/GearChangeGrinding/SuperV8/SuperV8_Upshift"
+            assert csd_loaded.links.get("gearshift_down") == "event:/AMS2/Drivetrain_GLOBAL/GearChangeGrinding/SuperV8/SuperV8_Downshift"
             assert "turbo_bank" in csd_loaded.links
             assert "turbo" in csd_loaded.links
             assert "backfire_ext" in csd_loaded.links
-            print(f"   Ferrari 488 GT3 Mod export directo DUAL (Jugador + IA): {summary_direct.bank_file.name} y {summary_direct.ai_bank_file.name} (Enlaces AI .csdbin OK)!")
+            print(f"   Ferrari 488 GT3 Mod export directo DUAL (Jugador + IA + Starter + Transmisión AMS2): {summary_direct.bank_file.name} y {summary_direct.ai_bank_file.name} OK!")
 
     print("14. Probando Gestor de Vehículos Vanilla (Auditoría, Inyección Directa y Restauración Bit-a-Bit)...")
     from ams2_sound_porter.vanilla_manager import VanillaVehicleManager, calculate_file_sha256
@@ -1945,6 +1951,383 @@ def main() -> None:
             _check_ext_case23(vid_kw, ac_bp, exp_p_mindist)
             gc.collect()
         print("   Sonoridad exterior/replay AMS2 (LinearSquared 1..300m, Distance Filter, MBUS float gain e idempotencia) verificada al 100%!")
+
+        # 24. Opción C: Injerto quirúrgico + EVIB Proxy en banco multi-evento con eventos viejos (F_Ultimate_2022)
+        print("24. Probando Opción C (Injerto quirúrgico + EVIB Proxy) en F_Ultimate_2022 (Player + AI + Edit Modified Sound)...")
+        from ams2_sound_porter.porter_engine import (
+            _extract_bnki_exported_event_guids,
+            _extract_event_prmb_metadata,
+            _extract_native_exterior_spatializers,
+            _inspect_native_event_profiles,
+            _iter_proj_table_items,
+            graft_ac_into_native_bank_surgical,
+            verify_fmod_bank_integrity,
+        )
+
+        fult_v = next((v for v in vm23._vehicles_cache if "f_ultimate_2022" in v.vehicle_id.lower()), None)
+        alp_ac_p = Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_alpine_a525\sfx\rss_alpine_a525.bank")
+        if fult_v and fult_v.ai_bank_path and alp_ac_p.is_file():
+            vm23.load_vehicle_events_info(fult_v)
+            assert fult_v.has_multi_engine_variants, "F_Ultimate_2022 debe detectarse como banco multi-evento"
+            nat_fult_p = vm23.backup_dir / fult_v.vehicle_id / fult_v.bank_path.name
+            if not nat_fult_p.is_file():
+                nat_fult_p = fult_v.bank_path
+            nat_fult_ai = vm23.backup_dir / fult_v.vehicle_id / fult_v.ai_bank_path.name
+            if not nat_fult_ai.is_file():
+                nat_fult_ai = fult_v.ai_bank_path
+
+            alp_lib = SourceAudioLibrary.from_bank(
+                alp_ac_p,
+                guids_path=(alp_ac_p.parent / "GUIDs.txt" if (alp_ac_p.parent / "GUIDs.txt").is_file() else None),
+            )
+            alp_fmod = alp_lib.fmod_bank
+            master_pmap = {guid_str_to_bytes(g): p for g, p in vm23.get_master_strings().items() if p.startswith("event:/")}
+
+            fult_int_tgts = [guid_str_to_bytes(ev.guid_str) for ev in fult_v.player_engine_variants if ev.role == "EngineInt"]
+            fult_ext_tgts = [guid_str_to_bytes(ev.guid_str) for ev in fult_v.player_engine_variants if ev.role == "EngineExt"]
+            assert len(fult_int_tgts) >= 10 and len(fult_ext_tgts) >= 3
+
+            r_1copy_p = build_direct_ported_bank_from_ac(
+                ac_bank=alp_fmod,
+                mod_identifier=fult_v.car_name,
+                standalone_guids=False,
+                target_role_guids={
+                    "EngineInt": bytes_to_guid_str(fult_int_tgts[0]),
+                    "EngineExt": bytes_to_guid_str(fult_ext_tgts[0]),
+                },
+                target_role_paths=fult_v.event_paths,
+                target_bank_guid=fult_v.bank_guid or None,
+                native_bank_path=nat_fult_p,
+                invert_spatial_cone=True,
+                output_codec_mode=FSB5_MODE_FADPCM,
+                prune_unused_samples=True,
+                extra_role_variants=None,
+                prefer_throttle_param=bool(fult_v.prefers_throttle_player),
+                library=alp_lib,
+            )
+            nat_fult_bank = FmodBank(nat_fult_p)
+            nat_fult_proj = next(
+                nat_fult_bank.raw[ps + 4 : pe]
+                for c, ps, pe, _ in iter_riff_chunks(nat_fult_bank.raw, 12, len(nat_fult_bank.raw))
+                if c == b"LIST" and nat_fult_bank.raw[ps : ps + 4] == b"PROJ"
+            )
+            nat_fult_exp = _extract_bnki_exported_event_guids(
+                nat_fult_proj, dict(_iter_proj_table_items(nat_fult_proj))[b"EVTS"]
+            )
+            exh_sil_24 = {guid_str_to_bytes(fult_v.event_guids["Exhaust"])} if "Exhaust" in fult_v.event_guids else set()
+
+            surg_fult_p, meta_fult_p = graft_ac_into_native_bank_surgical(
+                native_bank=nat_fult_bank,
+                ported_ac_bank=FmodBank(raw=r_1copy_p.bank_bytes),
+                ac_int_event_guid=guid_str_to_bytes(r_1copy_p.role_to_event_guid["EngineInt"]),
+                ac_ext_event_guid=guid_str_to_bytes(r_1copy_p.role_to_event_guid["EngineExt"]),
+                target_int_guids=fult_int_tgts,
+                target_ext_guids=fult_ext_tgts,
+                silence_native_guids=exh_sil_24,
+                event_paths_map=master_pmap,
+                is_ai_bank=False,
+                native_panners=_extract_native_exterior_spatializers(nat_fult_p),
+                default_prefer_throttle=bool(fult_v.prefers_throttle_player),
+                mod_identifier=fult_v.car_name,
+                seed_tag="test24:fult:p",
+            )
+            errs24_p = verify_fmod_bank_integrity(surg_fult_p, expected_exported_guids=nat_fult_exp)
+            assert not errs24_p, f"F_Ultimate_2022 Player quirúrgico falló integridad: {errs24_p}"
+            assert_sndh_and_fsb_alignment(surg_fult_p)
+            assert meta_fult_p["ac_int_guid"] is not None and meta_fult_p["ac_ext_guid"] is not None
+
+            # Verificar puenteo mixto por evento: Renfault (load + 3D), Alp22 (throttle + 3D), MAIN_Pan (throttle + 2D)
+            s_proj = next(
+                surg_fult_p[ps + 4 : pe]
+                for c, ps, pe, _ in iter_riff_chunks(surg_fult_p, 12, len(surg_fult_p))
+                if c == b"LIST" and surg_fult_p[ps : ps + 4] == b"PROJ"
+            )
+            assert len(s_proj) < 350_000, f"PROJ demasiado grande (debería usar proxies EVIB): {len(s_proj):,}B"
+            s_tbls = list(_iter_proj_table_items(s_proj))
+            s_items_map = {lt: [(k, f) for k, f, _, _ in items] for lt, items in s_tbls}
+            s_profs = _inspect_native_event_profiles(s_proj, s_tbls)
+            ren_g = guid_str_to_bytes(fult_v.event_guids["EngineExt"])
+            alp22_g = guid_str_to_bytes("{256c4bf1-23e1-4f04-a391-159db1739c1b}")
+            pan_g = guid_str_to_bytes("{9d29458b-03a1-4d83-8df8-5a066d19bcf6}")
+            assert "load" in {p["name_low"] for p in _extract_event_prmb_metadata(s_items_map, ren_g)} and s_profs[ren_g]["is_3d"]
+            assert "throttle" in {p["name_low"] for p in _extract_event_prmb_metadata(s_items_map, alp22_g)} and s_profs[alp22_g]["is_3d"]
+            assert "throttle" in {p["name_low"] for p in _extract_event_prmb_metadata(s_items_map, pan_g)} and not s_profs[pan_g]["is_3d"]
+
+            # Roundtrip Edit Modified Sound sobre banco quirúrgico EVIB Proxy
+            re_fult = FmodBank(raw=surg_fult_p)
+            fult_bands = build_default_rpm_bands(re_fult)
+            assert any(b.perspective == "int" for b in fult_bands) and any(b.perspective == "ext" for b in fult_bands)
+            fult_edited = apply_band_edits_to_bank(re_fult, rpm_bands=fult_bands)
+            assert not verify_fmod_bank_integrity(fult_edited, expected_exported_guids=nat_fult_exp)
+            del re_fult, fult_edited, surg_fult_p
+
+            # Verificar _AI.bank quirúrgico en F_Ultimate_2022_AI
+            ai_int_24 = [guid_str_to_bytes(ev.guid_str) for ev in fult_v.ai_engine_variants if ev.role == "ai_engine_int"]
+            ai_ext_24 = [guid_str_to_bytes(ev.guid_str) for ev in fult_v.ai_engine_variants if ev.role != "ai_engine_int"]
+            ai_live_24 = {guid_str_to_bytes(ev.guid_str) for ev in fult_v.ai_engine_variants if ev.role == "ai_engine_live"}
+            r_1copy_ai = build_direct_ported_bank_from_ac(
+                ac_bank=alp_fmod,
+                mod_identifier=f"{fult_v.car_name}_AI",
+                standalone_guids=False,
+                target_role_guids={
+                    "ai_engine_ext": bytes_to_guid_str(ai_ext_24[0]),
+                    "ai_engine_int": bytes_to_guid_str(ai_int_24[0]),
+                },
+                target_role_paths=fult_v.ai_event_paths,
+                target_bank_guid=fult_v.ai_bank_guid or None,
+                is_ai_bank=True,
+                mute_secondary_pops=True,
+                native_bank_path=nat_fult_ai,
+                invert_spatial_cone=False,
+                output_codec_mode=FSB5_MODE_FADPCM,
+                prune_unused_samples=True,
+                cached_fsb_blobs=r_1copy_p.fsb_blobs_cache,
+                extra_role_variants=None,
+                prefer_throttle_param=bool(fult_v.prefers_throttle_ai),
+                library=alp_lib,
+            )
+            nat_ai_b = FmodBank(nat_fult_ai)
+            nat_ai_proj = next(
+                nat_ai_b.raw[ps + 4 : pe]
+                for c, ps, pe, _ in iter_riff_chunks(nat_ai_b.raw, 12, len(nat_ai_b.raw))
+                if c == b"LIST" and nat_ai_b.raw[ps : ps + 4] == b"PROJ"
+            )
+            nat_ai_exp = _extract_bnki_exported_event_guids(
+                nat_ai_proj, dict(_iter_proj_table_items(nat_ai_proj))[b"EVTS"]
+            )
+            surg_fult_ai, _ = graft_ac_into_native_bank_surgical(
+                native_bank=nat_ai_b,
+                ported_ac_bank=FmodBank(raw=r_1copy_ai.bank_bytes),
+                ac_int_event_guid=guid_str_to_bytes(r_1copy_ai.role_to_event_guid["ai_engine_int"]),
+                ac_ext_event_guid=guid_str_to_bytes(r_1copy_ai.role_to_event_guid["ai_engine_ext"]),
+                target_int_guids=ai_int_24,
+                target_ext_guids=ai_ext_24,
+                event_paths_map=master_pmap,
+                is_ai_bank=True,
+                native_panners=_extract_native_exterior_spatializers(nat_fult_ai),
+                default_prefer_throttle=bool(fult_v.prefers_throttle_ai),
+                mod_identifier=f"{fult_v.car_name}_AI",
+                seed_tag="test24:fult:ai",
+                ai_live_guids=ai_live_24,
+            )
+            errs24_ai = verify_fmod_bank_integrity(surg_fult_ai, expected_exported_guids=nat_ai_exp)
+            assert not errs24_ai, f"F_Ultimate_2022_AI quirúrgico falló integridad: {errs24_ai}"
+            assert_sndh_and_fsb_alignment(surg_fult_ai)
+            print("   Opción C (F_Ultimate_2022 Player + AI + puenteo load/throttle + Edit Modified Sound) verificada al 100%!")
+
+            # 25. Opción C: Aislamiento selectivo por auto + apilado multi-auto en Audi_V10_GT3.bank (5 autos en 1 .bank)
+            print("25. Probando aislamiento selectivo y apilado multi-auto en Audi_V10_GT3.bank...")
+            audi_v = next((v for v in vm23._vehicles_cache if "audi_v10_gt3" in v.vehicle_id.lower()), None)
+            if audi_v:
+                vm23.load_vehicle_events_info(audi_v)
+                assert audi_v.has_multi_engine_variants
+                audi_nat_p = vm23.backup_dir / audi_v.vehicle_id / audi_v.bank_path.name
+                if not audi_nat_p.is_file():
+                    audi_nat_p = audi_v.bank_path
+                audi_nat_b = FmodBank(audi_nat_p)
+                audi_nat_proj = next(
+                    audi_nat_b.raw[ps + 4 : pe]
+                    for c, ps, pe, _ in iter_riff_chunks(audi_nat_b.raw, 12, len(audi_nat_b.raw))
+                    if c == b"LIST" and audi_nat_b.raw[ps : ps + 4] == b"PROJ"
+                )
+                audi_exp = _extract_bnki_exported_event_guids(
+                    audi_nat_proj, dict(_iter_proj_table_items(audi_nat_proj))[b"EVTS"]
+                )
+                hur_int_g = [guid_str_to_bytes(ev.guid_str) for ev in audi_v.player_engine_variants if ev.role == "EngineInt" and "huracan" in ev.short_name.lower()]
+                hur_ext_g = [guid_str_to_bytes(ev.guid_str) for ev in audi_v.player_engine_variants if ev.role == "EngineExt" and "huracan" in ev.short_name.lower()]
+                r8_int_g = [guid_str_to_bytes(ev.guid_str) for ev in audi_v.player_engine_variants if ev.role == "EngineInt" and "r8_lms_gt3_engineint" in ev.short_name.lower()]
+                r8_ext_g = [guid_str_to_bytes(ev.guid_str) for ev in audi_v.player_engine_variants if ev.role == "EngineExt" and "r8_lms_gt3_engineext" in ev.short_name.lower()]
+                assert hur_int_g and hur_ext_g and r8_int_g and r8_ext_g
+
+                # Paso 25A: Reemplazar SOLO Huracán (todos los Audi R8 siguen 100% vanilla)
+                audi_step1, _ = graft_ac_into_native_bank_surgical(
+                    native_bank=audi_nat_b,
+                    ported_ac_bank=FmodBank(raw=r_1copy_p.bank_bytes),
+                    ac_int_event_guid=guid_str_to_bytes(r_1copy_p.role_to_event_guid["EngineInt"]),
+                    ac_ext_event_guid=guid_str_to_bytes(r_1copy_p.role_to_event_guid["EngineExt"]),
+                    target_int_guids=hur_int_g,
+                    target_ext_guids=hur_ext_g,
+                    event_paths_map=master_pmap,
+                    is_ai_bank=False,
+                    native_panners=_extract_native_exterior_spatializers(audi_nat_p),
+                    default_prefer_throttle=bool(audi_v.prefers_throttle_player),
+                    mod_identifier=audi_v.car_name,
+                    seed_tag="test25:audi:huracan",
+                )
+                errs25_1 = verify_fmod_bank_integrity(audi_step1, expected_exported_guids=audi_exp)
+                assert not errs25_1, f"Audi_V10_GT3 Huracan-only falló integridad: {errs25_1}"
+                # Paso 25B: Apilar un segundo sonido sobre Audi R8 LMS GT3 manteniendo Huracán modificado y R8 GT4 vanilla
+                r_z4_1copy = build_direct_ported_bank_from_ac(
+                    ac_bank=ac_lib.fmod_bank,
+                    mod_identifier="audi_r8_layer",
+                    standalone_guids=False,
+                    target_role_guids={
+                        "EngineInt": bytes_to_guid_str(r8_int_g[0]),
+                        "EngineExt": bytes_to_guid_str(r8_ext_g[0]),
+                    },
+                    target_role_paths=audi_v.event_paths,
+                    target_bank_guid=audi_v.bank_guid or None,
+                    native_bank_path=audi_nat_p,
+                    extra_role_variants=None,
+                    prefer_throttle_param=bool(audi_v.prefers_throttle_player),
+                )
+                audi_step2, _ = graft_ac_into_native_bank_surgical(
+                    native_bank=FmodBank(raw=audi_step1),
+                    ported_ac_bank=FmodBank(raw=r_z4_1copy.bank_bytes),
+                    ac_int_event_guid=guid_str_to_bytes(r_z4_1copy.role_to_event_guid["EngineInt"]),
+                    ac_ext_event_guid=guid_str_to_bytes(r_z4_1copy.role_to_event_guid["EngineExt"]),
+                    target_int_guids=r8_int_g,
+                    target_ext_guids=r8_ext_g,
+                    event_paths_map=master_pmap,
+                    is_ai_bank=False,
+                    native_panners=_extract_native_exterior_spatializers(audi_nat_p),
+                    default_prefer_throttle=bool(audi_v.prefers_throttle_player),
+                    mod_identifier=audi_v.car_name,
+                    seed_tag="test25:audi:r8gt3",
+                )
+                errs25_2 = verify_fmod_bank_integrity(audi_step2, expected_exported_guids=audi_exp)
+                assert not errs25_2, f"Audi_V10_GT3 layered Huracan+R8 falló integridad: {errs25_2}"
+                assert_sndh_and_fsb_alignment(audi_step2)
+                print("   Aislamiento selectivo + apilado multi-auto (Huracán + R8 GT3 + R8 GT4 vanilla) verificado al 100%!")
+            del r_1copy_p, r_1copy_ai, alp_lib, alp_fmod
+            gc.collect()
+
+        # 26. Preservación garantizada de Starter/Starting (audio FSB5 completo) y Transmisión AMS2 en Vanilla y Mods
+        print("26. Probando preservación de Starter/Starting y Transmisión original de AMS2 (Vanilla FADPCM/Vorbis + Mod .csdbin)...")
+        from ams2_sound_porter.porter_engine import (
+            _extract_event_subgraph_closure,
+            collect_local_proj_guids,
+        )
+
+        def _verify_starter_wavs_26(bank_bytes: bytes, root_guids: list[bytes]) -> list[str]:
+            fb = FmodBank(raw=bank_bytes)
+            pj = next(
+                bank_bytes[ps + 4 : pe]
+                for c, ps, pe, _ in iter_riff_chunks(bank_bytes, 12, len(bank_bytes))
+                if c == b"LIST" and bank_bytes[ps : ps + 4] == b"PROJ"
+            )
+            tbls = list(_iter_proj_table_items(pj))
+            clos = _extract_event_subgraph_closure(tbls, set(root_guids))
+            found_names: list[str] = []
+            for lt, items in tbls:
+                if lt == b"WAVS":
+                    for k, _, _, bpay in items:
+                        if k in clos and len(bpay) >= 30:
+                            _, sb_i, _, smp_i, _ = struct.unpack_from("<HHHII", bpay, 16)
+                            sl = next((s for s in fb.slots if s.subbank_index == sb_i and s.sample_index == smp_i), None)
+                            assert sl is not None, f"WAV starter fuera de rango: ({sb_i}, {smp_i})"
+                            if sl.can_decode_audio:
+                                ab = fb.decode_slot_to_buffer(sl)
+                                assert ab.num_samples > 0 and ab.peak_linear() > 0.001, f"Audio starter mudo: {sl.name}"
+                            found_names.append(sl.name)
+            return found_names
+
+        # 26a. Vanilla single-car (Porsche_963 con 3 eventos Startup + Corvette_C8_GT3R + Audi_V10_GT3 Vorbis starter)
+        p96_ac_26 = Path(r"D:\SteamLibrary\steamapps\common\assettocorsa\content\cars\rss_mph_protech_p96_v8\sfx\rss_mph_protech_p96_v8.bank")
+        src_ac_26 = SourceAudioLibrary.from_bank(p96_ac_26, guids_path=p96_ac_26.parent / "GUIDs.txt") if p96_ac_26.is_file() else ac_lib
+        for vid_26, min_st_wavs in (("porsche_963", 5), ("c_corvette_c8_gt3r", 2), ("audi_audi_v10_gt3", 3)):
+            v26 = next((v for v in vm23._vehicles_cache if vid_26 in v.vehicle_id.lower()), None)
+            if not v26:
+                continue
+            vm23.load_vehicle_events_info(v26)
+            nat_p26 = vm23.backup_dir / v26.vehicle_id / v26.bank_path.name
+            if not nat_p26.is_file():
+                nat_p26 = v26.bank_path
+            r26 = build_direct_ported_bank_from_ac(
+                ac_bank=src_ac_26.fmod_bank,
+                mod_identifier=v26.car_name,
+                standalone_guids=False,
+                target_role_guids=v26.event_guids,
+                target_role_paths=v26.event_paths,
+                target_bank_guid=v26.bank_guid or None,
+                native_bank_path=nat_p26,
+                extra_role_variants=v26.extra_event_variants or None,
+                output_codec_mode=FSB5_MODE_FADPCM,
+                prune_unused_samples=True,
+                library=src_ac_26,
+            )
+            nat_b26 = FmodBank(nat_p26)
+            nat_pj26 = next(
+                nat_b26.raw[ps + 4 : pe]
+                for c, ps, pe, _ in iter_riff_chunks(nat_b26.raw, 12, len(nat_b26.raw))
+                if c == b"LIST" and nat_b26.raw[ps : ps + 4] == b"PROJ"
+            )
+            nat_exp26 = _extract_bnki_exported_event_guids(nat_pj26, dict(_iter_proj_table_items(nat_pj26))[b"EVTS"])
+            errs26 = verify_fmod_bank_integrity(r26.bank_bytes, expected_exported_guids=nat_exp26)
+            assert not errs26, f"{vid_26} falló integridad tras injerto de starter nativo: {errs26}"
+            assert_sndh_and_fsb_alignment(r26.bank_bytes)
+            st_gs26 = [guid_str_to_bytes(v26.event_guids[r]) for r in ("Starter", "Starting") if r in v26.event_guids]
+            for r in ("Starter", "Starting"):
+                for it in (v26.extra_event_variants or {}).get(r, ()):
+                    st_gs26.append(guid_str_to_bytes(it[0]))
+            st_names26 = _verify_starter_wavs_26(r26.bank_bytes, st_gs26)
+            assert len(st_names26) >= min_st_wavs, f"{vid_26} starter WAVS insuficientes: {st_names26}"
+            # Round-trip Edit Modified Sound debe mantener el starter intacto
+            re_b26 = FmodBank(raw=r26.bank_bytes)
+            ed_b26 = apply_band_edits_to_bank(re_b26, rpm_bands=build_default_rpm_bands(re_b26))
+            assert not verify_fmod_bank_integrity(ed_b26, expected_exported_guids=nat_exp26)
+            assert len(_verify_starter_wavs_26(ed_b26, st_gs26)) == len(st_names26)
+            del r26, re_b26, ed_b26
+
+        # 26b. Mod export (.csdbin de porsche_992_cup + doble exportación consecutiva)
+        cup_csd_p = vm23.ams2_root / "Vehicles" / "porsche_992_cup" / "porsche_992_cup.csdbin"
+        if cup_csd_p.is_file() and AC_MOD_488_BANK.is_file() and AC_MOD_488_GUIDS.is_file():
+            ac_488_26 = FmodBank(AC_MOD_488_BANK, guids_path=AC_MOD_488_GUIDS)
+            cup_doc26 = CsdbinDocument.from_file(cup_csd_p)
+            orig_links26 = {
+                k: cup_doc26.links.get(k)
+                for k in (
+                    "transmission_bank",
+                    "transmission",
+                    "gearshift_bank",
+                    "gearshift_up",
+                    "gearshift_down",
+                    "gearshift_grind",
+                    "rev_limiter_bank",
+                    "wind_bank",
+                )
+            }
+            cup_nat_raw26 = (vm23.ams2_root / "Audio" / "AMS2" / "Vehicles" / "Sort" / "P" / "Porsche" / "911_Cup_2.bank").read_bytes()
+            cup_nat_pj26 = next(
+                cup_nat_raw26[ps + 4 : pe]
+                for c, ps, pe, _ in iter_riff_chunks(cup_nat_raw26, 12, len(cup_nat_raw26))
+                if c == b"LIST" and cup_nat_raw26[ps : ps + 4] == b"PROJ"
+            )
+            cup_nat_guids26 = set(collect_local_proj_guids(cup_nat_pj26))
+            with tempfile.TemporaryDirectory() as td26:
+                for pass_idx in (1, 2):
+                    s26 = export_ams2_mod_package(
+                        output_root=Path(td26),
+                        mod_identifier="cup_st_tr_test",
+                        vehicle_folder_name="porsche_992_cup",
+                        direct_ac_bank=ac_488_26,
+                        csd_doc=cup_doc26,
+                        standalone_guids=True,
+                        ams2_root=vm23.ams2_root,
+                        backup_dir=vm23.backup_dir,
+                    )
+                    m_raw26 = s26.bank_file.read_bytes()
+                    assert not verify_fmod_bank_integrity(m_raw26), f"Mod pass {pass_idx} falló integridad"
+                    assert_sndh_and_fsb_alignment(m_raw26)
+                    m_pj26 = next(
+                        m_raw26[ps + 4 : pe]
+                        for c, ps, pe, _ in iter_riff_chunks(m_raw26, 12, len(m_raw26))
+                        if c == b"LIST" and m_raw26[ps : ps + 4] == b"PROJ"
+                    )
+                    assert not (cup_nat_guids26 & set(collect_local_proj_guids(m_pj26))), "Colisión GUID con 911_Cup_2 vanilla"
+                    st_g26 = guid_str_to_bytes(s26.bank_result.role_to_event_guid["Starter"])
+                    stg_g26 = guid_str_to_bytes(s26.bank_result.role_to_event_guid["Starting"])
+                    m_wavs26 = _verify_starter_wavs_26(m_raw26, [st_g26, stg_g26])
+                    assert len(m_wavs26) >= 4, f"Mod pass {pass_idx} perdió muestras starter: {m_wavs26}"
+                    csd_out26 = CsdbinDocument.from_file(s26.csdbin_file)
+                    assert csd_out26.links.get("starter") == "event:/AMS2/Vehicles/Mods/cup_st_tr_test/Starter"
+                    assert csd_out26.links.get("starting") == "event:/AMS2/Vehicles/Mods/cup_st_tr_test/Starting"
+                    for lk, lv in orig_links26.items():
+                        if lv:
+                            assert csd_out26.links.get(lk) == lv, f"Mod pass {pass_idx} alteró enlace nativo {lk}: {csd_out26.links.get(lk)} != {lv}"
+            del ac_488_26
+        print("   Preservación de Starter/Starting (FADPCM+Vorbis) y Transmisión/Gearshift AMS2 (Vanilla + Mod + re-export) verificada al 100%!")
+        gc.collect()
 
     print("\nTODAS LAS PRUEBAS DEL MOTOR PASARON AL 100%!")
 

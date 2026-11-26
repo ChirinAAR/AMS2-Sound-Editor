@@ -626,6 +626,30 @@ def main() -> None:
                     assert row_vals[2] == "Interior only" and row_vals[3] == "Kept vanilla", f"Fila inesperada en modified_tree: {row_vals}"
                     assert (sbx9_backup / sv9.vehicle_id / sv9.bank_path.name).read_bytes() == orig_m3_p
                     print("   Selector Vanilla ('Full' / 'Interior only' / 'Exterior only') y respaldo intacto verificados al 100%!")
+
+                    # 10. Verificar UI y flujo quirúrgico multi-evento (Opción C) en F_Ultimate_2022 y Porsche_963
+                    print("10. Probando UI y selector quirúrgico multi-evento (Opción C: single-car vs multi-event)...")
+                    app.vanilla_mgr = real_mgr
+                    app.vanilla_search_var.set("F Ultimate 2022")
+                    app._filter_vanilla_vehicles()
+                    assert app.vanilla_selected_vehicle is not None
+                    assert app.vanilla_selected_vehicle.has_multi_engine_variants
+                    assert app.vanilla_ev_box.winfo_manager() == "grid", "El panel multi-evento debía mostrarse para F_Ultimate_2022"
+                    assert "Surgical EVIB Proxy" in app.vanilla_event_target_badge_var.get()
+                    assert app.vanilla_event_target_mode_var.get() == "all"
+
+                    app.vanilla_event_target_mode_var.set("specific")
+                    app._on_vanilla_event_target_mode_changed()
+                    assert str(app.btn_choose_vanilla_events["state"]) == "normal"
+
+                    app.vanilla_search_var.set("Corvette C8 GT3R")
+                    app._filter_vanilla_vehicles()
+                    assert app.vanilla_selected_vehicle is not None
+                    assert not app.vanilla_selected_vehicle.has_multi_engine_variants
+                    assert app.vanilla_ev_box.winfo_manager() == "", "El panel multi-evento debía ocultarse en bancos de 1 solo auto"
+                    app.vanilla_search_var.set("")
+                    app._filter_vanilla_vehicles()
+                    print("   UI contextual multi-evento (Opción C) verificada al 100%!")
                 finally:
                     app.vanilla_audio_scope_var.set("full")
                     app._on_vanilla_scope_changed()

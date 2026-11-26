@@ -759,6 +759,8 @@ class FmodBank:
         wais_map: dict[bytes, tuple[bytes, bytes, float | None, bool, bytes]] = {}
         # muis_map: mg_self -> (children_guids, ap_guid, ap_val, inf_loop, route_bus)
         muis_map: dict[bytes, tuple[list[bytes], bytes, float | None, bool, bytes]] = {}
+        # evis_map: evib_self_guid -> target_event_guid (sub-eventos anidados / proxies EVIB)
+        evis_map: dict[bytes, bytes] = {}
         ibus_parent_bytes: dict[bytes, bytes] = {}
         ibus_parent: dict[bytes, str] = {}
         prms_map: dict[bytes, tuple[str, float, float]] = {}
@@ -896,6 +898,11 @@ class FmodBank:
                                 ap_g, ref_rpm, inf_loop, rbus = _parse_inst_chunk(raw[sps:spe])
                         if mg:
                             muis_map[mg] = (children, ap_g, ref_rpm, inf_loop, rbus)
+                    elif ltype == b"EVIN":
+                        for scid, sps, spe, _ in iter_riff_chunks(raw, ps + 4, pe):
+                            if scid == b"EVIB" and spe - sps >= 32:
+                                evis_map[raw[sps : sps + 16]] = raw[sps + 16 : sps + 32]
+                                break
                     else:
                         walk_proj(ps + 4, pe)
 
@@ -1044,6 +1051,7 @@ class FmodBank:
         # Construir información de eventos y clasificarlos
         evt_params: dict[bytes, list[tuple[str, float, float]]] = {}
         evt_samples: dict[bytes, list[FsbSampleSlot]] = {}
+        evt_evib_targets: dict[bytes, list[bytes]] = {}
         evt_is_timeline: set[bytes] = set()
         slot_has_unmuted_ref: set[int] = set()
         slot_has_muted_ref: set[int] = set()
@@ -1054,6 +1062,9 @@ class FmodBank:
                 evt_params.setdefault(eg, []).append(pinfo)
             pname_low = pinfo[0].strip().lower() if pinfo else ""
             for ig, v0, v1 in boxes:
+                if ig in evis_map:
+                    evt_evib_targets.setdefault(eg, []).append(evis_map[ig])
+                    continue
                 rbus = _get_inst_rbus(ig)
                 muted_box = _is_chain_muted(ig, rbus)
                 aud_win = (
@@ -1082,6 +1093,9 @@ class FmodBank:
             if tboxes:
                 evt_is_timeline.add(eg)
             for ig, _, _ in tboxes:
+                if ig in evis_map:
+                    evt_evib_targets.setdefault(eg, []).append(evis_map[ig])
+                    continue
                 rbus = _get_inst_rbus(ig)
                 muted_box = _is_chain_muted(ig, rbus)
                 for sl in resolve_inst_slots(ig):
@@ -1181,6 +1195,23 @@ class FmodBank:
             "AuxInt": "ai_engine_int",
         }
 
+        def _collect_linked_samples(root_eg: bytes) -> list[FsbSampleSlot]:
+            out_s: list[FsbSampleSlot] = list(evt_samples.get(root_eg, []))
+            if root_eg not in evt_evib_targets:
+                return out_s
+            visited_ev: set[bytes] = {root_eg}
+            stack: list[bytes] = list(reversed(evt_evib_targets[root_eg]))
+            while stack:
+                cur_eg = stack.pop()
+                if cur_eg in visited_ev:
+                    continue
+                visited_ev.add(cur_eg)
+                out_s.extend(evt_samples.get(cur_eg, []))
+                for nxt_eg in reversed(evt_evib_targets.get(cur_eg, [])):
+                    if nxt_eg not in visited_ev:
+                        stack.append(nxt_eg)
+            return out_s
+
         evt_role_by_guid: dict[bytes, str] = {}
         for idx, (eg, _, ibg) in enumerate(raw_evts):
             g_str = bytes_to_guid_str(eg)
@@ -1189,7 +1220,8 @@ class FmodBank:
             pbus = ibus_parent.get(ibg, "")
             ev_path = guid_to_path.get(eg, "")
             slist = evt_samples.get(eg, [])
-            unique_names = list(dict.fromkeys(s.name for s in slist))
+            linked_slist = _collect_linked_samples(eg)
+            unique_names = list(dict.fromkeys(s.name for s in linked_slist))
             for sl in slist:
                 if g_str not in sl.event_guids:
                     sl.event_guids.append(g_str)
@@ -1260,6 +1292,8 @@ class FmodBank:
 
             band_persp = "int" if ev_role in ("EngineInt", "AuxInt") else "ext"
             for bi, (ig, v0, v1) in enumerate(boxes):
+                if ig in evis_map:
+                    continue
                 box_slots = resolve_inst_slots(ig)
                 unique_gidxs = list(dict.fromkeys(s.global_index for s in box_slots))
                 rbus = _get_inst_rbus(ig)

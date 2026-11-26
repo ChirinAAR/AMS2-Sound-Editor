@@ -22,9 +22,9 @@ except ImportError:
 
 from .audio_dsp import conform_audio, read_wav_file, write_wav_bytes
 from .engine_sim import EnginePassTrajectory, render_engine_pass_wav_bytes
-from .fmod_bank import FSB5_MODE_FADPCM, FSB5_MODE_PCM16, FmodBank
+from .fmod_bank import FSB5_MODE_FADPCM, FSB5_MODE_PCM16, FmodBank, bytes_to_guid_str, guid_str_to_bytes
 from .omvt_csdbin import SOUND_SLOT_GROUPS, CsdbinDocument
-from .vanilla_manager import VanillaVehicle, VanillaVehicleManager
+from .vanilla_manager import VanillaEventVariant, VanillaVehicle, VanillaVehicleManager
 from .porter_engine import (
     ModExportSummary,
     RpmBandConfig,
@@ -32,6 +32,7 @@ from .porter_engine import (
     SourceAudioLibrary,
     ThrottleCutConfig,
     _extract_native_engine_max_rpm,
+    _extract_native_exterior_spatializers,
     apply_band_edits_to_bank,
     apply_ported_bank_to_csdbin,
     auto_detect_throttle_cut_config,
@@ -45,10 +46,12 @@ from .porter_engine import (
     collect_vanilla_scope_targets,
     estimate_engine_rpm_bounds,
     export_ams2_mod_package,
+    graft_ac_into_native_bank_surgical,
     merge_ported_events_into_native_bank,
     sync_faithful_assetto_corsa_setup,
     sync_faithful_section_from_source,
     uninvert_spatial_cone_in_bank_bytes,
+    verify_fmod_bank_integrity,
 )
 
 
@@ -108,12 +111,12 @@ class SoundPorterApp(tk.Tk):
 
         # Variables de control Tk
         self.status_var = tk.StringVar(
-            value="Ready. Select 'Edit custom car sounds' or 'Edit vanilla car sounds'."
+            value="."
         )
         self.src_filter_var = tk.StringVar()
-        self.src_info_var = tk.StringVar(value="Ningún origen cargado")
-        self.donor_info_var = tk.StringVar(value="Ningún banco donante AMS2 cargado")
-        self.csd_info_var = tk.StringVar(value="Ningún archivo .csdbin / .csd cargado")
+        self.src_info_var = tk.StringVar(value="No origin loaded")
+        self.donor_info_var = tk.StringVar(value="No AMS 2 Bank Loaded")
+        self.csd_info_var = tk.StringVar(value="No CSDBIN loaded")
 
         # Controles de edición de slot (Pestaña 2)
         self.slot_action_var = tk.StringVar(value="keep_donor")
@@ -128,7 +131,7 @@ class SoundPorterApp(tk.Tk):
         self.rpm_view_persp_var = tk.StringVar(value="int")
         self.show_muted_bands_var = tk.BooleanVar(value=False)
         self.rpm_overlap_status_var = tk.StringVar(
-            value="Carga un banco donante de AMS2 en el Paso 2 para visualizar y editar las bandas de RPM."
+            value=" "
         )
         self.tcut_enabled_var = tk.BooleanVar(value=False)
         self.tcut_int_combo_var = tk.StringVar(value="")
@@ -150,7 +153,7 @@ class SoundPorterApp(tk.Tk):
         self.batch_gain_var = tk.StringVar(value="+1.5")
 
         self.sim_telemetry_var = tk.StringVar(
-            value="Simulador listo — Prueba la pasada en 5 etapas (Idle -> Corte 1ª -> Cambio + Subida 2ª -> 3s Corte + 3s Desacel -> Rebaje Auto-Blip -> Idle)."
+            value=" "
         )
         self.sim_stage_var = tk.StringVar(value="Stage: Idle")
 
@@ -191,12 +194,18 @@ class SoundPorterApp(tk.Tk):
         self.vanilla_mute_pops_var = tk.BooleanVar(value=True)
         self.vanilla_audio_scope_var = tk.StringVar(value="full")
         self.vanilla_scope_hint_var = tk.StringVar(
-            value="Replaces both onboard interior audio and exterior / chase / replay audio."
+            value="Replaces both interior and exterior audio"
         )
+        self.vanilla_event_target_mode_var = tk.StringVar(value="all")
+        self.vanilla_event_target_badge_var = tk.StringVar(value="")
+        self.vanilla_event_target_summary_var = tk.StringVar(value="")
+        self.vanilla_selected_player_ev_guids: set[str] = set()
+        self.vanilla_selected_ai_ev_guids: set[str] = set()
+        self.vanilla_layer_on_modified_var = tk.BooleanVar(value=False)
         self.mute_all_pops_var = tk.BooleanVar(value=True)
         self.invert_cone_var = tk.BooleanVar(value=True)
         self.vanilla_filtered_vehicles: list[VanillaVehicle] = []
-        self.vanilla_export_dest_var = tk.StringVar(value="Ningún vehículo vanilla seleccionado.")
+        self.vanilla_export_dest_var = tk.StringVar(value="No car selected")
 
         # Estado de navegación y vista simplificada
         self._current_view: str = "menu"
@@ -205,7 +214,7 @@ class SoundPorterApp(tk.Tk):
         self._modified_edit_vehicle: VanillaVehicle | None = None
         self._modified_vehicles_list: list[VanillaVehicle] = []
         self.modified_search_var = tk.StringVar(value="")
-        self.modified_count_var = tk.StringVar(value="Select a modified sound to edit its RPM bands.")
+        self.modified_count_var = tk.StringVar(value="Select a sound to edit it")
         self._pending_guids_path: Path | None = None
         self.ui_bank_check_var = tk.StringVar(value="○")
         self.ui_bank_status_var = tk.StringVar(value=".bank : Not selected")
@@ -405,12 +414,12 @@ class SoundPorterApp(tk.Tk):
         left.pack(side="left", fill="x", expand=True)
         ttk.Label(
             left,
-            text="🏎️  AMS2 Sound Porter Studio",
+            text="AMS2 Sound Editor",
             style="HeaderTitle.TLabel",
         ).pack(anchor="w")
         ttk.Label(
             left,
-            text="Porteo directo de bancos FMOD de Assetto Corsa / WAV hacia Automobilista 2 + Editor visual .csdbin (OMVT)",
+            text="",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -418,12 +427,12 @@ class SoundPorterApp(tk.Tk):
         right.pack(side="right")
         ttk.Button(
             right,
-            text="🛡️ Restaurar Sonidos Vanilla...",
+            text="Restore sounds",
             command=self.cmd_open_vanilla_restore_dialog,
         ).pack(side="right", padx=(6, 0))
         ttk.Button(
             right,
-            text="⏹ Detener Audio",
+            text="Stop",
             command=self.stop_audio_preview,
         ).pack(side="right", padx=(6, 0))
 
@@ -878,6 +887,87 @@ class SoundPorterApp(tk.Tk):
             fg=FG_MUTED,
             font=("Segoe UI", 10),
         ).grid(row=4, column=2, sticky="w", pady=(2, 0))
+
+        # Row 5 (contextual): Multi-event / Shared bank surgical event target (shown only for multi-event banks)
+        self.vanilla_ev_num_lbl = tk.Label(rows, text="5)", bg=BG_DARK, fg="#f1f5f9", font=("Segoe UI", 15))
+        self.vanilla_ev_num_lbl.grid(row=5, column=0, sticky="nw", padx=(0, 12), pady=(16, 4))
+        self.vanilla_ev_title_lbl = tk.Label(
+            rows,
+            text="Target events:",
+            bg=BG_DARK,
+            fg="#f1f5f9",
+            font=("Segoe UI", 12, "bold"),
+        )
+        self.vanilla_ev_title_lbl.grid(row=5, column=1, sticky="nw", padx=(0, 26), pady=(18, 4))
+
+        self.vanilla_ev_box = tk.Frame(
+            rows,
+            bg=BG_CARD,
+            bd=1,
+            relief="solid",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+            padx=14,
+            pady=10,
+        )
+        self.vanilla_ev_box.grid(row=5, column=2, sticky="w", pady=(12, 4))
+
+        tk.Label(
+            self.vanilla_ev_box,
+            textvariable=self.vanilla_event_target_badge_var,
+            bg=BG_CARD,
+            fg="#38bdf8",
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        ).pack(anchor="w", pady=(0, 6))
+
+        tk.Radiobutton(
+            self.vanilla_ev_box,
+            text="All engine events in this bank (Surgical EVIB Proxy — Recommended)",
+            variable=self.vanilla_event_target_mode_var,
+            value="all",
+            command=self._on_vanilla_event_target_mode_changed,
+            **rb_opts,
+        ).pack(anchor="w", pady=(0, 4))
+
+        spec_row = tk.Frame(self.vanilla_ev_box, bg=BG_CARD)
+        spec_row.pack(anchor="w", fill="x")
+        tk.Radiobutton(
+            spec_row,
+            text="Select specific events / cars only (other cars stay vanilla)",
+            variable=self.vanilla_event_target_mode_var,
+            value="specific",
+            command=self._on_vanilla_event_target_mode_changed,
+            **rb_opts,
+        ).pack(side="left")
+        self.btn_choose_vanilla_events = tk.Button(
+            spec_row,
+            text="Choose events...",
+            command=self.cmd_open_vanilla_event_picker,
+            bg="#25344d",
+            fg="#f1f5f9",
+            activebackground=ACCENT_BLUE,
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            padx=10,
+            pady=2,
+        )
+        self.btn_choose_vanilla_events.pack(side="left", padx=(14, 0))
+
+        self.vanilla_ev_summary_lbl = tk.Label(
+            rows,
+            textvariable=self.vanilla_event_target_summary_var,
+            bg=BG_DARK,
+            fg=FG_MUTED,
+            font=("Segoe UI", 10),
+        )
+        self.vanilla_ev_summary_lbl.grid(row=6, column=2, sticky="w", pady=(2, 0))
+
+        # Ocultar por defecto (se muestra automáticamente cuando el banco seleccionado tiene >1 variante)
+        self._set_vanilla_multi_event_visible(False)
 
         # Acciones inferiores
         actions = ttk.Frame(body, style="TFrame")
@@ -1506,6 +1596,300 @@ class SoundPorterApp(tk.Tk):
             "exterior": "Replaces only exterior, chase camera, and replay audio. Onboard interior audio stays vanilla.",
         }
         self.vanilla_scope_hint_var.set(hints.get(scope, hints["full"]))
+        self._refresh_vanilla_multi_event_ui(reset_selection=False)
+
+    def _set_vanilla_multi_event_visible(self, visible: bool) -> None:
+        widgets = (
+            getattr(self, "vanilla_ev_num_lbl", None),
+            getattr(self, "vanilla_ev_title_lbl", None),
+            getattr(self, "vanilla_ev_box", None),
+            getattr(self, "vanilla_ev_summary_lbl", None),
+        )
+        for w in widgets:
+            if w is None:
+                continue
+            if visible:
+                w.grid()
+            else:
+                w.grid_remove()
+
+    def _refresh_vanilla_multi_event_ui(self, reset_selection: bool = False) -> None:
+        v = self.vanilla_selected_vehicle
+        if v is None or not v.has_multi_engine_variants:
+            self._set_vanilla_multi_event_visible(False)
+            if reset_selection:
+                self.vanilla_event_target_mode_var.set("all")
+                self.vanilla_selected_player_ev_guids.clear()
+                self.vanilla_selected_ai_ev_guids.clear()
+                self.vanilla_layer_on_modified_var.set(False)
+            return
+
+        if reset_selection:
+            self.vanilla_event_target_mode_var.set("all")
+            self.vanilla_selected_player_ev_guids = {ev.guid_str.lower() for ev in v.player_engine_variants}
+            self.vanilla_selected_ai_ev_guids = {ev.guid_str.lower() for ev in v.ai_engine_variants}
+            self.vanilla_layer_on_modified_var.set(False)
+
+        p_int_all = [ev for ev in v.player_engine_variants if ev.role == "EngineInt"]
+        p_ext_all = [ev for ev in v.player_engine_variants if ev.role == "EngineExt"]
+        ai_all = list(v.ai_engine_variants)
+        self.vanilla_event_target_badge_var.set(
+            f"⚡ Multi-event bank ({len(p_int_all)} Interior, {len(p_ext_all)} Exterior, {len(ai_all)} AI) "
+            "— Surgical EVIB Proxy active"
+        )
+        mode = self.vanilla_event_target_mode_var.get()
+        if hasattr(self, "btn_choose_vanilla_events"):
+            self.btn_choose_vanilla_events.config(state=("normal" if mode == "specific" else "disabled"))
+
+        scope = self.vanilla_audio_scope_var.get()
+        if mode == "specific":
+            sel_int = sum(1 for ev in p_int_all if ev.guid_str.lower() in self.vanilla_selected_player_ev_guids)
+            sel_ext = sum(1 for ev in p_ext_all if ev.guid_str.lower() in self.vanilla_selected_player_ev_guids)
+            sel_ai = sum(1 for ev in ai_all if ev.guid_str.lower() in self.vanilla_selected_ai_ev_guids)
+            layer_txt = " | Layering on modified bank" if (v.is_modified and self.vanilla_layer_on_modified_var.get()) else ""
+            self.vanilla_event_target_summary_var.set(
+                f"Selected: {sel_int}/{len(p_int_all)} Interior, {sel_ext}/{len(p_ext_all)} Exterior, "
+                f"{sel_ai}/{len(ai_all)} AI (unchecked events stay untouched){layer_txt}"
+            )
+        else:
+            if scope == "interior":
+                self.vanilla_event_target_summary_var.set(
+                    f"Target: All {len(p_int_all)} Interior events via 1 shared AC graph + EVIB proxies (Exterior & AI stay vanilla)."
+                )
+            elif scope == "exterior":
+                self.vanilla_event_target_summary_var.set(
+                    f"Target: All {len(p_ext_all)} Exterior + {len(ai_all)} AI events via 1 shared AC graph + EVIB proxies (Interior stays vanilla)."
+                )
+            else:
+                self.vanilla_event_target_summary_var.set(
+                    f"Target: All {len(p_int_all)} Interior + {len(p_ext_all)} Exterior + {len(ai_all)} AI events "
+                    "(1 shared AC graph + EVIB proxies; native starters preserved)."
+                )
+        self._set_vanilla_multi_event_visible(True)
+
+    def _on_vanilla_event_target_mode_changed(self) -> None:
+        self._refresh_vanilla_multi_event_ui(reset_selection=False)
+
+    def cmd_open_vanilla_event_picker(self) -> None:
+        """Abre un diálogo interactivo para seleccionar qué eventos/autos específicos reemplazar dentro del .bank."""
+        veh = self.vanilla_selected_vehicle
+        if veh is None:
+            messagebox.showwarning("No Vehicle Selected", "Please select a vanilla vehicle first.")
+            return
+        self.vanilla_mgr.load_vehicle_events_info(veh)
+        if not veh.player_engine_variants and not veh.ai_engine_variants:
+            messagebox.showinfo(
+                "No Engine Events Found",
+                "This vehicle bank does not expose selectable engine event variants.",
+            )
+            return
+
+        self.vanilla_event_target_mode_var.set("specific")
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Select Target Events — {veh.display_name}")
+        dlg.configure(bg=BG_DARK)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("760x580")
+        dlg.minsize(640, 440)
+
+        hdr = tk.Frame(dlg, bg="#080c13", padx=18, pady=12)
+        hdr.pack(fill="x")
+        tk.Label(
+            hdr,
+            text=f"Select Target Events in '{veh.bank_path.name}'",
+            bg="#080c13",
+            fg="#ffffff",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            hdr,
+            text="Check only the cars/events you want to replace. Unchecked events stay 100% untouched.",
+            bg="#080c13",
+            fg=FG_MUTED,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(2, 0))
+
+        bar = tk.Frame(dlg, bg=BG_DARK, padx=16, pady=10)
+        bar.pack(fill="x")
+        tk.Label(bar, text="Filter:", bg=BG_DARK, fg=FG_TEXT, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
+        filter_var = tk.StringVar(value="")
+        filter_ent = ttk.Entry(bar, textvariable=filter_var, width=32)
+        filter_ent.pack(side="left", padx=(0, 12))
+
+        p_vars: dict[str, tuple[VanillaEventVariant, tk.BooleanVar]] = {}
+        ai_vars: dict[str, tuple[VanillaEventVariant, tk.BooleanVar]] = {}
+        for ev in veh.player_engine_variants:
+            gl = ev.guid_str.lower()
+            init_v = (gl in self.vanilla_selected_player_ev_guids) if self.vanilla_selected_player_ev_guids else True
+            p_vars[gl] = (ev, tk.BooleanVar(value=init_v))
+        for ev in veh.ai_engine_variants:
+            gl = ev.guid_str.lower()
+            init_v = (gl in self.vanilla_selected_ai_ev_guids) if self.vanilla_selected_ai_ev_guids else True
+            ai_vars[gl] = (ev, tk.BooleanVar(value=init_v))
+
+        # Contenedor desplazable de checkboxes
+        list_outer = tk.Frame(dlg, bg=BG_DARK, padx=16)
+        list_outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(list_outer, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER_COLOR)
+        vsb = ttk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=BG_CARD, padx=12, pady=10)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _on_inner_cfg(_e=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_cfg(e) -> None:
+            canvas.itemconfigure(inner_id, width=e.width)
+
+        inner.bind("<Configure>", _on_inner_cfg)
+        canvas.bind("<Configure>", _on_canvas_cfg)
+
+        scope_now = self.vanilla_audio_scope_var.get()
+        visible_vars: list[tk.BooleanVar] = []
+
+        def _render_list(*_args) -> None:
+            for ch in inner.winfo_children():
+                ch.destroy()
+            visible_vars.clear()
+            q = filter_var.get().strip().lower()
+
+            sections = [
+                (
+                    "Player — Interior Engine Events (EngineInt)"
+                    + ("  [skipped in Exterior-only mode]" if scope_now == "exterior" else ""),
+                    [v for v in p_vars.values() if v[0].role == "EngineInt"],
+                ),
+                (
+                    "Player — Exterior Engine Events (EngineExt)"
+                    + ("  [skipped in Interior-only mode]" if scope_now == "interior" else ""),
+                    [v for v in p_vars.values() if v[0].role == "EngineExt"],
+                ),
+                (
+                    "AI & TV Replay Engine Events (_AI.bank)"
+                    + ("  [skipped in Interior-only mode]" if scope_now == "interior" else ""),
+                    list(ai_vars.values()),
+                ),
+            ]
+            for sec_title, items in sections:
+                matched = [
+                    (ev, bvar)
+                    for ev, bvar in items
+                    if not q or q in ev.short_name.lower() or q in ev.path.lower() or q in ev.role.lower()
+                ]
+                if not matched:
+                    continue
+                tk.Label(
+                    inner,
+                    text=sec_title,
+                    bg=BG_CARD,
+                    fg="#38bdf8",
+                    font=("Segoe UI", 10, "bold"),
+                    anchor="w",
+                ).pack(fill="x", pady=(8, 4))
+                for ev, bvar in matched:
+                    visible_vars.append(bvar)
+                    lbl = f"{ev.short_name}   [{ev.role}]"
+                    tk.Checkbutton(
+                        inner,
+                        text=lbl,
+                        variable=bvar,
+                        bg=BG_CARD,
+                        fg=FG_TEXT,
+                        activebackground=BG_CARD,
+                        activeforeground="#ffffff",
+                        selectcolor=BG_INPUT,
+                        font=("Consolas", 10),
+                        anchor="w",
+                        cursor="hand2",
+                    ).pack(fill="x", padx=(10, 0), pady=1)
+
+        def _set_all(val: bool) -> None:
+            for _, bv in list(p_vars.values()) + list(ai_vars.values()):
+                bv.set(val)
+
+        def _set_visible(val: bool) -> None:
+            for bv in visible_vars:
+                bv.set(val)
+
+        ttk.Button(bar, text="Select All", command=lambda: _set_all(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(bar, text="Select Filtered", command=lambda: _set_visible(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(bar, text="Clear All", command=lambda: _set_all(False)).pack(side="left")
+        filter_var.trace_add("write", _render_list)
+        _render_list()
+
+        # Opción de apilado multi-auto si el banco ya está modificado
+        layer_var = tk.BooleanVar(value=self.vanilla_layer_on_modified_var.get())
+        if veh.is_modified:
+            layer_fr = tk.Frame(dlg, bg=BG_DARK, padx=16, pady=(8, 0))
+            layer_fr.pack(fill="x")
+            tk.Checkbutton(
+                layer_fr,
+                text="Preserve previously injected custom events in this bank (layer another car's sound on top)",
+                variable=layer_var,
+                bg=BG_DARK,
+                fg="#fbbf24",
+                activebackground=BG_DARK,
+                activeforeground="#fde68a",
+                selectcolor=BG_INPUT,
+                font=("Segoe UI", 10),
+                anchor="w",
+                cursor="hand2",
+            ).pack(anchor="w")
+
+        foot = tk.Frame(dlg, bg=BG_DARK, padx=16, pady=12)
+        foot.pack(fill="x")
+
+        def _confirm() -> None:
+            sel_p = {gl for gl, (_, bv) in p_vars.items() if bv.get()}
+            sel_ai = {gl for gl, (_, bv) in ai_vars.items() if bv.get()}
+            if not sel_p and not sel_ai:
+                messagebox.showwarning(
+                    "No Events Selected",
+                    "Please select at least one target event, or click Cancel.",
+                    parent=dlg,
+                )
+                return
+            self.vanilla_selected_player_ev_guids = sel_p
+            self.vanilla_selected_ai_ev_guids = sel_ai
+            self.vanilla_layer_on_modified_var.set(bool(layer_var.get()) if veh.is_modified else False)
+            dlg.destroy()
+            self._refresh_vanilla_multi_event_ui(reset_selection=False)
+
+        tk.Button(
+            foot,
+            text="Confirm Selection",
+            command=_confirm,
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 11, "bold"),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            padx=18,
+            pady=5,
+        ).pack(side="right")
+        tk.Button(
+            foot,
+            text="Cancel",
+            command=dlg.destroy,
+            bg=BG_CARD,
+            fg=FG_TEXT,
+            activebackground="#25344d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 11),
+            bd=1,
+            relief="solid",
+            cursor="hand2",
+            padx=14,
+            pady=5,
+        ).pack(side="right", padx=(0, 10))
+        filter_ent.focus_set()
 
     @staticmethod
     def _format_audio_scope_label(scope: str, detailed: bool = False) -> str:
@@ -1734,47 +2118,148 @@ class SoundPorterApp(tk.Tk):
                             else veh.ai_bank_path
                         )
                     )
-                    ai_res = build_direct_ported_bank_from_ac(
-                        ac_bank=ai_src_bank,
-                        mod_identifier=f"{veh.car_name}_AI",
-                        standalone_guids=False,
-                        target_role_guids=veh.ai_event_guids,
-                        target_role_paths=veh.ai_event_paths,
-                        target_bank_guid=veh.ai_bank_guid or None,
-                        target_role_buses=getattr(veh, "ai_event_buses", None),
-                        rpm_bands=ai_bands,
-                        is_ai_bank=True,
-                        mute_secondary_pops=mute_pops,
-                        native_bank_path=(nat_ai_p if nat_ai_p.is_file() else None),
-                        invert_spatial_cone=False,
-                        output_codec_mode=None,
-                        prune_unused_samples=False,
-                        extra_role_variants=getattr(veh, "extra_ai_event_variants", None) or None,
-                        prefer_throttle_param=bool(getattr(veh, "prefers_throttle_ai", False)),
-                        target_max_rpm=0.0,
-                    )
-                    if mod_scope == "exterior":
-                        rep_ai, sil_ai, pmap_ai, _ = collect_vanilla_scope_targets(veh, ai_src_bank, "exterior", is_ai=True)
-                        if nat_ai_p.is_file() and rep_ai:
-                            ai_bytes = merge_ported_events_into_native_bank(
-                                native_bank=FmodBank(nat_ai_p),
-                                ported_bank=FmodBank(raw=ai_res.bank_bytes),
-                                replace_event_guids=rep_ai,
-                                silence_native_event_guids=sil_ai,
-                                event_paths_map=pmap_ai,
-                                mod_identifier=f"{veh.car_name}_AI",
-                                seed_tag="hybrid:ai:exterior",
+                    if getattr(veh, "surgical_mode", False) and nat_ai_p.is_file():
+                        master_str = self.vanilla_mgr.get_master_strings()
+                        pmap_ai_surg = {
+                            guid_str_to_bytes(g): p
+                            for g, p in master_str.items()
+                            if p.startswith("event:/")
+                        }
+                        sel_ai_saved = {g.lower() for g in (getattr(veh, "modified_ai_event_guids", None) or ())}
+                        ai_vars = list(getattr(veh, "ai_engine_variants", ()) or ())
+                        if not ai_vars:
+                            for role_k, g_s in veh.ai_event_guids.items():
+                                p_s = veh.ai_event_paths.get(role_k, "")
+                                base_r = (
+                                    "ai_engine_live" if "live" in role_k
+                                    else ("ai_engine_main" if "main" in role_k
+                                          else ("ai_engine_int" if "int" in role_k else "ai_engine_ext"))
+                                )
+                                ai_vars.append(VanillaEventVariant(g_s, p_s, p_s.split("/")[-1], base_r, "ai"))
+                        ai_int_t: list[bytes] = []
+                        ai_ext_t: list[bytes] = []
+                        ai_live_s: set[bytes] = set()
+                        for evv in ai_vars:
+                            if sel_ai_saved and evv.guid_str.lower() not in sel_ai_saved:
+                                continue
+                            gb = guid_str_to_bytes(evv.guid_str)
+                            if evv.role == "ai_engine_int":
+                                if mod_scope == "full":
+                                    ai_int_t.append(gb)
+                            else:
+                                ai_ext_t.append(gb)
+                                if evv.role == "ai_engine_live":
+                                    ai_live_s.add(gb)
+
+                        if ai_int_t or ai_ext_t:
+                            tr_ai_1copy: dict[str, str] = {}
+                            if ai_ext_t:
+                                tr_ai_1copy["ai_engine_ext"] = bytes_to_guid_str(ai_ext_t[0])
+                            if ai_int_t:
+                                tr_ai_1copy["ai_engine_int"] = bytes_to_guid_str(ai_int_t[0])
+                            exp_int_b = (
+                                guid_str_to_bytes(veh.surgical_ac_int_guid)
+                                if getattr(veh, "surgical_ac_int_guid", "")
+                                else None
                             )
+                            exp_ext_b = (
+                                guid_str_to_bytes(veh.surgical_ac_ext_guid)
+                                if getattr(veh, "surgical_ac_ext_guid", "")
+                                else None
+                            )
+                            ai_res = build_direct_ported_bank_from_ac(
+                                ac_bank=ai_src_bank,
+                                mod_identifier=f"{veh.car_name}_AI",
+                                standalone_guids=False,
+                                target_role_guids=tr_ai_1copy,
+                                target_role_paths=veh.ai_event_paths,
+                                target_bank_guid=veh.ai_bank_guid or None,
+                                target_role_buses=getattr(veh, "ai_event_buses", None),
+                                rpm_bands=ai_bands,
+                                is_ai_bank=True,
+                                mute_secondary_pops=mute_pops,
+                                native_bank_path=nat_ai_p,
+                                invert_spatial_cone=False,
+                                output_codec_mode=None,
+                                prune_unused_samples=False,
+                                extra_role_variants=None,
+                                prefer_throttle_param=bool(getattr(veh, "prefers_throttle_ai", False)),
+                                target_max_rpm=0.0,
+                                explicit_ac_int_guid=exp_int_b,
+                                explicit_ac_ext_guid=exp_ext_b,
+                            )
+                            ac_ai_int_g = (
+                                guid_str_to_bytes(ai_res.role_to_event_guid["ai_engine_int"])
+                                if "ai_engine_int" in ai_res.role_to_event_guid
+                                else None
+                            )
+                            ac_ai_ext_g = (
+                                guid_str_to_bytes(ai_res.role_to_event_guid["ai_engine_ext"])
+                                if "ai_engine_ext" in ai_res.role_to_event_guid
+                                else None
+                            )
+                            ai_bytes, _ = graft_ac_into_native_bank_surgical(
+                                native_bank=FmodBank(nat_ai_p),
+                                ported_ac_bank=FmodBank(raw=ai_res.bank_bytes),
+                                ac_int_event_guid=ac_ai_int_g,
+                                ac_ext_event_guid=ac_ai_ext_g,
+                                target_int_guids=ai_int_t,
+                                target_ext_guids=ai_ext_t,
+                                event_paths_map=pmap_ai_surg,
+                                is_ai_bank=True,
+                                native_panners=_extract_native_exterior_spatializers(nat_ai_p),
+                                default_prefer_throttle=bool(getattr(veh, "prefers_throttle_ai", False)),
+                                mod_identifier=f"{veh.car_name}_AI",
+                                seed_tag="surgical:edit:ai",
+                                ai_live_guids=ai_live_s,
+                            )
+                    else:
+                        ai_res = build_direct_ported_bank_from_ac(
+                            ac_bank=ai_src_bank,
+                            mod_identifier=f"{veh.car_name}_AI",
+                            standalone_guids=False,
+                            target_role_guids=veh.ai_event_guids,
+                            target_role_paths=veh.ai_event_paths,
+                            target_bank_guid=veh.ai_bank_guid or None,
+                            target_role_buses=getattr(veh, "ai_event_buses", None),
+                            rpm_bands=ai_bands,
+                            is_ai_bank=True,
+                            mute_secondary_pops=mute_pops,
+                            native_bank_path=(nat_ai_p if nat_ai_p.is_file() else None),
+                            invert_spatial_cone=False,
+                            output_codec_mode=None,
+                            prune_unused_samples=False,
+                            extra_role_variants=getattr(veh, "extra_ai_event_variants", None) or None,
+                            prefer_throttle_param=bool(getattr(veh, "prefers_throttle_ai", False)),
+                            target_max_rpm=0.0,
+                        )
+                        if mod_scope == "exterior":
+                            rep_ai, sil_ai, pmap_ai, _ = collect_vanilla_scope_targets(veh, ai_src_bank, "exterior", is_ai=True)
+                            if nat_ai_p.is_file() and rep_ai:
+                                ai_bytes = merge_ported_events_into_native_bank(
+                                    native_bank=FmodBank(nat_ai_p),
+                                    ported_bank=FmodBank(raw=ai_res.bank_bytes),
+                                    replace_event_guids=rep_ai,
+                                    silence_native_event_guids=sil_ai,
+                                    event_paths_map=pmap_ai,
+                                    mod_identifier=f"{veh.car_name}_AI",
+                                    seed_tag="hybrid:ai:exterior",
+                                )
+                            else:
+                                ai_bytes = ai_res.bank_bytes
                         else:
                             ai_bytes = ai_res.bank_bytes
-                    else:
-                        ai_bytes = ai_res.bank_bytes
 
                 ok, msg = self.vanilla_mgr.install_sound(
                     vehicle=veh,
                     bank_bytes=updated_player_bytes,
                     ai_bank_bytes=ai_bytes,
                     audio_scope=mod_scope,
+                    surgical_mode=bool(getattr(veh, "surgical_mode", False)),
+                    modified_player_event_guids=list(getattr(veh, "modified_player_event_guids", ()) or ()),
+                    modified_ai_event_guids=list(getattr(veh, "modified_ai_event_guids", ()) or ()),
+                    surgical_ac_int_guid=str(getattr(veh, "surgical_ac_int_guid", "") or ""),
+                    surgical_ac_ext_guid=str(getattr(veh, "surgical_ac_ext_guid", "") or ""),
                 )
                 if not ok:
                     raise RuntimeError(msg)
@@ -5627,6 +6112,7 @@ class SoundPorterApp(tk.Tk):
         v = self.vanilla_filtered_vehicles[idx]
         self.vanilla_selected_vehicle = v
         self.vanilla_mgr.load_vehicle_events_info(v)
+        self._refresh_vanilla_multi_event_ui(reset_selection=True)
 
         if hasattr(self, "vanilla_det_name_var"):
             self.vanilla_det_name_var.set(v.display_name)
@@ -6012,6 +6498,10 @@ class SoundPorterApp(tk.Tk):
                     throttle_cut=tcut_cfg,
                     mute_pops=self.mute_all_pops_var.get(),
                     invert_spatial_cone=self.invert_cone_var.get(),
+                    ams2_root=self.vanilla_mgr.ams2_root,
+                    backup_dir=self.vanilla_mgr.backup_dir,
+                    preserve_native_starter=True,
+                    preserve_native_transmission=True,
                 )
                 self.dispatch_to_ui(self._on_export_success, summary)
             except Exception as exc:
@@ -6052,6 +6542,10 @@ class SoundPorterApp(tk.Tk):
         if summary.csdbin_file:
             self._append_log(f"✔ Archivo .csdbin compilado: {summary.csdbin_file}")
             self._append_log(f"✔ Respaldo .csd (OMVT):      {summary.csd_text_file}")
+            if "Starter" in b_res.role_to_event_path or "Starting" in b_res.role_to_event_path:
+                self._append_log("✔ Starter / Starting originales de AMS2 preservados e injertados con su audio FSB5.")
+            if self.csd_doc and (self.csd_doc.links.get("transmission_bank") or self.csd_doc.links.get("gearshift_bank")):
+                self._append_log("✔ Transmisión y caja de cambios originales de AMS2 preservadas en .csdbin.")
         self._append_log(f"✔ Guía de instalación:       {summary.readme_file}")
 
         self.status_var.set(f"✅ Export succeeded in {summary.output_root}!")
@@ -6120,12 +6614,54 @@ class SoundPorterApp(tk.Tk):
                     self.cmd_load_vanilla_as_donor()
                 return
 
+        event_target_mode = self.vanilla_event_target_mode_var.get()
+        if event_target_mode not in ("all", "specific"):
+            event_target_mode = "all"
+        sel_player_ev_snap = set(self.vanilla_selected_player_ev_guids)
+        sel_ai_ev_snap = set(self.vanilla_selected_ai_ev_guids)
+        layer_on_modified = bool(self.vanilla_layer_on_modified_var.get()) and event_target_mode == "specific" and veh.is_modified
+        use_surgical_c = bool(
+            self.is_direct_ac_mode
+            and (veh.has_multi_engine_variants or (event_target_mode == "specific" and (sel_player_ev_snap or sel_ai_ev_snap)))
+        )
+
+        if use_surgical_c and event_target_mode == "specific":
+            p_matches = [
+                ev for ev in veh.player_engine_variants
+                if ev.guid_str.lower() in sel_player_ev_snap
+                and (
+                    audio_scope == "full"
+                    or (audio_scope == "interior" and ev.role == "EngineInt")
+                    or (audio_scope == "exterior" and ev.role == "EngineExt")
+                )
+            ]
+            if not p_matches:
+                messagebox.showwarning(
+                    "No Matching Player Events Selected",
+                    f"No Player engine events matching the '{self._format_audio_scope_label(audio_scope)}' scope are currently selected.\n\n"
+                    "Click 'Choose events...' to select at least one matching event.",
+                )
+                return
+
+        if use_surgical_c:
+            if event_target_mode == "specific":
+                target_ev_line = (
+                    f"• Target Events: Surgical selection ({len(sel_player_ev_snap)} Player, {len(sel_ai_ev_snap)} AI"
+                    + (", layered on modified bank" if layer_on_modified else ", untouched events stay vanilla")
+                    + ")\n"
+                )
+            else:
+                target_ev_line = "• Target Events: All engine events via Surgical EVIB Proxy (1 shared AC graph; native starters preserved)\n"
+        else:
+            target_ev_line = ""
+
         ans_confirm = messagebox.askyesno(
             "Confirm Vanilla Sound Import",
             f"Do you want to import the new sound into the official vehicle:\n\n"
             f"'{veh.display_name}'?\n\n"
             f"• File: {veh.bank_path}\n"
             f"• Audio Scope: {scope_detail_lbl}\n"
+            f"{target_ev_line}"
             f"• Mode: {'Direct AC Transmutation (100% Faithful)' if self.is_direct_ac_mode else 'Donor Mapping'}\n\n"
             f"🛡️ A safe backup (SHA256) will be created automatically before modifying anything.\n"
             f"You can restore the original Steam sound at any time with one click.",
@@ -6136,9 +6672,13 @@ class SoundPorterApp(tk.Tk):
         self._set_import_buttons_state("disabled")
         self.progress.start(12)
         mode_label = (
-            "Direct AC Transmutation (100% Faithful)"
-            if self.is_direct_ac_mode
-            else f"Donor Mapping ({self.codec_choice_var.get()})"
+            "Direct AC Surgical EVIB Proxy (100% Faithful)"
+            if use_surgical_c
+            else (
+                "Direct AC Transmutation (100% Faithful)"
+                if self.is_direct_ac_mode
+                else f"Donor Mapping ({self.codec_choice_var.get()})"
+            )
         )
         self.status_var.set(f"⏳ Importing sound ({self._format_audio_scope_label(audio_scope)}) into '{veh.display_name}'...")
         self._append_log("\n----------------------------------------------------------------------")
@@ -6202,20 +6742,18 @@ class SoundPorterApp(tk.Tk):
                 native_max_rpm = _extract_native_engine_max_rpm(native_p)
 
                 bank_bytes: bytes
+                ai_bytes: bytes | None = None
                 cached_blobs: list[bytes] | None = None
                 use_compressed_direct = False
                 ac_fmod_ref = self.source_lib.fmod_bank if (self.source_lib and self.source_lib.fmod_bank) else None
-                rep_p: set[bytes] = set()
-                sil_p: set[bytes] = set()
-                pmap_p: dict[bytes, str] = {}
-                extra_p_variants = getattr(veh, "extra_event_variants", None) or None
-                if audio_scope in ("interior", "exterior"):
-                    rep_p, sil_p, pmap_p, aug_ex_p = collect_vanilla_scope_targets(
-                        veh, ac_fmod_ref, audio_scope, is_ai=False
-                    )
-                    extra_p_variants = aug_ex_p or None
+                surgical_mod_p_guids: list[str] = []
+                surgical_mod_ai_guids: list[str] = []
+                surgical_ac_int_g_str = ""
+                surgical_ac_ext_g_str = ""
 
-                if is_direct:
+                if use_surgical_c and is_direct:
+                    # Opción C: Injerto quirúrgico por evento + Enrutador liviano EVIB Proxy
+                    # Mantiene intactos los eventos no seleccionados y evita clonados masivos en bancos multi-evento.
                     assert self.source_lib and self.source_lib.fmod_bank
                     ac_fmod = self.source_lib.fmod_bank
                     use_compressed_direct = (
@@ -6223,11 +6761,52 @@ class SoundPorterApp(tk.Tk):
                         and any(sl.mode == FSB5_MODE_PCM16 for sl in ac_fmod.slots)
                     )
                     direct_codec = FSB5_MODE_FADPCM if use_compressed_direct else None
+
+                    master_str = self.vanilla_mgr.get_master_strings()
+                    pmap_all = {
+                        guid_str_to_bytes(g): p
+                        for g, p in master_str.items()
+                        if p.startswith("event:/")
+                    }
+
+                    p_vars_all = list(getattr(veh, "player_engine_variants", ()) or ())
+                    if not p_vars_all:
+                        for vr in ("EngineInt", "EngineExt"):
+                            if vr in veh.event_guids:
+                                p_s = veh.event_paths.get(vr, "")
+                                p_vars_all.append(VanillaEventVariant(veh.event_guids[vr], p_s, p_s.split("/")[-1], vr, "player"))
+                            for g_ex, p_ex in (veh.extra_event_variants or {}).get(vr, ()):
+                                p_vars_all.append(VanillaEventVariant(g_ex, p_ex, p_ex.split("/")[-1], vr, "player"))
+
+                    int_targets_p: list[bytes] = []
+                    ext_targets_p: list[bytes] = []
+                    all_ext_count_p = sum(1 for evv in p_vars_all if evv.role == "EngineExt")
+                    for evv in p_vars_all:
+                        if event_target_mode == "specific" and evv.guid_str.lower() not in sel_player_ev_snap:
+                            continue
+                        gb = guid_str_to_bytes(evv.guid_str)
+                        if evv.role == "EngineInt" and audio_scope in ("full", "interior"):
+                            int_targets_p.append(gb)
+                        elif evv.role == "EngineExt" and audio_scope in ("full", "exterior"):
+                            ext_targets_p.append(gb)
+
+                    if not int_targets_p and not ext_targets_p:
+                        raise RuntimeError(
+                            f"No matching {audio_scope} engine events selected in '{veh.display_name}'."
+                        )
+
+                    # Construir banco AC limpio de 1 sola copia (sin clonar variantes extra)
+                    tr_p_1copy: dict[str, str] = {}
+                    if int_targets_p:
+                        tr_p_1copy["EngineInt"] = bytes_to_guid_str(int_targets_p[0])
+                    if ext_targets_p:
+                        tr_p_1copy["EngineExt"] = bytes_to_guid_str(ext_targets_p[0])
+
                     direct_res = build_direct_ported_bank_from_ac(
                         ac_bank=ac_fmod,
                         mod_identifier=veh.car_name,
                         standalone_guids=False,
-                        target_role_guids=veh.event_guids,
+                        target_role_guids=tr_p_1copy,
                         target_role_paths=veh.event_paths,
                         target_bank_guid=veh.bank_guid or None,
                         target_param_names=veh.target_parameters,
@@ -6240,133 +6819,341 @@ class SoundPorterApp(tk.Tk):
                         mappings=self.mappings,
                         output_codec_mode=direct_codec,
                         prune_unused_samples=use_compressed_direct,
-                        extra_role_variants=extra_p_variants,
+                        extra_role_variants=None,
                         prefer_throttle_param=bool(getattr(veh, "prefers_throttle_player", False)),
                         target_max_rpm=native_max_rpm,
                         library=self.source_lib,
                         active_scope=audio_scope,
                     )
-                    bank_bytes = direct_res.bank_bytes
                     cached_blobs = direct_res.fsb_blobs_cache if use_compressed_direct else None
+
+                    ac_int_g_b = (
+                        guid_str_to_bytes(direct_res.role_to_event_guid["EngineInt"])
+                        if "EngineInt" in direct_res.role_to_event_guid
+                        else None
+                    )
+                    ac_ext_g_b = (
+                        guid_str_to_bytes(direct_res.role_to_event_guid["EngineExt"])
+                        if "EngineExt" in direct_res.role_to_event_guid
+                        else None
+                    )
+
+                    # Neutralizar Exhaust nativo solo si se reemplazan TODOS los EngineExt del banco y AC no trae Exhaust
+                    # (evita silenciar el escape compartido de otros autos vanilla no seleccionados en bancos multi-auto)
+                    sil_exh_p: set[bytes] = set()
+                    has_ac_exh = any(
+                        any(k in (ev.path or "").lower() for k in ("exhaust", "tailpipe", "muffler"))
+                        for ev in ac_fmod.events
+                    )
+                    if (
+                        audio_scope in ("full", "exterior")
+                        and not has_ac_exh
+                        and ext_targets_p
+                        and len(ext_targets_p) >= max(1, all_ext_count_p)
+                    ):
+                        if "Exhaust" in veh.event_guids:
+                            sil_exh_p.add(guid_str_to_bytes(veh.event_guids["Exhaust"]))
+                        for g_ex, _ in (veh.extra_event_variants or {}).get("Exhaust", ()):
+                            sil_exh_p.add(guid_str_to_bytes(g_ex))
+
+                    host_p_path = (
+                        veh.bank_path
+                        if (layer_on_modified and veh.bank_path.is_file())
+                        else native_p
+                    )
+                    bank_bytes, meta_p = graft_ac_into_native_bank_surgical(
+                        native_bank=FmodBank(host_p_path),
+                        ported_ac_bank=FmodBank(raw=direct_res.bank_bytes),
+                        ac_int_event_guid=ac_int_g_b,
+                        ac_ext_event_guid=ac_ext_g_b,
+                        target_int_guids=int_targets_p,
+                        target_ext_guids=ext_targets_p,
+                        silence_native_guids=sil_exh_p,
+                        event_paths_map=pmap_all,
+                        is_ai_bank=False,
+                        native_panners=_extract_native_exterior_spatializers(native_p),
+                        default_prefer_throttle=bool(getattr(veh, "prefers_throttle_player", False)),
+                        mod_identifier=veh.car_name,
+                        seed_tag=f"surgical:p:{audio_scope}:{len(int_targets_p)}x{len(ext_targets_p)}",
+                    )
+                    errs_p_surg = verify_fmod_bank_integrity(bank_bytes)
+                    if errs_p_surg:
+                        raise RuntimeError(f"FMOD surgical player bank validation failed: {errs_p_surg[0]}")
+
+                    surgical_mod_p_guids = [bytes_to_guid_str(g) for g in (int_targets_p + ext_targets_p)]
+                    if layer_on_modified and getattr(veh, "modified_player_event_guids", None):
+                        prev_set = {g.lower(): g for g in veh.modified_player_event_guids}
+                        for g_s in surgical_mod_p_guids:
+                            prev_set[g_s.lower()] = g_s
+                        surgical_mod_p_guids = list(prev_set.values())
+                    surgical_ac_int_g_str = bytes_to_guid_str(meta_p["ac_int_guid"]) if meta_p.get("ac_int_guid") else ""
+                    surgical_ac_ext_g_str = bytes_to_guid_str(meta_p["ac_ext_guid"]) if meta_p.get("ac_ext_guid") else ""
+
+                    # 2. Banco AI quirúrgico con EVIB Proxy (si aplica)
+                    if audio_scope != "interior" and sync_ai and veh.ai_bank_path and veh.ai_event_guids:
+                        orig_ai_candidate = veh.ai_bank_path.parent / f"{veh.ai_bank_path.name}.orig"
+                        native_ai_p = (
+                            veh_backup_folder / veh.ai_bank_path.name
+                            if (veh_backup_folder / veh.ai_bank_path.name).is_file()
+                            else (orig_ai_candidate if orig_ai_candidate.is_file() else veh.ai_bank_path)
+                        )
+                        if native_ai_p.is_file():
+                            ai_vars_all = list(getattr(veh, "ai_engine_variants", ()) or ())
+                            if not ai_vars_all:
+                                for role_k, g_s in veh.ai_event_guids.items():
+                                    p_s = veh.ai_event_paths.get(role_k, "")
+                                    base_r = (
+                                        "ai_engine_live" if "live" in role_k
+                                        else ("ai_engine_main" if "main" in role_k
+                                              else ("ai_engine_int" if "int" in role_k else "ai_engine_ext"))
+                                    )
+                                    ai_vars_all.append(VanillaEventVariant(g_s, p_s, p_s.split("/")[-1], base_r, "ai"))
+
+                            ai_int_targets: list[bytes] = []
+                            ai_ext_targets: list[bytes] = []
+                            ai_live_set: set[bytes] = set()
+                            for evv in ai_vars_all:
+                                if event_target_mode == "specific" and evv.guid_str.lower() not in sel_ai_ev_snap:
+                                    continue
+                                gb = guid_str_to_bytes(evv.guid_str)
+                                if evv.role == "ai_engine_int":
+                                    if audio_scope == "full":
+                                        ai_int_targets.append(gb)
+                                else:
+                                    ai_ext_targets.append(gb)
+                                    if evv.role == "ai_engine_live":
+                                        ai_live_set.add(gb)
+
+                            if ai_int_targets or ai_ext_targets:
+                                tr_ai_1copy: dict[str, str] = {}
+                                if ai_ext_targets:
+                                    tr_ai_1copy["ai_engine_ext"] = bytes_to_guid_str(ai_ext_targets[0])
+                                if ai_int_targets:
+                                    tr_ai_1copy["ai_engine_int"] = bytes_to_guid_str(ai_int_targets[0])
+                                ai_direct_res = build_direct_ported_bank_from_ac(
+                                    ac_bank=ac_fmod,
+                                    mod_identifier=f"{veh.car_name}_AI",
+                                    standalone_guids=False,
+                                    target_role_guids=tr_ai_1copy,
+                                    target_role_paths=veh.ai_event_paths,
+                                    target_bank_guid=veh.ai_bank_guid or None,
+                                    target_role_buses=getattr(veh, "ai_event_buses", None),
+                                    rpm_bands=ai_bands_to_export,
+                                    is_ai_bank=True,
+                                    mute_secondary_pops=mute_pops,
+                                    native_bank_path=native_ai_p,
+                                    invert_spatial_cone=False,
+                                    mappings=self.mappings,
+                                    output_codec_mode=(FSB5_MODE_FADPCM if use_compressed_direct else None),
+                                    prune_unused_samples=use_compressed_direct,
+                                    cached_fsb_blobs=cached_blobs,
+                                    extra_role_variants=None,
+                                    prefer_throttle_param=bool(getattr(veh, "prefers_throttle_ai", False)),
+                                    target_max_rpm=native_max_rpm,
+                                    library=self.source_lib,
+                                    active_scope=audio_scope,
+                                )
+                                ac_ai_int_b = (
+                                    guid_str_to_bytes(ai_direct_res.role_to_event_guid["ai_engine_int"])
+                                    if "ai_engine_int" in ai_direct_res.role_to_event_guid
+                                    else None
+                                )
+                                ac_ai_ext_b = (
+                                    guid_str_to_bytes(ai_direct_res.role_to_event_guid["ai_engine_ext"])
+                                    if "ai_engine_ext" in ai_direct_res.role_to_event_guid
+                                    else None
+                                )
+                                host_ai_path = (
+                                    veh.ai_bank_path
+                                    if (layer_on_modified and veh.ai_bank_path.is_file())
+                                    else native_ai_p
+                                )
+                                ai_bytes, _ = graft_ac_into_native_bank_surgical(
+                                    native_bank=FmodBank(host_ai_path),
+                                    ported_ac_bank=FmodBank(raw=ai_direct_res.bank_bytes),
+                                    ac_int_event_guid=ac_ai_int_b,
+                                    ac_ext_event_guid=ac_ai_ext_b,
+                                    target_int_guids=ai_int_targets,
+                                    target_ext_guids=ai_ext_targets,
+                                    event_paths_map=pmap_all,
+                                    is_ai_bank=True,
+                                    native_panners=_extract_native_exterior_spatializers(native_ai_p),
+                                    default_prefer_throttle=bool(getattr(veh, "prefers_throttle_ai", False)),
+                                    mod_identifier=f"{veh.car_name}_AI",
+                                    seed_tag=f"surgical:ai:{audio_scope}:{len(ai_int_targets)}x{len(ai_ext_targets)}",
+                                    ai_live_guids=ai_live_set,
+                                )
+                                errs_ai_surg = verify_fmod_bank_integrity(ai_bytes)
+                                if errs_ai_surg:
+                                    raise RuntimeError(f"FMOD surgical AI bank validation failed: {errs_ai_surg[0]}")
+                                surgical_mod_ai_guids = [bytes_to_guid_str(g) for g in (ai_int_targets + ai_ext_targets)]
+                                if layer_on_modified and getattr(veh, "modified_ai_event_guids", None):
+                                    prev_ai = {g.lower(): g for g in veh.modified_ai_event_guids}
+                                    for g_s in surgical_mod_ai_guids:
+                                        prev_ai[g_s.lower()] = g_s
+                                    surgical_mod_ai_guids = list(prev_ai.values())
                 else:
-                    assert self.donor_bank
-                    donor_res = build_ported_bank(
-                        donor=self.donor_bank,
-                        library=self.source_lib,
-                        mappings=self.mappings,
-                        mod_identifier=veh.car_name,
-                        standalone_guids=False,
-                        sync_autopitch=sync_pitch,
-                        output_codec_mode=codec_mode,
-                        rpm_bands=player_bands_to_export,
-                        throttle_cut=tcut_cfg,
-                    )
-                    bank_bytes = donor_res.bank_bytes
-
-                if audio_scope in ("interior", "exterior"):
-                    if not rep_p:
-                        raise RuntimeError(
-                            f"This vehicle does not expose a replaceable {audio_scope} engine event in its native bank."
+                    rep_p: set[bytes] = set()
+                    sil_p: set[bytes] = set()
+                    pmap_p: dict[bytes, str] = {}
+                    extra_p_variants = getattr(veh, "extra_event_variants", None) or None
+                    if audio_scope in ("interior", "exterior"):
+                        rep_p, sil_p, pmap_p, aug_ex_p = collect_vanilla_scope_targets(
+                            veh, ac_fmod_ref, audio_scope, is_ai=False
                         )
-                    bank_bytes = merge_ported_events_into_native_bank(
-                        native_bank=FmodBank(native_p),
-                        ported_bank=FmodBank(raw=bank_bytes),
-                        replace_event_guids=rep_p,
-                        silence_native_event_guids=sil_p,
-                        event_paths_map=pmap_p,
-                        mod_identifier=veh.car_name,
-                        seed_tag=f"hybrid:p:{audio_scope}",
-                    )
-
-                # 2. Configurar banco de la IA según el alcance seleccionado:
-                # - 'interior': _AI.bank permanece 100% vanilla (repeticiones y rivales sin cambios).
-                # - 'exterior': solo se reemplazan los eventos exteriores de _AI.bank, manteniendo ai_engine_int vanilla.
-                # - 'full': comportamiento completo estándar.
-                ai_bytes: bytes | None = None
-                if audio_scope != "interior" and sync_ai and veh.ai_bank_path and veh.ai_event_guids:
-                    orig_ai_candidate = veh.ai_bank_path.parent / f"{veh.ai_bank_path.name}.orig"
-                    native_ai_p = (
-                        veh_backup_folder / veh.ai_bank_path.name
-                        if (veh_backup_folder / veh.ai_bank_path.name).is_file()
-                        else (orig_ai_candidate if orig_ai_candidate.is_file() else veh.ai_bank_path)
-                    )
-                    rep_ai: set[bytes] = set()
-                    sil_ai: set[bytes] = set()
-                    pmap_ai: dict[bytes, str] = {}
-                    extra_ai_variants = getattr(veh, "extra_ai_event_variants", None) or None
-                    if audio_scope == "exterior":
-                        rep_ai, sil_ai, pmap_ai, aug_ex_ai = collect_vanilla_scope_targets(
-                            veh, ac_fmod_ref, "exterior", is_ai=True
-                        )
-                        extra_ai_variants = aug_ex_ai or None
+                        extra_p_variants = aug_ex_p or None
 
                     if is_direct:
-                        ai_direct_res = build_direct_ported_bank_from_ac(
-                            ac_bank=self.source_lib.fmod_bank,
-                            mod_identifier=f"{veh.car_name}_AI",
+                        assert self.source_lib and self.source_lib.fmod_bank
+                        ac_fmod = self.source_lib.fmod_bank
+                        use_compressed_direct = (
+                            sum(len(sb.raw_fsb_bytes) for sb in ac_fmod.subbanks) > 20_000_000
+                            and any(sl.mode == FSB5_MODE_PCM16 for sl in ac_fmod.slots)
+                        )
+                        direct_codec = FSB5_MODE_FADPCM if use_compressed_direct else None
+                        direct_res = build_direct_ported_bank_from_ac(
+                            ac_bank=ac_fmod,
+                            mod_identifier=veh.car_name,
                             standalone_guids=False,
-                            target_role_guids=veh.ai_event_guids,
-                            target_role_paths=veh.ai_event_paths,
-                            target_bank_guid=veh.ai_bank_guid or None,
+                            target_role_guids=veh.event_guids,
+                            target_role_paths=veh.event_paths,
+                            target_bank_guid=veh.bank_guid or None,
+                            target_param_names=veh.target_parameters,
+                            target_ctrl_params=veh.ctrl_parameters,
                             target_role_buses=getattr(veh, "ai_event_buses", None),
-                            rpm_bands=ai_bands_to_export,
-                            is_ai_bank=True,
-                            mute_secondary_pops=mute_pops,
-                            native_bank_path=(native_ai_p if native_ai_p.is_file() else None),
-                            invert_spatial_cone=False,
+                            rpm_bands=player_bands_to_export,
+                            mute_secondary_pops=False,
+                            native_bank_path=native_p,
+                            invert_spatial_cone=(invert_cone if audio_scope != "interior" else False),
                             mappings=self.mappings,
-                            output_codec_mode=(FSB5_MODE_FADPCM if use_compressed_direct else None),
+                            output_codec_mode=direct_codec,
                             prune_unused_samples=use_compressed_direct,
-                            cached_fsb_blobs=cached_blobs,
-                            extra_role_variants=extra_ai_variants,
-                            prefer_throttle_param=bool(getattr(veh, "prefers_throttle_ai", False)),
+                            extra_role_variants=extra_p_variants,
+                            prefer_throttle_param=bool(getattr(veh, "prefers_throttle_player", False)),
                             target_max_rpm=native_max_rpm,
                             library=self.source_lib,
                             active_scope=audio_scope,
                         )
-                        ai_bytes = ai_direct_res.bank_bytes
+                        bank_bytes = direct_res.bank_bytes
+                        cached_blobs = direct_res.fsb_blobs_cache if use_compressed_direct else None
                     else:
-                        if native_ai_p.is_file() and self.source_lib:
-                            ai_donor = FmodBank(native_ai_p)
-                            ai_maps = auto_map_samples(ai_donor, self.source_lib)
-                            if mute_pops and ai_maps:
-                                muted_ai_maps: list[SlotMappingConfig] = []
-                                for m in ai_maps:
-                                    sl = ai_donor.slots[m.donor_global_index] if 0 <= m.donor_global_index < len(ai_donor.slots) else None
-                                    if sl and (sl.load_role in ("pops", "throttle_cut") or "limiter" in sl.name.lower() or "backfire" in sl.name.lower()):
-                                        muted_ai_maps.append(
-                                            SlotMappingConfig(
-                                                donor_global_index=m.donor_global_index,
-                                                action="silence",
-                                                source_index=None,
-                                                gain_db=-96.0,
-                                                match_reason="Silenciado para Replay / IA limpia",
-                                            )
-                                        )
-                                    else:
-                                        muted_ai_maps.append(m)
-                                ai_maps = muted_ai_maps
-                            ai_donor_res = build_ported_bank(
-                                donor=ai_donor,
-                                mappings=ai_maps,
-                                library=self.source_lib,
+                        assert self.donor_bank
+                        donor_res = build_ported_bank(
+                            donor=self.donor_bank,
+                            library=self.source_lib,
+                            mappings=self.mappings,
+                            mod_identifier=veh.car_name,
+                            standalone_guids=False,
+                            sync_autopitch=sync_pitch,
+                            output_codec_mode=codec_mode,
+                            rpm_bands=player_bands_to_export,
+                            throttle_cut=tcut_cfg,
+                        )
+                        bank_bytes = donor_res.bank_bytes
+
+                    if audio_scope in ("interior", "exterior"):
+                        if not rep_p:
+                            raise RuntimeError(
+                                f"This vehicle does not expose a replaceable {audio_scope} engine event in its native bank."
+                            )
+                        bank_bytes = merge_ported_events_into_native_bank(
+                            native_bank=FmodBank(native_p),
+                            ported_bank=FmodBank(raw=bank_bytes),
+                            replace_event_guids=rep_p,
+                            silence_native_event_guids=sil_p,
+                            event_paths_map=pmap_p,
+                            mod_identifier=veh.car_name,
+                            seed_tag=f"hybrid:p:{audio_scope}",
+                        )
+
+                    # 2. Configurar banco de la IA según el alcance seleccionado:
+                    # - 'interior': _AI.bank permanece 100% vanilla (repeticiones y rivales sin cambios).
+                    # - 'exterior': solo se reemplazan los eventos exteriores de _AI.bank, manteniendo ai_engine_int vanilla.
+                    # - 'full': comportamiento completo estándar.
+                    if audio_scope != "interior" and sync_ai and veh.ai_bank_path and veh.ai_event_guids:
+                        orig_ai_candidate = veh.ai_bank_path.parent / f"{veh.ai_bank_path.name}.orig"
+                        native_ai_p = (
+                            veh_backup_folder / veh.ai_bank_path.name
+                            if (veh_backup_folder / veh.ai_bank_path.name).is_file()
+                            else (orig_ai_candidate if orig_ai_candidate.is_file() else veh.ai_bank_path)
+                        )
+                        rep_ai: set[bytes] = set()
+                        sil_ai: set[bytes] = set()
+                        pmap_ai: dict[bytes, str] = {}
+                        extra_ai_variants = getattr(veh, "extra_ai_event_variants", None) or None
+                        if audio_scope == "exterior":
+                            rep_ai, sil_ai, pmap_ai, aug_ex_ai = collect_vanilla_scope_targets(
+                                veh, ac_fmod_ref, "exterior", is_ai=True
+                            )
+                            extra_ai_variants = aug_ex_ai or None
+
+                        if is_direct:
+                            ai_direct_res = build_direct_ported_bank_from_ac(
+                                ac_bank=self.source_lib.fmod_bank,
                                 mod_identifier=f"{veh.car_name}_AI",
                                 standalone_guids=False,
-                                sync_autopitch=sync_pitch,
-                                output_codec_mode=codec_mode,
+                                target_role_guids=veh.ai_event_guids,
+                                target_role_paths=veh.ai_event_paths,
+                                target_bank_guid=veh.ai_bank_guid or None,
+                                target_role_buses=getattr(veh, "ai_event_buses", None),
+                                rpm_bands=ai_bands_to_export,
+                                is_ai_bank=True,
+                                mute_secondary_pops=mute_pops,
+                                native_bank_path=(native_ai_p if native_ai_p.is_file() else None),
+                                invert_spatial_cone=False,
+                                mappings=self.mappings,
+                                output_codec_mode=(FSB5_MODE_FADPCM if use_compressed_direct else None),
+                                prune_unused_samples=use_compressed_direct,
+                                cached_fsb_blobs=cached_blobs,
+                                extra_role_variants=extra_ai_variants,
+                                prefer_throttle_param=bool(getattr(veh, "prefers_throttle_ai", False)),
+                                target_max_rpm=native_max_rpm,
+                                library=self.source_lib,
+                                active_scope=audio_scope,
                             )
-                            ai_bytes = ai_donor_res.bank_bytes
+                            ai_bytes = ai_direct_res.bank_bytes
+                        else:
+                            if native_ai_p.is_file() and self.source_lib:
+                                ai_donor = FmodBank(native_ai_p)
+                                ai_maps = auto_map_samples(ai_donor, self.source_lib)
+                                if mute_pops and ai_maps:
+                                    muted_ai_maps: list[SlotMappingConfig] = []
+                                    for m in ai_maps:
+                                        sl = ai_donor.slots[m.donor_global_index] if 0 <= m.donor_global_index < len(ai_donor.slots) else None
+                                        if sl and (sl.load_role in ("pops", "throttle_cut") or "limiter" in sl.name.lower() or "backfire" in sl.name.lower()):
+                                            muted_ai_maps.append(
+                                                SlotMappingConfig(
+                                                    donor_global_index=m.donor_global_index,
+                                                    action="silence",
+                                                    source_index=None,
+                                                    gain_db=-96.0,
+                                                    match_reason="Silenciado para Replay / IA limpia",
+                                                )
+                                            )
+                                        else:
+                                            muted_ai_maps.append(m)
+                                    ai_maps = muted_ai_maps
+                                ai_donor_res = build_ported_bank(
+                                    donor=ai_donor,
+                                    mappings=ai_maps,
+                                    library=self.source_lib,
+                                    mod_identifier=f"{veh.car_name}_AI",
+                                    standalone_guids=False,
+                                    sync_autopitch=sync_pitch,
+                                    output_codec_mode=codec_mode,
+                                )
+                                ai_bytes = ai_donor_res.bank_bytes
 
-                    if audio_scope == "exterior" and ai_bytes and native_ai_p.is_file() and rep_ai:
-                        ai_bytes = merge_ported_events_into_native_bank(
-                            native_bank=FmodBank(native_ai_p),
-                            ported_bank=FmodBank(raw=ai_bytes),
-                            replace_event_guids=rep_ai,
-                            silence_native_event_guids=sil_ai,
-                            event_paths_map=pmap_ai,
-                            mod_identifier=f"{veh.car_name}_AI",
-                            seed_tag="hybrid:ai:exterior",
-                        )
+                        if audio_scope == "exterior" and ai_bytes and native_ai_p.is_file() and rep_ai:
+                            ai_bytes = merge_ported_events_into_native_bank(
+                                native_bank=FmodBank(native_ai_p),
+                                ported_bank=FmodBank(raw=ai_bytes),
+                                replace_event_guids=rep_ai,
+                                silence_native_event_guids=sil_ai,
+                                event_paths_map=pmap_ai,
+                                mod_identifier=f"{veh.car_name}_AI",
+                                seed_tag="hybrid:ai:exterior",
+                            )
 
                 # 3. Optimizar .csdbin suelto para Chase Cam (3ra persona) solo cuando se modifica el exterior
                 csd_bytes: bytes | None = None
@@ -6394,6 +7181,11 @@ class SoundPorterApp(tk.Tk):
                     ai_bank_bytes=ai_bytes,
                     csdbin_bytes=csd_bytes,
                     audio_scope=audio_scope,
+                    surgical_mode=use_surgical_c,
+                    modified_player_event_guids=surgical_mod_p_guids,
+                    modified_ai_event_guids=surgical_mod_ai_guids,
+                    surgical_ac_int_guid=surgical_ac_int_g_str,
+                    surgical_ac_ext_guid=surgical_ac_ext_g_str,
                 )
                 if not ok:
                     raise RuntimeError(msg)

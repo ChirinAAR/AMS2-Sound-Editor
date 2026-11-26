@@ -1,6 +1,7 @@
 """Motor de porteo AC -> AMS2: Auto-Mapeo FMOD, Reconstrucción FSB5 y Remapeo Standalone de GUIDs."""
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import math
@@ -27,7 +28,7 @@ from .fmod_bank import (
     infer_rpm_from_name,
     iter_riff_chunks,
 )
-from .fmod_stdt import build_stdt_chunk, lookup_stdt_id, parse_stdt_sections
+from .fmod_stdt import build_stdt_chunk, lookup_stdt_id, parse_stdt_all_paths, parse_stdt_sections
 from .omvt_csdbin import CsdbinDocument
 
 # Tags de chunks base en PROJ cuyos primeros 16 bytes definen el GUID propio de un objeto local
@@ -1134,15 +1135,15 @@ def auto_map_samples(
             mappings_by_idx[sl.global_index] = cfg
             continue
 
-        # 2. Starter / Starting / ThrottleCut existentes en el donante cuando AC no tiene equivalente
-        if sl.load_role == "starter" and not has_starter_in_src and sl.mode != FSB5_MODE_VORBIS:
+        # 2. Preservar siempre Starter / Starting originales de AMS2 (incluso en sub-bancos Vorbis)
+        if sl.load_role == "starter":
             cfg.action = "keep_donor"
-            cfg.match_reason = "Sin starter en AC (se conserva donante AMS2)"
+            cfg.match_reason = "Starter original de AMS2 conservado"
             mappings_by_idx[sl.global_index] = cfg
             continue
-        if sl.load_role == "starting" and not has_starting_in_src and sl.mode != FSB5_MODE_VORBIS:
+        if sl.load_role == "starting":
             cfg.action = "keep_donor"
-            cfg.match_reason = "Sin encendido en AC (se conserva donante AMS2)"
+            cfg.match_reason = "Encendido (Starting) original de AMS2 conservado"
             mappings_by_idx[sl.global_index] = cfg
             continue
         if sl.load_role == "throttle_cut" and not has_tcut_in_src and sl.mode != FSB5_MODE_VORBIS:
@@ -4106,6 +4107,7 @@ def apply_band_edits_to_bank(
     return b"RIFF" + struct.pack("<I", 4 + len(body)) + b"FEV " + body
 
 
+
 def _extract_event_subgraph_closure(
     tables: list[tuple[bytes, list[tuple[bytes, bytes, bytes, bytes]]]],
     root_event_guids: set[bytes],
@@ -4195,10 +4197,20 @@ def _remap_chunk_guids_leaves(chunk_bytes: bytes, remap: dict[bytes, bytes]) -> 
 
 def _patch_wav_chunk_subbank(wav_chunk_bytes: bytes, new_sb: int) -> bytes:
     """Actualiza el índice de sub-banco (u16 en WAV[18:20]) preservando flags, sample_index y load_mode."""
+    return _patch_wav_chunk_location(wav_chunk_bytes, new_sb, None)
+
+
+def _patch_wav_chunk_location(
+    wav_chunk_bytes: bytes,
+    new_sb: int,
+    new_smp: int | None = None,
+) -> bytes:
+    """Actualiza subbank_index (y opcionalmente sample_index) en un chunk WAV preservando flags y load_mode."""
     if len(wav_chunk_bytes) < 38 or wav_chunk_bytes[:4] != b"WAV ":
         return wav_chunk_bytes
     out = bytearray(wav_chunk_bytes)
-    f0, _old_sb, flags, smp_idx, load_mode = struct.unpack_from("<HHHII", out, 24)
+    f0, _old_sb, flags, old_smp, load_mode = struct.unpack_from("<HHHII", out, 24)
+    smp_idx = old_smp if new_smp is None else int(new_smp)
     struct.pack_into("<HHHII", out, 24, f0, int(new_sb), flags, smp_idx, load_mode)
     return bytes(out)
 
@@ -4345,12 +4357,18 @@ def merge_ported_events_into_native_bank(
         g for g in (silence_native_event_guids or set()) if g in native_evts_all and g not in actual_replace
     }
 
-    native_evib_targets = _collect_evib_targets(native_proj)
-    kept_native_roots = {
-        g
-        for g in native_evts_all
-        if g not in actual_replace and g not in actual_silence and g not in native_evib_targets
-    }
+    native_exported = _extract_bnki_exported_event_guids(native_proj, dict(native_tables).get(b"EVTS", ()))
+    if native_exported:
+        kept_native_roots = {
+            g for g in native_exported if g not in actual_replace and g not in actual_silence
+        }
+    else:
+        native_evib_targets = _collect_evib_targets(native_proj)
+        kept_native_roots = {
+            g
+            for g in native_evts_all
+            if g not in actual_replace and g not in actual_silence and g not in native_evib_targets
+        }
 
     # Si no queda ningún evento vanilla que conservar (ej. un _AI.bank sin ai_engine_int en modo exterior),
     # devolver el banco porteado directamente.
@@ -4487,8 +4505,11 @@ def merge_ported_events_into_native_bank(
                 combined_map[k] = f
 
         combined_sorted = sorted(combined_map.items(), key=lambda x: x[0])
-        lcnt_ch = _riff_chunk(b"LCNT", struct.pack("<I", len(combined_sorted)))
-        body_lt = lt + lcnt_ch + b"".join(f for _, f in combined_sorted)
+        if combined_sorted:
+            lcnt_ch = _riff_chunk(b"LCNT", struct.pack("<I", len(combined_sorted)))
+            body_lt = lt + lcnt_ch + b"".join(f for _, f in combined_sorted)
+        else:
+            body_lt = lt
         merged_proj_parts += _riff_chunk(b"LIST", body_lt)
 
     exported_ev_guids = kept_native_roots | actual_replace | actual_silence
@@ -4551,6 +4572,1985 @@ def merge_ported_events_into_native_bank(
     return b"RIFF" + struct.pack("<I", 4 + len(body)) + b"FEV " + body
 
 
+# ============================================================================
+# Opción C: Injerto Quirúrgico por Evento + Enrutador Liviano EVIB Proxy
+# ============================================================================
+
+_EVIN_INST_PREFIX = bytes.fromhex(
+    "0000000000000000000000000000000000000000000000000000000000000000000000c842"
+    "00000000000000000000000000000000000000000000000000000000000000000000803f"
+    "00000000ffffff7f1800"
+)
+_EVIN_INST_SUFFIX = bytes.fromhex("03000000ffffffff02000000000000000000000000000000")
+assert len(_EVIN_INST_PREFIX) == 83 and len(_EVIN_INST_SUFFIX) == 24
+
+_BUILTIN_3D_PRMB_HDR5: dict[str, bytes] = {
+    "distance": b"\x00\x01\x00\x00\x00",
+    "event cone angle": b"\x00\x02\x00\x00\x00",
+    "event orientation": b"\x00\x03\x00\x00\x00",
+    "direction": b"\x00\x04\x00\x00\x00",
+    "elevation": b"\x00\x05\x00\x00\x00",
+}
+
+
+def _extract_bnki_exported_event_guids(
+    proj_bytes: bytes,
+    evts_items: list[tuple[bytes, bytes, bytes, bytes]] | tuple,
+) -> set[bytes]:
+    """Devuelve el conjunto exacto de GUIDs exportados según la partición EVTS[0 : BNKI[24:28])."""
+    exp_cnt: int | None = None
+    for cid, ps, pe, _ in iter_riff_chunks(proj_bytes, 0, len(proj_bytes)):
+        if cid == b"BNKI" and pe - ps >= 28:
+            exp_cnt = struct.unpack_from("<I", proj_bytes, ps + 24)[0]
+            break
+    if exp_cnt is None or exp_cnt <= 0 or exp_cnt > len(evts_items):
+        return set()
+    return {k for k, _, _, _ in list(evts_items)[:exp_cnt]}
+
+
+def _alloc_unique_guid(reserved: set[bytes], seed: bytes, tag: bytes) -> bytes:
+    """Genera un GUID v4 determinista que no colisiona con ningún objeto en `reserved`."""
+    ctr = 0
+    while True:
+        cand = bytearray(hashlib.sha256(seed + b":" + tag + b":" + struct.pack("<I", ctr)).digest()[:16])
+        ctr += 1
+        cand[7] = (cand[7] & 0x0F) | 0x40
+        cand[8] = (cand[8] & 0x3F) | 0x80
+        cb = bytes(cand)
+        if cb not in reserved and cb != b"\x00" * 16:
+            reserved.add(cb)
+            return cb
+
+
+def _inspect_native_event_profiles(
+    native_proj: bytes,
+    native_tables: list[tuple[bytes, list[tuple[bytes, bytes, bytes, bytes]]]],
+    native_panners: dict[bytes, tuple[int, float, float, int, float, float]] | None = None,
+) -> dict[bytes, dict]:
+    """Analiza cada evento de un banco nativo AMS2 (bus padre, throttle vs load, 3D, límites, panner)."""
+    tmap = dict(native_tables)
+    ibs_parent: dict[bytes, bytes] = {}
+    for k, _, _, bpay in tmap.get(b"IBSS", ()):
+        if len(bpay) >= 34:
+            ibs_parent[k] = bytes(bpay[18:34])
+
+    prm_name_by_guid: dict[bytes, str] = {}
+    for k, _, _, bpay in tmap.get(b"PRMS", ()):
+        if len(bpay) >= 23:
+            sl = struct.unpack_from("<H", bpay, 21)[0]
+            if 23 + sl <= len(bpay):
+                prm_name_by_guid[k] = bpay[23 : 23 + sl].decode("latin1", "replace").rstrip("\x00").strip().lower()
+
+    # Detectar BEFX Spatializer 3D (type 27, panBlend > 0.5)
+    sp3d_guids: set[bytes] = set()
+    for k, full, _, bpay in tmap.get(b"BEFX", ()):
+        if len(bpay) >= 24 and struct.unpack_from("<I", bpay, 20)[0] == 27:
+            for sc, sps, spe, _ in iter_riff_chunks(full, 12, len(full)):
+                if sc == b"PMEF" and spe - sps >= 12:
+                    pm = _parse_pmef_param_offsets(full[sps:spe])
+                    if 17 in pm and pm[17][0] == 0 and float(pm[17][2]) > 0.5:
+                        sp3d_guids.add(k)
+                    break
+
+    mbus_is_3d: dict[bytes, bool] = {}
+    for k, full, _, _ in tmap.get(b"MBSS", ()):
+        mbus_is_3d[k] = any(full[i : i + 16] in sp3d_guids for i in range(0, len(full) - 15))
+
+    ctrs_items = tmap.get(b"CTRS", ())
+    pmls_items = tmap.get(b"PMLS", ())
+
+    profiles: dict[bytes, dict] = {}
+    for ek, _full, _base, ebpay in tmap.get(b"EVTS", ()):
+        ibs_g = bytes(ebpay[48:64]) if len(ebpay) >= 64 else b""
+        mbs_g = bytes(ebpay[64:80]) if len(ebpay) >= 80 else b""
+        max_i, flg = struct.unpack_from("<iI", ebpay, 80) if len(ebpay) >= 88 else (1, 0)
+        dopp = struct.unpack_from("<f", ebpay, len(ebpay) - 12)[0] if len(ebpay) >= 96 else 0.0
+
+        cl = _extract_event_subgraph_closure(native_tables, {ek})
+        thr_hits = 0
+        load_hits = 0
+        for ck, _, _, cbpay in ctrs_items:
+            if ck in cl and len(cbpay) >= 48:
+                pn = prm_name_by_guid.get(bytes(cbpay[32:48]), "")
+                if pn == "throttle":
+                    thr_hits += 1
+                elif pn == "load":
+                    load_hits += 1
+        for pmk, _, _, pmbpay in pmls_items:
+            if pmk in cl and len(pmbpay) >= 50:
+                nb = struct.unpack_from("<H", pmbpay, 48)[0] >> 1
+                if nb > 0:
+                    pn = prm_name_by_guid.get(bytes(pmbpay[16:32]), "")
+                    if pn == "throttle":
+                        thr_hits += 2
+                    elif pn == "load":
+                        load_hits += 2
+
+        pref_thr: bool | None
+        if thr_hits > 0 and load_hits == 0:
+            pref_thr = True
+        elif load_hits > 0 and thr_hits == 0:
+            pref_thr = False
+        elif thr_hits > load_hits:
+            pref_thr = True
+        elif load_hits > thr_hits:
+            pref_thr = False
+        else:
+            pref_thr = None
+
+        pbus = ibs_parent.get(ibs_g, b"")
+        is_3d = bool(dopp > 0.5 or mbus_is_3d.get(mbs_g, False))
+        profiles[ek] = {
+            "parent_bus": pbus,
+            "prefers_throttle": pref_thr,
+            "is_3d": is_3d,
+            "max_instances": int(max_i),
+            "flags": int(flg),
+            "panner_cfg": (native_panners or {}).get(ek),
+        }
+    return profiles
+
+
+def _extract_event_prmb_metadata(
+    items_by_table: dict[bytes, list[tuple[bytes, bytes]]],
+    event_guid: bytes,
+) -> list[dict]:
+    """Devuelve metadatos completos de cada PRMB propio de `event_guid` (orden estable)."""
+    owned_prm_guids: list[bytes] = []
+    seen_p: set[bytes] = set()
+    for _pk, pml_full in items_by_table.get(b"PMLS", ()):
+        for sc, sps, spe, _ in iter_riff_chunks(pml_full, 12, len(pml_full)):
+            if sc == b"PMLB" and spe - sps >= 48 and pml_full[sps + 32 : sps + 48] == event_guid:
+                pg = bytes(pml_full[sps + 16 : sps + 32])
+                if pg not in seen_p:
+                    seen_p.add(pg)
+                    owned_prm_guids.append(pg)
+                break
+
+    prms_lookup: dict[bytes, bytes] = {}
+    for k, prm_full in items_by_table.get(b"PRMS", ()):
+        for sc, sps, spe, _ in iter_riff_chunks(prm_full, 12, len(prm_full)):
+            if sc == b"PRMB" and spe - sps >= 23:
+                prms_lookup[k] = bytes(prm_full[sps:spe])
+                break
+
+    result: list[dict] = []
+    for pg in owned_prm_guids:
+        bp = prms_lookup.get(pg)
+        if not bp or len(bp) < 23:
+            continue
+        sl = struct.unpack_from("<H", bp, 21)[0]
+        if 23 + sl + 12 > len(bp):
+            continue
+        pname = bp[23 : 23 + sl].decode("latin1", "replace").rstrip("\x00")
+        pmin, pmax, pdef = struct.unpack_from("<fff", bp, 23 + sl)
+        result.append(
+            {
+                "guid": pg,
+                "name": pname,
+                "name_low": pname.strip().lower(),
+                "hdr5": bytes(bp[16:21]),
+                "pmin": float(pmin),
+                "pmax": float(pmax),
+                "pdef": float(pdef),
+            }
+        )
+    return result
+
+
+def _patch_evtb_doppler_and_limits(
+    evnt_full: bytes,
+    doppler_scale: float | None = None,
+    max_instances: int | None = None,
+    flags: int | None = None,
+) -> bytes:
+    """Actualiza doppler_scale (tail+4) y/o límites de instancias en un chunk LIST:EVNT."""
+    out = bytearray()
+    for sc, sps, spe, _ in iter_riff_chunks(evnt_full, 12, len(evnt_full)):
+        sp = bytearray(evnt_full[sps:spe])
+        if sc == b"EVTB" and len(sp) >= 96:
+            if max_instances is not None:
+                struct.pack_into("<i", sp, 80, int(max_instances))
+            if flags is not None:
+                cur_f = struct.unpack_from("<I", sp, 84)[0]
+                struct.pack_into("<I", sp, 84, (cur_f & ~0xE0) | (int(flags) & 0xE0))
+            if doppler_scale is not None:
+                struct.pack_into("<f", sp, len(sp) - 12, float(doppler_scale))
+        out += _riff_chunk(sc, bytes(sp))
+    return _riff_list(b"EVNT", bytes(out))
+
+
+def _strip_spatializer_from_mbus_chunk(mbus_full: bytes, sp_guid: bytes) -> tuple[bytes, bool]:
+    """Elimina un GUID de efecto Spatializer de las listas pre/post-fader de BUS dentro de LIST:MBUS."""
+    removed = False
+    out = bytearray()
+    for sc, sps, spe, _ in iter_riff_chunks(mbus_full, 12, len(mbus_full)):
+        sp = mbus_full[sps:spe]
+        if sc == b"BUS " and len(sp) >= 27:
+            pos = 5
+            arrays: list[list[bytes]] = []
+            ok_parse = True
+            for _ in range(2):
+                if pos + 2 > len(sp):
+                    ok_parse = False
+                    break
+                hdr = struct.unpack_from("<H", sp, pos)[0]
+                cnt = hdr >> 1
+                pos += 2
+                if cnt == 0:
+                    arrays.append([])
+                else:
+                    if pos + 2 > len(sp):
+                        ok_parse = False
+                        break
+                    stride = struct.unpack_from("<H", sp, pos)[0]
+                    pos += 2
+                    if stride < 16 or pos + cnt * stride > len(sp):
+                        ok_parse = False
+                        break
+                    arr = [bytes(sp[pos + i * stride : pos + i * stride + 16]) for i in range(cnt)]
+                    pos += cnt * stride
+                    arrays.append(arr)
+            if ok_parse and len(arrays) == 2:
+                tail = sp[pos:]
+                new_arrays: list[list[bytes]] = []
+                for arr in arrays:
+                    filt = [g for g in arr if g != sp_guid]
+                    if len(filt) != len(arr):
+                        removed = True
+                    new_arrays.append(filt)
+                if removed:
+                    new_bus = bytearray(sp[:5])
+                    for arr in new_arrays:
+                        if not arr:
+                            new_bus += struct.pack("<H", 1)
+                        else:
+                            new_bus += struct.pack("<HH", (len(arr) << 1) | 1, 0x0010)
+                            new_bus += b"".join(arr)
+                    new_bus += tail
+                    out += _riff_chunk(b"BUS ", bytes(new_bus))
+                    continue
+        out += _riff_chunk(sc, sp)
+    return _riff_list(b"MBUS", bytes(out)), removed
+
+
+def _patch_befx_spatializer_chunk(
+    befx_full: bytes,
+    new_guid: bytes,
+    pan_cfg: tuple[int, float, float, int, float, float] | None = None,
+) -> bytes:
+    """Clona un chunk LIST:BEFX de Spatializer 3D con nuevo GUID y perfil de atenuación AMS2 opcional."""
+    out = bytearray()
+    for sc, sps, spe, _ in iter_riff_chunks(befx_full, 12, len(befx_full)):
+        sp = bytearray(befx_full[sps:spe])
+        if sc == b"BEFB" and len(sp) >= 16:
+            sp[0:16] = new_guid
+        elif sc == b"PMEF" and pan_cfg is not None and len(sp) >= 12:
+            pm = _parse_pmef_param_offsets(bytes(sp))
+            if 17 in pm and pm[17][0] == 0 and float(pm[17][2]) > 0.5:
+                rolloff, min_d, max_d, ext_mode, snd_size, min_ext = pan_cfg
+                if 11 in pm and pm[11][0] == 1:
+                    struct.pack_into("<i", sp, pm[11][1], int(rolloff))
+                if 12 in pm and pm[12][0] == 0:
+                    struct.pack_into("<f", sp, pm[12][1], float(min_d))
+                if 13 in pm and pm[13][0] == 0:
+                    struct.pack_into("<f", sp, pm[13][1], float(max_d))
+                if 14 in pm and pm[14][0] == 1:
+                    struct.pack_into("<i", sp, pm[14][1], int(ext_mode))
+                if 15 in pm and pm[15][0] == 0:
+                    struct.pack_into("<f", sp, pm[15][1], float(snd_size))
+                if 16 in pm and pm[16][0] == 0:
+                    struct.pack_into("<f", sp, pm[16][1], float(min_ext))
+        elif sc == b"LIST" and sp[:4] == b"PRPS":
+            # El Spatializer clonado para proxies no hereda automatizaciones CTRL externas
+            out += _riff_list(b"PRPS", b"")
+            continue
+        out += _riff_chunk(sc, bytes(sp))
+    return _riff_list(b"BEFF", bytes(out))
+
+
+def _hoist_3d_spatializer_from_ac_items(
+    ac_items_by_table: dict[bytes, list[tuple[bytes, bytes]]],
+    child_ev_guid: bytes,
+) -> bytes | None:
+    """Extrae el 3D Spatializer (BEFX 27, panBlend>0.5) del MBUS del sub-evento hijo hacia sus proxies padre.
+
+    Sigue el patrón nativo exacto de AMS2 (AI_EngineMAIN / AI_EngineMAIN_LIVE -> AI_EngineExt): el Spatializer 3D
+    vive en cada proxy padre (con su atenuación propia) y el sub-evento hijo tiene doppler=0 y sin doble espacialización.
+    Si algún CTRL o MODS referencia directamente al Spatializer, se omite el traslado por seguridad.
+    """
+    evts_list = ac_items_by_table.get(b"EVTS", [])
+    ev_entry_idx = next((i for i, (k, _) in enumerate(evts_list) if k == child_ev_guid), None)
+    if ev_entry_idx is None:
+        return None
+    _, ev_full = evts_list[ev_entry_idx]
+    mbs_g: bytes | None = None
+    for sc, sps, spe, _ in iter_riff_chunks(ev_full, 12, len(ev_full)):
+        if sc == b"EVTB" and spe - sps >= 80:
+            mbs_g = bytes(ev_full[sps + 64 : sps + 80])
+            break
+    if not mbs_g or mbs_g == b"\x00" * 16:
+        return None
+
+    mbss_list = ac_items_by_table.get(b"MBSS", [])
+    mb_idx = next((i for i, (k, _) in enumerate(mbss_list) if k == mbs_g), None)
+    if mb_idx is None:
+        return None
+    _, mb_full = mbss_list[mb_idx]
+
+    befx_list = ac_items_by_table.get(b"BEFX", [])
+    sp_idx: int | None = None
+    sp_guid: bytes | None = None
+    sp_full: bytes | None = None
+    for bi, (bk, bf) in enumerate(befx_list):
+        if bk not in mb_full:
+            continue
+        is_pan_27 = False
+        is_3d_pan = False
+        for sc, sps, spe, _ in iter_riff_chunks(bf, 12, len(bf)):
+            if sc == b"BEFB" and spe - sps >= 24 and struct.unpack_from("<I", bf, sps + 20)[0] == 27:
+                is_pan_27 = True
+            elif sc == b"PMEF" and spe - sps >= 12:
+                pm = _parse_pmef_param_offsets(bf[sps:spe])
+                if 17 in pm and pm[17][0] == 0 and float(pm[17][2]) > 0.5:
+                    is_3d_pan = True
+        if is_pan_27 and is_3d_pan:
+            sp_idx = bi
+            sp_guid = bk
+            sp_full = bf
+            break
+
+    if sp_guid is None or sp_full is None or sp_idx is None:
+        return None
+
+    # Verificar que ningún CTRL ni MODS dependa directamente de este BEFX
+    for tbl_tag in (b"CTRS", b"MODS"):
+        for _k, cf in ac_items_by_table.get(tbl_tag, ()):
+            if sp_guid in cf:
+                return None
+
+    new_mb_full, removed = _strip_spatializer_from_mbus_chunk(mb_full, sp_guid)
+    if not removed:
+        return None
+
+    mbss_list[mb_idx] = (mbs_g, new_mb_full)
+    befx_list.pop(sp_idx)
+    evts_list[ev_entry_idx] = (child_ev_guid, _patch_evtb_doppler_and_limits(ev_full, doppler_scale=0.0))
+    return sp_full
+
+
+def _align_direct_graft_event(
+    ac_items_by_table: dict[bytes, list[tuple[bytes, bytes]]],
+    target_ev_guid: bytes,
+    target_bus: bytes | None,
+    prefer_throttle: bool | None,
+    max_instances: int | None = None,
+    flags: int | None = None,
+) -> None:
+    """Alinea bus de salida, límites de instancias y nombre throttle/load de un evento injertado 1:1."""
+    evts_list = ac_items_by_table.get(b"EVTS", [])
+    ev_idx = next((i for i, (k, _) in enumerate(evts_list) if k == target_ev_guid), None)
+    if ev_idx is None:
+        return
+    _, ev_full = evts_list[ev_idx]
+    ibs_g: bytes | None = None
+    for sc, sps, spe, _ in iter_riff_chunks(ev_full, 12, len(ev_full)):
+        if sc == b"EVTB" and spe - sps >= 64:
+            ibs_g = bytes(ev_full[sps + 48 : sps + 64])
+            break
+
+    if max_instances is not None or flags is not None:
+        evts_list[ev_idx] = (
+            target_ev_guid,
+            _patch_evtb_doppler_and_limits(ev_full, max_instances=max_instances, flags=flags),
+        )
+
+    if target_bus and target_bus != b"\x00" * 16 and ibs_g:
+        ibss_list = ac_items_by_table.get(b"IBSS", [])
+        for ii, (ik, ifull) in enumerate(ibss_list):
+            if ik != ibs_g:
+                continue
+            out_ib = bytearray()
+            for sc, sps, spe, _ in iter_riff_chunks(ifull, 12, len(ifull)):
+                sp = bytearray(ifull[sps:spe])
+                if sc == b"IBSB" and len(sp) >= 34:
+                    sp[18:34] = target_bus
+                out_ib += _riff_chunk(sc, bytes(sp))
+            ibss_list[ii] = (ik, _riff_list(b"IBUS", bytes(out_ib)))
+            break
+
+    if prefer_throttle is None:
+        return
+
+    desired_name = "throttle" if prefer_throttle else "load"
+    other_name = "load" if prefer_throttle else "throttle"
+    ev_prms = _extract_event_prmb_metadata(ac_items_by_table, target_ev_guid)
+    names_present = {p["name_low"] for p in ev_prms}
+    if desired_name in names_present or other_name not in names_present:
+        return
+
+    target_p_guids = {p["guid"] for p in ev_prms if p["name_low"] == other_name}
+    prms_list = ac_items_by_table.get(b"PRMS", [])
+    desired_b = desired_name.encode("ascii")
+    for pi, (pk, pfull) in enumerate(prms_list):
+        if pk not in target_p_guids:
+            continue
+        out_p = bytearray()
+        for sc, sps, spe, _ in iter_riff_chunks(pfull, 12, len(pfull)):
+            sp = pfull[sps:spe]
+            if sc == b"PRMB" and len(sp) >= 23:
+                sl = struct.unpack_from("<H", sp, 21)[0]
+                if 23 + sl + 12 <= len(sp):
+                    tail_p = bytearray(sp[23 + sl :])
+                    # Asegurar valor por defecto 1.0 para que jamás caiga en silencio/crackle si no se alimenta
+                    struct.pack_into("<f", tail_p, 8, 1.0)
+                    new_prmb = sp[:21] + struct.pack("<H", len(desired_b)) + desired_b + bytes(tail_p)
+                    out_p += _riff_chunk(b"PRMB", new_prmb)
+                    continue
+            out_p += _riff_chunk(sc, sp)
+        prms_list[pi] = (pk, _riff_list(b"PARM", bytes(out_p)))
+
+
+def _make_prmb_chunk(
+    prm_guid: bytes,
+    name: str,
+    pmin: float,
+    pmax: float,
+    pdef: float,
+    pml_guid: bytes,
+    hdr5: bytes = b"\x00\x00\x00\x00\x00",
+) -> bytes:
+    """Construye un chunk LIST:PARM (PRMB + LIST:PRPS vacío) idéntico al formato nativo de FMOD Studio."""
+    nb = name.encode("ascii")
+    prmb_pay = (
+        prm_guid
+        + hdr5
+        + struct.pack("<H", len(nb))
+        + nb
+        + struct.pack("<fffffB", float(pmin), float(pmax), float(pdef), 0.0, 0.0, 0)
+        + struct.pack("<HH", 0x0003, 0x0010)
+        + pml_guid
+    )
+    return _riff_list(b"PARM", _riff_chunk(b"PRMB", prmb_pay) + _riff_list(b"PRPS", b""))
+
+
+def _make_pmlo_chunk(
+    pml_guid: bytes,
+    prm_guid: bytes,
+    ev_guid: bytes,
+    boxes: list[tuple[bytes, float, float]],
+    ctrl_guids: list[bytes],
+) -> bytes:
+    """Construye un chunk LIST:PMLO (PMLB + CTRO) idéntico al formato nativo de FMOD Studio."""
+    if boxes:
+        box_pay = struct.pack("<HH", (len(boxes) << 1) | 1, 0x0018) + b"".join(
+            inst_g + struct.pack("<ff", float(v0), float(vlen)) for inst_g, v0, vlen in boxes
+        )
+    else:
+        box_pay = struct.pack("<H", 1)
+    pmlb_pay = pml_guid + prm_guid + ev_guid + box_pay
+    if ctrl_guids:
+        ctro_pay = struct.pack("<HH", (len(ctrl_guids) << 1) | 1, 0x0010) + b"".join(ctrl_guids)
+    else:
+        ctro_pay = struct.pack("<H", 1)
+    return _riff_list(b"PMLO", _riff_chunk(b"PMLB", pmlb_pay) + _riff_chunk(b"CTRO", ctro_pay))
+
+
+def _build_evib_proxy_event_chunks(
+    proxy_ev_guid: bytes,
+    child_ev_guid: bytes,
+    child_prms: list[dict],
+    target_bus_guid: bytes,
+    is_3d: bool,
+    prefer_throttle: bool,
+    max_instances: int,
+    flags: int,
+    reserved_guids: set[bytes],
+    seed_bytes: bytes,
+    spatializer_template: bytes | None = None,
+    pan_cfg: tuple[int, float, float, int, float, float] | None = None,
+) -> dict[bytes, list[tuple[bytes, bytes]]]:
+    """Sintetiza un evento proxy FMOD liviano (~1.1 KB) con Event Instrument (EVIB) hacia un sub-evento AC único.
+
+    Reproduce byte a byte la arquitectura nativa de AMS2 (F_Ultimate_2022 EV[14] y F_Ultimate_2022_AI EV[3]):
+    - Dispara permanentemente el sub-evento AC a través de una caja PMLB en todo el rango de `rpm` [0..max_rpm].
+    - Reenvía linealmente `rpm` y puentea automáticamente `throttle` o `load` según lo que espera ese evento nativo.
+    - En eventos 3D (Exterior / AI / Replay), aloja el 3D Spatializer ajustado a AMS2 en el MBUS del proxy padre.
+    """
+    tag_base = proxy_ev_guid
+    tln_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"tln")
+    ibs_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"ibs")
+    mbs_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"mbs")
+    gbs_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"gbs")
+    evib_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"evib")
+
+    out: dict[bytes, list[tuple[bytes, bytes]]] = {}
+
+    def _add(tbl: bytes, k: bytes, ch: bytes) -> None:
+        out.setdefault(tbl, []).append((k, ch))
+
+    # 1. Opcional: Spatializer 3D clonado y ajustado a AMS2 en el MBUS del proxy
+    sp_fx_g: bytes | None = None
+    if is_3d and spatializer_template is not None:
+        sp_fx_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"sp3d")
+        _add(b"BEFX", sp_fx_g, _patch_befx_spatializer_chunk(spatializer_template, sp_fx_g, pan_cfg))
+
+    # 2. Parámetros del sub-evento hijo -> slots EVIB + puentes PROP/MAP/CTRL/CURV
+    child_rpm = next((p for p in child_prms if p["name_low"] in ("rpm", "rpms")), None)
+    child_thr = next((p for p in child_prms if p["name_low"] in ("throttle", "load")), None)
+    child_rpm_max = max(10000.0, float(child_rpm["pmax"]) if child_rpm else 22000.0)
+    parent_rpm_max = max(child_rpm_max, 25000.0)
+
+    used_prop_ids: set[int] = set()
+
+    def _next_prop_id(cg: bytes) -> int:
+        h = struct.unpack_from("<I", hashlib.sha256(cg + b":evib_prop").digest(), 0)[0] | 1
+        while h in used_prop_ids:
+            h = (h + 2) & 0xFFFFFFFF
+            if h == 0:
+                h = 1
+        used_prop_ids.add(h)
+        return h
+
+    evib_slots: list[tuple[int, bytes, float]] = []
+    child_prop_id_map: dict[bytes, int] = {}
+    for cp in child_prms:
+        pid = _next_prop_id(cp["guid"])
+        child_prop_id_map[cp["guid"]] = pid
+        def_v = 1.0 if cp["name_low"] in ("throttle", "load") else float(cp["pdef"])
+        evib_slots.append((pid, cp["guid"], def_v))
+
+    parent_pml_guids: list[bytes] = []
+    evin_props_chunks: list[tuple[int, bytes]] = []
+
+    # 2a. Parámetro padre `rpm` (siempre presente: aloja la caja EVIB persistente [0..parent_rpm_max])
+    rpm_prm_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"prm_rpm")
+    parent_pml_guids.append(rpm_prm_g)
+    rpm_ctrls: list[bytes] = []
+    if child_rpm is not None:
+        pid_rpm = child_prop_id_map[child_rpm["guid"]]
+        rpm_map_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"map_rpm")
+        rpm_ctrl_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"ctrl_rpm")
+        rpm_ctrls.append(rpm_ctrl_g)
+
+        c_rmin = float(child_rpm["pmin"])
+        c_rmax = max(c_rmin + 100.0, float(child_rpm["pmax"]))
+        map_pay = rpm_map_g + struct.pack("<HHffff", 0x0005, 0x0008, 0.0, c_rmin, 1.0, c_rmax)
+        _add(b"MPGS", rpm_map_g, _riff_chunk(b"MAP ", map_pay))
+
+        ctrl_pay = rpm_ctrl_g + evib_g + rpm_prm_g + rpm_ctrl_g + struct.pack("<I", pid_rpm)
+        _add(b"CTRS", rpm_ctrl_g, _riff_chunk(b"CTRL", ctrl_pay))
+
+        curv_pay = (
+            rpm_ctrl_g
+            + rpm_ctrl_g
+            + struct.pack("<HH", 0x0005, 0x0010)
+            + struct.pack("<ffffffff", c_rmin, 0.0, 0.0, 0.0, c_rmax, 1.0, 0.0, 0.0)
+        )
+        _add(b"CRVS", rpm_ctrl_g, _riff_chunk(b"CURV", curv_pay))
+
+        prop_pay = (
+            struct.pack("<II", pid_rpm, 3)
+            + rpm_map_g
+            + struct.pack("<HH", 0x0003, 0x0010)
+            + rpm_ctrl_g
+            + struct.pack("<H", 1)
+        )
+        evin_props_chunks.append((pid_rpm, _riff_chunk(b"PROP", prop_pay)))
+
+    _add(b"PRMS", rpm_prm_g, _make_prmb_chunk(rpm_prm_g, "rpm", 0.0, parent_rpm_max, 0.0, rpm_prm_g))
+    _add(
+        b"PMLS",
+        rpm_prm_g,
+        _make_pmlo_chunk(
+            rpm_prm_g,
+            rpm_prm_g,
+            proxy_ev_guid,
+            boxes=[(evib_g, 0.0, parent_rpm_max)],
+            ctrl_guids=rpm_ctrls,
+        ),
+    )
+
+    # 2b. Parámetro padre `throttle` o `load` puenteado hacia el parámetro de carga del hijo AC
+    if child_thr is not None:
+        parent_thr_name = "throttle" if prefer_throttle else "load"
+        thr_prm_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"prm_thr")
+        parent_pml_guids.append(thr_prm_g)
+
+        pid_thr = child_prop_id_map[child_thr["guid"]]
+        thr_map_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"map_thr")
+        thr_ctrl_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"ctrl_thr")
+
+        c_tmin = float(child_thr["pmin"])
+        c_tmax = float(child_thr["pmax"]) if float(child_thr["pmax"]) > c_tmin else (c_tmin + 1.0)
+        map_pay = thr_map_g + struct.pack("<HHffff", 0x0005, 0x0008, 0.0, c_tmin, 1.0, c_tmax)
+        _add(b"MPGS", thr_map_g, _riff_chunk(b"MAP ", map_pay))
+
+        ctrl_pay = thr_ctrl_g + evib_g + thr_prm_g + thr_ctrl_g + struct.pack("<I", pid_thr)
+        _add(b"CTRS", thr_ctrl_g, _riff_chunk(b"CTRL", ctrl_pay))
+
+        curv_pay = (
+            thr_ctrl_g
+            + thr_ctrl_g
+            + struct.pack("<HH", 0x0005, 0x0010)
+            + struct.pack("<ffffffff", c_tmin, 0.0, 0.0, 0.0, c_tmax, 1.0, 0.0, 0.0)
+        )
+        _add(b"CRVS", thr_ctrl_g, _riff_chunk(b"CURV", curv_pay))
+
+        prop_pay = (
+            struct.pack("<II", pid_thr, 3)
+            + thr_map_g
+            + struct.pack("<HH", 0x0003, 0x0010)
+            + thr_ctrl_g
+            + struct.pack("<H", 1)
+        )
+        evin_props_chunks.append((pid_thr, _riff_chunk(b"PROP", prop_pay)))
+
+        _add(b"PRMS", thr_prm_g, _make_prmb_chunk(thr_prm_g, parent_thr_name, c_tmin, c_tmax, 1.0, thr_prm_g))
+        _add(
+            b"PMLS",
+            thr_prm_g,
+            _make_pmlo_chunk(thr_prm_g, thr_prm_g, proxy_ev_guid, boxes=[], ctrl_guids=[thr_ctrl_g]),
+        )
+
+    # 2c. Parámetros 3D integrados en el padre si el proxy es 3D (espeja F_Ultimate_2022_AI EV[3])
+    if is_3d:
+        for cp in child_prms:
+            if cp["name_low"] in ("distance", "event cone angle", "event orientation", "direction"):
+                b3d_g = _alloc_unique_guid(reserved_guids, seed_bytes, tag_base + b"prm3d_" + cp["name_low"].encode())
+                parent_pml_guids.append(b3d_g)
+                hdr5 = _BUILTIN_3D_PRMB_HDR5.get(cp["name_low"], cp["hdr5"])
+                _add(
+                    b"PRMS",
+                    b3d_g,
+                    _make_prmb_chunk(b3d_g, cp["name"], cp["pmin"], cp["pmax"], cp["pdef"], b3d_g, hdr5=hdr5),
+                )
+                _add(b"PMLS", b3d_g, _make_pmlo_chunk(b3d_g, b3d_g, proxy_ev_guid, boxes=[], ctrl_guids=[]))
+
+    # 3. EVIN (EVIB + INST + LIST:PRPS ordenado por prop_id ascendente para búsqueda binaria de FMOD)
+    evib_slots.sort(key=lambda x: x[0])
+    evin_props_chunks.sort(key=lambda x: x[0])
+    if evib_slots:
+        slots_pay = struct.pack("<HH", (len(evib_slots) << 1) | 1, 0x0018) + b"".join(
+            struct.pack("<I", pid) + cpg + struct.pack("<f", dv) for pid, cpg, dv in evib_slots
+        )
+    else:
+        slots_pay = struct.pack("<H", 1)
+    evib_pay = evib_g + child_ev_guid + struct.pack("<f", 100.0) + slots_pay
+    inst_pay = _EVIN_INST_PREFIX + gbs_g + _EVIN_INST_SUFFIX
+    if evin_props_chunks:
+        prps_body = _riff_chunk(b"LCNT", struct.pack("<I", len(evin_props_chunks))) + b"".join(
+            ch for _, ch in evin_props_chunks
+        )
+    else:
+        prps_body = b""
+    evin_full = _riff_list(
+        b"EVIN",
+        _riff_chunk(b"EVIB", evib_pay) + _riff_chunk(b"INST", inst_pay) + _riff_list(b"PRPS", prps_body),
+    )
+    _add(b"EVIS", evib_g, evin_full)
+
+    # 4. TMLN (TLNB + TRNS vacío + CTRO vacío)
+    tlnb_pay = tln_g + proxy_ev_guid + struct.pack("<HHHHH", 1, 1, 1, 0, 1)
+    tmln_full = _riff_list(
+        b"TMLN",
+        _riff_chunk(b"TLNB", tlnb_pay) + _riff_list(b"TRNS", b"") + _riff_chunk(b"CTRO", struct.pack("<H", 1)),
+    )
+    _add(b"TLNS", tln_g, tmln_full)
+
+    # 5. IBUS (IBSB -> target_bus_guid + BUS + PRPS vacío)
+    ibsb_pay = ibs_g + b"\x18\x00" + target_bus_guid + struct.pack("<Ii", 7, -1)
+    ibus_bus_pay = bytes.fromhex("01070000000100010008000000000000000000ffffff7f00000000")
+    ibus_full = _riff_list(
+        b"IBUS",
+        _riff_chunk(b"IBSB", ibsb_pay) + _riff_chunk(b"BUS ", ibus_bus_pay) + _riff_list(b"PRPS", b""),
+    )
+    _add(b"IBSS", ibs_g, ibus_full)
+
+    # 6. MBUS (MBSB + BUS con Spatializer 3D si aplica + PRPS vacío)
+    mbs_ch_fmt = 7 if is_3d else 3
+    mbsb_pay = mbs_g + b"\x18\x00" + (b"\x00" * 16) + struct.pack("<Ii", mbs_ch_fmt, -1)
+    post_fx = (struct.pack("<HH", 0x0003, 0x0010) + sp_fx_g) if sp_fx_g else struct.pack("<H", 1)
+    mbus_bus_pay = (
+        bytes.fromhex("00030000000100")
+        + post_fx
+        + bytes.fromhex("08000000000000000000ffffff7f02000000")
+    )
+    mbus_full = _riff_list(
+        b"MBUS",
+        _riff_chunk(b"MBSB", mbsb_pay) + _riff_chunk(b"BUS ", mbus_bus_pay) + _riff_list(b"PRPS", b""),
+    )
+    _add(b"MBSS", mbs_g, mbus_full)
+
+    # 7. GBUS (GBSB -> mbs_g + BUS + PRPS vacío)
+    gbsb_pay = gbs_g + b"\x18\x00" + mbs_g + struct.pack("<Ii", 7 if is_3d else 3, -1)
+    gbus_bus_pay = bytes.fromhex("00030000000100010008000000000000000000ffffff7f02000000")
+    gbus_full = _riff_list(
+        b"GBUS",
+        _riff_chunk(b"GBSB", gbsb_pay) + _riff_chunk(b"BUS ", gbus_bus_pay) + _riff_list(b"PRPS", b""),
+    )
+    _add(b"GBSS", gbs_g, gbus_full)
+
+    # 8. EVNT (EVTB + PRPS vacío)
+    pml_arr_pay = (
+        struct.pack("<HH", (len(parent_pml_guids) << 1) | 1, 0x0010) + b"".join(parent_pml_guids)
+        if parent_pml_guids
+        else struct.pack("<H", 1)
+    )
+    evtb_pay = (
+        proxy_ev_guid
+        + (b"\x00" * 16)
+        + tln_g
+        + ibs_g
+        + mbs_g
+        + struct.pack("<iIBI", int(max_instances), int(flags), 0, 1)
+        + pml_arr_pay
+        + struct.pack("<ffII", 0.0, 100.0 if is_3d else 0.0, 1, 0)
+    )
+    evnt_full = _riff_list(b"EVNT", _riff_chunk(b"EVTB", evtb_pay) + _riff_list(b"PRPS", b""))
+    _add(b"EVTS", proxy_ev_guid, evnt_full)
+
+    return out
+
+
+def graft_ac_into_native_bank_surgical(
+    native_bank: FmodBank,
+    ported_ac_bank: FmodBank,
+    ac_int_event_guid: bytes | None,
+    ac_ext_event_guid: bytes | None,
+    target_int_guids: list[bytes] | None = None,
+    target_ext_guids: list[bytes] | None = None,
+    silence_native_guids: set[bytes] | None = None,
+    event_paths_map: dict[bytes, str] | None = None,
+    is_ai_bank: bool = False,
+    native_panners: dict[bytes, tuple[int, float, float, int, float, float]] | None = None,
+    default_prefer_throttle: bool = False,
+    mod_identifier: str = "custom_mod",
+    seed_tag: str = "surgical",
+    ai_live_guids: set[bytes] | None = None,
+) -> tuple[bytes, dict[str, bytes | None]]:
+    """Opción C: Injerta quirúrgicamente eventos de AC dentro de un .bank nativo de AMS2 con proxies EVIB.
+
+    - Preserva 100% intactos los eventos nativos no seleccionados (otros autos del mismo .bank, Starter,
+      Starting, Exhaust y sus sub-bancos FSB5 originales) sin ningún puntero colgante.
+    - Cuando un rol (Interior o Exterior) apunta a 1 único evento destino -> injerto directo 1:1 (cero overhead).
+    - Cuando un rol apunta a >=2 variantes/eventos (ej. F_Ultimate_2022 con 12 EngineInt y 3 EngineExt,
+      o múltiples AI_EngineMAIN/LIVE) -> inserta UNA sola copia del grafo AC como sub-evento interno (NST)
+      y crea proxies EVIB livianos (~1.1 KB c/u) con puenteo por-evento de `throttle`/`load` y Spatializer 3D
+      en cada proxy exterior.
+    - Retorna (bank_bytes, {"ac_int_guid": guid_final_int, "ac_ext_guid": guid_final_ext}).
+    """
+    EXT_BUS = guid_str_to_bytes("{c1986fb5-b329-4565-8342-b223857006d5}")
+    INT_BUS = guid_str_to_bytes("{a8959bf6-0b54-43ea-9d9a-06a8831c40d4}")
+    AI_BUS = guid_str_to_bytes(AMS2_AI_ENGINE_BUS)
+    EXH_BUS = guid_str_to_bytes("{ffe57d5c-46ed-4b06-86d5-8fa6f8ffdf07}")
+
+    fmt_payload = struct.pack("<II", native_bank.file_version or 0x50, native_bank.compat_version or 0x46)
+    native_proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(native_bank.raw, 12, len(native_bank.raw)):
+        if cid == b"FMT ":
+            fmt_payload = native_bank.raw[ps:pe]
+        elif cid == b"LIST" and native_bank.raw[ps : ps + 4] == b"PROJ":
+            native_proj = native_bank.raw[ps + 4 : pe]
+
+    ported_proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(ported_ac_bank.raw, 12, len(ported_ac_bank.raw)):
+        if cid == b"LIST" and ported_ac_bank.raw[ps : ps + 4] == b"PROJ":
+            ported_proj = ported_ac_bank.raw[ps + 4 : pe]
+            break
+
+    if not native_proj or not ported_proj:
+        raise ValueError("Invalid FMOD bank: missing LIST:PROJ payload for surgical graft.")
+
+    native_tables = list(_iter_proj_table_items(native_proj))
+    ported_tables = list(_iter_proj_table_items(ported_proj))
+    native_tmap = dict(native_tables)
+    ported_tmap = dict(ported_tables)
+
+    native_evts_all = {k for k, _, _, _ in native_tmap.get(b"EVTS", ())}
+    ported_evts_all = {k for k, _, _, _ in ported_tmap.get(b"EVTS", ())}
+
+    # Deduplicar destinos válidos dentro del banco nativo
+    int_targets: list[bytes] = []
+    seen_targets: set[bytes] = set()
+    if ac_int_event_guid and ac_int_event_guid in ported_evts_all:
+        for g in (target_int_guids or ()):
+            if g in native_evts_all and g not in seen_targets:
+                seen_targets.add(g)
+                int_targets.append(g)
+
+    ext_targets: list[bytes] = []
+    if ac_ext_event_guid and ac_ext_event_guid in ported_evts_all:
+        for g in (target_ext_guids or ()):
+            if g in native_evts_all and g not in seen_targets:
+                seen_targets.add(g)
+                ext_targets.append(g)
+
+    all_replaced = set(int_targets) | set(ext_targets)
+    if not all_replaced:
+        raise ValueError("No matching target events in native bank for surgical AC graft.")
+
+    actual_silence = {
+        g for g in (silence_native_guids or set()) if g in native_evts_all and g not in all_replaced
+    }
+
+    native_profiles = _inspect_native_event_profiles(native_proj, native_tables, native_panners=native_panners)
+    native_exported = _extract_bnki_exported_event_guids(native_proj, native_tmap.get(b"EVTS", ()))
+    if not native_exported:
+        nat_evib_tgts = _collect_evib_targets(native_proj)
+        native_exported = {g for g in native_evts_all if g not in nat_evib_tgts}
+
+    kept_native_roots = {g for g in native_exported if g not in all_replaced and g not in actual_silence}
+    k_native = _extract_event_subgraph_closure(native_tables, kept_native_roots)
+
+    # Extraer subgrafos limpios de los 1 ó 2 eventos AC fuente (sin basura: wheel/horn/door/bodywork)
+    ac_src_roots: set[bytes] = set()
+    if int_targets and ac_int_event_guid:
+        ac_src_roots.add(ac_int_event_guid)
+    if ext_targets and ac_ext_event_guid:
+        ac_src_roots.add(ac_ext_event_guid)
+    c_ac = _extract_event_subgraph_closure(ported_tables, ac_src_roots)
+
+    # Reservar GUIDs nativos y destinos para garantizar 0 colisiones
+    all_native_guids = set(collect_local_proj_guids(native_proj))
+    if native_bank.bank_guid:
+        all_native_guids.add(native_bank.bank_guid)
+    reserved_guids: set[bytes] = all_native_guids | all_replaced | actual_silence
+    seed_bytes = f"{seed_tag}:{mod_identifier}:{'ai' if is_ai_bank else 'p'}".encode("utf-8")
+
+    # Determinar GUID final del evento AC Interior y Exterior (directo si len==1, NST único si len>=2)
+    int_uses_proxy = len(int_targets) >= 2
+    ext_uses_proxy = len(ext_targets) >= 2
+    final_ac_int_guid: bytes | None = None
+    final_ac_ext_guid: bytes | None = None
+
+    if int_targets and ac_int_event_guid:
+        final_ac_int_guid = (
+            _alloc_unique_guid(reserved_guids, seed_bytes, b"ac_int_nst")
+            if int_uses_proxy
+            else int_targets[0]
+        )
+    if ext_targets and ac_ext_event_guid:
+        if ac_ext_event_guid == ac_int_event_guid:
+            # Caso raro: banco AC con un único evento para ambos roles; usar proxy separado si se pide
+            final_ac_ext_guid = final_ac_int_guid
+        else:
+            final_ac_ext_guid = (
+                _alloc_unique_guid(reserved_guids, seed_bytes, b"ac_ext_nst")
+                if ext_uses_proxy
+                else ext_targets[0]
+            )
+
+    remap_ac: dict[bytes, bytes] = {}
+    if ac_int_event_guid and final_ac_int_guid:
+        remap_ac[ac_int_event_guid] = final_ac_int_guid
+    if ac_ext_event_guid and final_ac_ext_guid and ac_ext_event_guid not in remap_ac:
+        remap_ac[ac_ext_event_guid] = final_ac_ext_guid
+
+    for g in sorted(c_ac):
+        if g in remap_ac:
+            continue
+        remap_ac[g] = _alloc_unique_guid(reserved_guids, seed_bytes, b"ac:" + g)
+
+    # Recolectar únicamente los sub-bancos FSB5 referenciados por cada lado
+    used_nat_sbs: set[int] = set()
+    for k, _full, _base, bpay in native_tmap.get(b"WAVS", ()):
+        if k in k_native and len(bpay) >= 30:
+            _, sb_i, _, _, _ = struct.unpack_from("<HHHII", bpay, 16)
+            if 0 <= sb_i < len(native_bank.subbanks):
+                used_nat_sbs.add(sb_i)
+
+    used_ac_sbs: set[int] = set()
+    for k, _full, _base, bpay in ported_tmap.get(b"WAVS", ()):
+        if k in c_ac and len(bpay) >= 30:
+            _, sb_i, _, _, _ = struct.unpack_from("<HHHII", bpay, 16)
+            if 0 <= sb_i < len(ported_ac_bank.subbanks):
+                used_ac_sbs.add(sb_i)
+
+    ordered_nat_sbs = sorted(used_nat_sbs)
+    ordered_ac_sbs = sorted(used_ac_sbs)
+    nat_sb_remap = {old_sb: new_idx for new_idx, old_sb in enumerate(ordered_nat_sbs)}
+    ac_sb_remap = {old_sb: len(ordered_nat_sbs) + new_idx for new_idx, old_sb in enumerate(ordered_ac_sbs)}
+
+    final_fsb_blobs: list[bytes] = (
+        [bytes(native_bank.subbanks[sb].raw_fsb_bytes) for sb in ordered_nat_sbs]
+        + [bytes(ported_ac_bank.subbanks[sb].raw_fsb_bytes) for sb in ordered_ac_sbs]
+    )
+    if not final_fsb_blobs and native_bank.subbanks:
+        final_fsb_blobs = [bytes(native_bank.subbanks[0].raw_fsb_bytes)]
+
+    # Remapear chunks del subgrafo AC
+    ac_items_by_table: dict[bytes, list[tuple[bytes, bytes]]] = {}
+    for lt, items in ported_tables:
+        out_list: list[tuple[bytes, bytes]] = []
+        for k, full, _base, bpay in items:
+            if k not in c_ac:
+                continue
+            new_k = remap_ac.get(k, k)
+            new_full = _remap_chunk_guids_leaves(full, remap_ac)
+            if lt == b"WAVS" and len(bpay) >= 30:
+                _, old_sb, _, _, _ = struct.unpack_from("<HHHII", bpay, 16)
+                new_sb = ac_sb_remap.get(old_sb, 0)
+                new_full = _patch_wav_chunk_subbank(new_full, new_sb)
+            out_list.append((new_k, new_full))
+        if out_list:
+            ac_items_by_table[lt] = out_list
+
+    # Alinear casos directos (1 único evento destino) y elevar Spatializer 3D si Exterior usa proxies EVIB
+    default_max_inst = AI_EVENT_MAX_INSTANCES if is_ai_bank else 4
+
+    if int_targets and final_ac_int_guid and not int_uses_proxy:
+        prof0 = native_profiles.get(int_targets[0], {})
+        bus0 = prof0.get("parent_bus") or INT_BUS
+        _align_direct_graft_event(
+            ac_items_by_table,
+            final_ac_int_guid,
+            target_bus=bus0,
+            prefer_throttle=prof0.get("prefers_throttle"),
+            max_instances=default_max_inst,
+            flags=AI_EVENT_STEAL_VIRTUALIZE,
+        )
+    elif int_targets and final_ac_int_guid and int_uses_proxy:
+        # Asegurar que el hijo NST interior tenga bus INT_BUS (para reconocimiento en Edit Modified Sound)
+        _align_direct_graft_event(
+            ac_items_by_table,
+            final_ac_int_guid,
+            target_bus=INT_BUS,
+            prefer_throttle=None,
+            max_instances=default_max_inst,
+            flags=AI_EVENT_STEAL_VIRTUALIZE,
+        )
+
+    ext_spatializer_template: bytes | None = None
+    if ext_targets and final_ac_ext_guid and not ext_uses_proxy:
+        prof0 = native_profiles.get(ext_targets[0], {})
+        bus0 = prof0.get("parent_bus") or (AI_BUS if is_ai_bank else EXT_BUS)
+        _align_direct_graft_event(
+            ac_items_by_table,
+            final_ac_ext_guid,
+            target_bus=bus0,
+            prefer_throttle=prof0.get("prefers_throttle"),
+            max_instances=default_max_inst,
+            flags=AI_EVENT_STEAL_VIRTUALIZE,
+        )
+    elif ext_targets and final_ac_ext_guid and ext_uses_proxy:
+        _align_direct_graft_event(
+            ac_items_by_table,
+            final_ac_ext_guid,
+            target_bus=(AI_BUS if is_ai_bank else EXT_BUS),
+            prefer_throttle=None,
+            max_instances=default_max_inst,
+            flags=AI_EVENT_STEAL_VIRTUALIZE,
+        )
+        ext_spatializer_template = _hoist_3d_spatializer_from_ac_items(ac_items_by_table, final_ac_ext_guid)
+
+    # Sintetizar proxies EVIB livianos para roles multi-destino
+    proxy_items_by_table: dict[bytes, list[tuple[bytes, bytes]]] = {}
+
+    def _merge_proxy_chunks(chunks_map: dict[bytes, list[tuple[bytes, bytes]]]) -> None:
+        for tbl, lst in chunks_map.items():
+            proxy_items_by_table.setdefault(tbl, []).extend(lst)
+
+    if int_uses_proxy and final_ac_int_guid:
+        child_int_prms = _extract_event_prmb_metadata(ac_items_by_table, final_ac_int_guid)
+        for tg in int_targets:
+            prof = native_profiles.get(tg, {})
+            t_bus = prof.get("parent_bus") or INT_BUS
+            t_pref_thr = (
+                prof["prefers_throttle"]
+                if prof.get("prefers_throttle") is not None
+                else bool(default_prefer_throttle)
+            )
+            p_chunks = _build_evib_proxy_event_chunks(
+                proxy_ev_guid=tg,
+                child_ev_guid=final_ac_int_guid,
+                child_prms=child_int_prms,
+                target_bus_guid=t_bus,
+                is_3d=False,
+                prefer_throttle=bool(t_pref_thr),
+                max_instances=default_max_inst,
+                flags=AI_EVENT_STEAL_VIRTUALIZE,
+                reserved_guids=reserved_guids,
+                seed_bytes=seed_bytes,
+            )
+            _merge_proxy_chunks(p_chunks)
+
+    if ext_uses_proxy and final_ac_ext_guid:
+        child_ext_prms = _extract_event_prmb_metadata(ac_items_by_table, final_ac_ext_guid)
+        live_set = ai_live_guids or set()
+        for tg in ext_targets:
+            prof = native_profiles.get(tg, {})
+            t_bus = prof.get("parent_bus") or (AI_BUS if is_ai_bank else EXT_BUS)
+            t_pref_thr = (
+                prof["prefers_throttle"]
+                if prof.get("prefers_throttle") is not None
+                else bool(default_prefer_throttle)
+            )
+            if prof.get("panner_cfg") is not None:
+                pan_cfg = prof["panner_cfg"]
+            elif is_ai_bank:
+                pan_cfg = AMS2_LIVE_REPLAY_PANNER if tg in live_set else AMS2_AI_MAIN_PANNER
+            else:
+                pan_cfg = AMS2_PLAYER_EXT_PANNER
+
+            p_chunks = _build_evib_proxy_event_chunks(
+                proxy_ev_guid=tg,
+                child_ev_guid=final_ac_ext_guid,
+                child_prms=child_ext_prms,
+                target_bus_guid=t_bus,
+                is_3d=True,
+                prefer_throttle=bool(t_pref_thr),
+                max_instances=default_max_inst,
+                flags=AI_EVENT_STEAL_VIRTUALIZE,
+                reserved_guids=reserved_guids,
+                seed_bytes=seed_bytes,
+                spatializer_template=ext_spatializer_template,
+                pan_cfg=pan_cfg,
+            )
+            _merge_proxy_chunks(p_chunks)
+
+    # Crear stubs silenciosos completos (con MBUS y TLN válidos -> 0 punteros colgantes) para eventos neutralizados
+    for sg in sorted(actual_silence):
+        prof_s = native_profiles.get(sg, {})
+        s_bus = prof_s.get("parent_bus") or EXH_BUS
+        s_tln = _alloc_unique_guid(reserved_guids, seed_bytes, b"sil_tln:" + sg)
+        s_ibs = _alloc_unique_guid(reserved_guids, seed_bytes, b"sil_ibs:" + sg)
+        s_mbs = _alloc_unique_guid(reserved_guids, seed_bytes, b"sil_mbs:" + sg)
+        tlnb_pay = s_tln + sg + struct.pack("<HHHHH", 1, 1, 1, 0, 1)
+        ibsb_pay = s_ibs + b"\x18\x00" + s_bus + struct.pack("<Ii", 3, -1)
+        mbsb_pay = s_mbs + b"\x18\x00" + (b"\x00" * 16) + struct.pack("<Ii", 3, -1)
+        bus_pay = bytes.fromhex("00030000000100010008000000000000000000ffffff7f02000000")
+        ibus_bus_pay = bytes.fromhex("01030000000100010008000000000000000000ffffff7f00000000")
+        evtb_pay = (
+            sg
+            + (b"\x00" * 16)
+            + s_tln
+            + s_ibs
+            + s_mbs
+            + struct.pack("<iIBI", 1, 0, 0, 1)
+            + struct.pack("<H", 1)
+            + struct.pack("<ffII", 0.0, 0.0, 1, 0)
+        )
+        proxy_items_by_table.setdefault(b"EVTS", []).append(
+            (sg, _riff_list(b"EVNT", _riff_chunk(b"EVTB", evtb_pay) + _riff_list(b"PRPS", b"")))
+        )
+        proxy_items_by_table.setdefault(b"TLNS", []).append(
+            (
+                s_tln,
+                _riff_list(
+                    b"TMLN",
+                    _riff_chunk(b"TLNB", tlnb_pay) + _riff_list(b"TRNS", b"") + _riff_chunk(b"CTRO", struct.pack("<H", 1)),
+                ),
+            )
+        )
+        proxy_items_by_table.setdefault(b"IBSS", []).append(
+            (
+                s_ibs,
+                _riff_list(b"IBUS", _riff_chunk(b"IBSB", ibsb_pay) + _riff_chunk(b"BUS ", ibus_bus_pay) + _riff_list(b"PRPS", b"")),
+            )
+        )
+        proxy_items_by_table.setdefault(b"MBSS", []).append(
+            (
+                s_mbs,
+                _riff_list(b"MBUS", _riff_chunk(b"MBSB", mbsb_pay) + _riff_chunk(b"BUS ", bus_pay) + _riff_list(b"PRPS", b"")),
+            )
+        )
+
+    # Filtrar y reindexar chunks nativos conservados
+    nat_items_by_table: dict[bytes, list[tuple[bytes, bytes]]] = {}
+    for lt, items in native_tables:
+        out_list = []
+        for k, full, _base, bpay in items:
+            if k not in k_native:
+                continue
+            new_full = full
+            if lt == b"WAVS" and len(bpay) >= 30:
+                _, old_sb, _, _, _ = struct.unpack_from("<HHHII", bpay, 16)
+                new_sb = nat_sb_remap.get(old_sb, old_sb)
+                if new_sb != old_sb:
+                    new_full = _patch_wav_chunk_subbank(new_full, new_sb)
+            out_list.append((k, new_full))
+        nat_items_by_table[lt] = out_list
+
+    # Reconstruir LIST:PROJ preservando el orden exacto de tablas del banco nativo
+    merged_proj_parts = bytearray()
+    for cid, ps, pe, pos in iter_riff_chunks(native_proj, 0, len(native_proj)):
+        pad_end = pe + ((pe - ps) & 1)
+        if cid != b"LIST":
+            merged_proj_parts += native_proj[pos:pad_end]
+            continue
+        lt = bytes(native_proj[ps : ps + 4])
+        combined_map: dict[bytes, bytes] = {}
+        for k, f in nat_items_by_table.get(lt, ()):
+            combined_map[k] = f
+        for k, f in ac_items_by_table.get(lt, ()):
+            combined_map[k] = f
+        for k, f in proxy_items_by_table.get(lt, ()):
+            combined_map[k] = f
+
+        combined_sorted = sorted(combined_map.items(), key=lambda x: x[0])
+        if combined_sorted:
+            lcnt_ch = _riff_chunk(b"LCNT", struct.pack("<I", len(combined_sorted)))
+            body_lt = lt + lcnt_ch + b"".join(f for _, f in combined_sorted)
+        else:
+            body_lt = lt
+        merged_proj_parts += _riff_chunk(b"LIST", body_lt)
+
+    # Particionar EVTS [0..exported) + [exported..total) y sincronizar BNKI[24:28]
+    exported_ev_guids = kept_native_roots | all_replaced | actual_silence
+    patched_proj_body = bytes(_sync_evts_partition_and_bnki(merged_proj_parts, exported_ev_guids))
+
+    # Construir STDT únicamente con el banco y los eventos exportados (nunca sub-eventos NST)
+    safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_mod"
+    stdt_entries: list[tuple[str, bytes]] = []
+    if native_bank.bank_guid:
+        stdt_entries.append((f"bank:/{safe_mod}", native_bank.bank_guid))
+    pmap = event_paths_map or {}
+    for ev_i, eg in enumerate(sorted(exported_ev_guids)):
+        ep = pmap.get(eg) or f"event:/AMS2/Vehicles/{safe_mod}/Event_{ev_i:02d}"
+        stdt_entries.append((ep, eg))
+    new_stdt_payload = build_stdt_chunk(stdt_entries) if stdt_entries else None
+
+    sndh_ver = 0x00080000 | (2 * len(final_fsb_blobs) + 1)
+    dummy_sndh = struct.pack("<I", sndh_ver) + b"\x00" * (8 * len(final_fsb_blobs))
+    temp_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, dummy_sndh, new_stdt_payload)
+
+    fmt_chunk_bytes = b"FMT " + struct.pack("<I", len(fmt_payload)) + fmt_payload
+    if len(fmt_payload) & 1:
+        fmt_chunk_bytes += b"\x00"
+
+    proj_list_size = 4 + len(temp_proj_body)
+    proj_total_bytes = 8 + proj_list_size + (proj_list_size & 1)
+
+    cur_file_pos = 12 + len(fmt_chunk_bytes) + proj_total_bytes
+    sndh_entries: list[tuple[int, int]] = []
+    snd_chunks_built: list[bytes] = []
+
+    for fsb_blob in final_fsb_blobs:
+        snd_payload_start = cur_file_pos + 8
+        pad_before = (32 - (snd_payload_start % 32)) % 32
+        fsb_pos = snd_payload_start + pad_before
+        fsb_len = len(fsb_blob)
+        snd_payload = (b"\x00" * pad_before) + bytes(fsb_blob)
+        snd_chunk = b"SND " + struct.pack("<I", len(snd_payload)) + snd_payload
+        if len(snd_payload) & 1:
+            snd_chunk += b"\x00"
+        sndh_entries.append((fsb_pos, fsb_len))
+        snd_chunks_built.append(snd_chunk)
+        cur_file_pos += len(snd_chunk)
+
+    real_sndh = struct.pack("<I", sndh_ver) + b"".join(
+        struct.pack("<II", fpos, flen) for fpos, flen in sndh_entries
+    )
+    final_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, real_sndh, new_stdt_payload)
+    assert len(final_proj_body) == len(temp_proj_body), "Tamaño inesperado al actualizar SNDH/STDT en injerto quirúrgico"
+
+    proj_chunk_bytes = (
+        b"LIST"
+        + struct.pack("<I", 4 + len(final_proj_body))
+        + b"PROJ"
+        + final_proj_body
+        + (b"\x00" if (len(final_proj_body) & 1) else b"")
+    )
+    body = fmt_chunk_bytes + proj_chunk_bytes + b"".join(snd_chunks_built)
+    out_bytes = b"RIFF" + struct.pack("<I", 4 + len(body)) + b"FEV " + body
+    meta = {
+        "ac_int_guid": final_ac_int_guid,
+        "ac_ext_guid": final_ac_ext_guid,
+    }
+    return out_bytes, meta
+
+
+def verify_fmod_bank_integrity(
+    bank_bytes: bytes,
+    expected_exported_guids: set[bytes] | None = None,
+) -> list[str]:
+    """Verifica invariantes binarios críticos de FMOD Studio sobre un .bank compilado.
+
+    Retorna una lista vacía `[]` si el banco es 100% íntegro (tablas ordenadas, partición EVTS/BNKI
+    válida para búsqueda binaria, cero referencias colgantes en EVTB/EVIB/PMLB/CTRL/CURV/WAVS y
+    alineación 32 bytes de FSB5).
+    """
+    errors: list[str] = []
+    if len(bank_bytes) < 20 or bank_bytes[:4] != b"RIFF" or bank_bytes[8:12] != b"FEV ":
+        return ["Cabecera RIFF/FEV inválida"]
+
+    proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(bank_bytes, 12, len(bank_bytes)):
+        if cid == b"LIST" and bank_bytes[ps : ps + 4] == b"PROJ":
+            proj = bank_bytes[ps + 4 : pe]
+            break
+    if not proj:
+        return ["Falta chunk LIST:PROJ"]
+
+    tables = list(_iter_proj_table_items(proj))
+    tmap = dict(tables)
+    all_keys: set[bytes] = set()
+
+    for lt, items in tables:
+        ks = [k for k, _, _, _ in items]
+        if len(ks) != len(set(ks)):
+            errors.append(f"Claves duplicadas en tabla {lt.decode('latin1')}")
+        if lt != b"EVTS" and ks != sorted(ks):
+            errors.append(f"Tabla {lt.decode('latin1')} desordenada")
+        all_keys.update(ks)
+
+    bnki_exp = -1
+    for cid, ps, pe, _ in iter_riff_chunks(proj, 0, len(proj)):
+        if cid == b"BNKI" and pe - ps >= 28:
+            bnki_exp = struct.unpack_from("<I", proj, ps + 24)[0]
+            break
+
+    ev_items = tmap.get(b"EVTS", [])
+    ev_keys = [k for k, _, _, _ in ev_items]
+    ev_set = set(ev_keys)
+    if not (0 <= bnki_exp <= len(ev_keys)):
+        errors.append(f"BNKI_exp={bnki_exp} fuera de rango (EVTS={len(ev_keys)})")
+    else:
+        exp_slice = ev_keys[:bnki_exp]
+        nst_slice = ev_keys[bnki_exp:]
+        if exp_slice != sorted(exp_slice):
+            errors.append("Partición exportada EVTS[0:BNKI_exp] no ordenada")
+        if nst_slice != sorted(nst_slice):
+            errors.append("Partición anidada EVTS[BNKI_exp:] no ordenada")
+        if expected_exported_guids:
+            for g in expected_exported_guids:
+                idx = bisect.bisect_left(exp_slice, g)
+                if idx >= len(exp_slice) or exp_slice[idx] != g:
+                    errors.append(f"Evento exportado no alcanzable por búsqueda binaria: {bytes_to_guid_str(g)}")
+
+    # Verificar referencias críticas EVTB -> TLN / IBS / MBS
+    tln_set = {k for k, _, _, _ in tmap.get(b"TLNS", ())}
+    ibs_set = {k for k, _, _, _ in tmap.get(b"IBSS", ())}
+    mbs_set = {k for k, _, _, _ in tmap.get(b"MBSS", ())}
+    for k, _, _, bpay in ev_items:
+        if len(bpay) >= 80:
+            for nm, ref, valid_set in (
+                ("TLN", bytes(bpay[32:48]), tln_set),
+                ("IBS", bytes(bpay[48:64]), ibs_set),
+                ("MBS", bytes(bpay[64:80]), mbs_set),
+            ):
+                if ref != b"\x00" * 16 and ref not in valid_set:
+                    errors.append(f"EVTB {bytes_to_guid_str(k)} referencia {nm} inexistente")
+
+    # Verificar EVIB -> target EVTS y orden de prop_id en EVIN -> LIST:PRPS
+    for k, full, _, bpay in tmap.get(b"EVIS", ()):
+        if len(bpay) >= 32 and bytes(bpay[16:32]) not in ev_set:
+            errors.append(f"EVIB {bytes_to_guid_str(k)} apunta a evento inexistente")
+        for sc, sps, spe, _ in iter_riff_chunks(full, 12, len(full)):
+            if sc == b"LIST" and full[sps : sps + 4] == b"PRPS":
+                pids = [
+                    struct.unpack_from("<I", full, pps)[0]
+                    for pc, pps, ppe, _ in iter_riff_chunks(full, sps + 4, spe)
+                    if pc == b"PROP" and ppe - pps >= 4
+                ]
+                if pids != sorted(pids):
+                    errors.append(f"EVIN {bytes_to_guid_str(k)} tiene PRPS desordenados por prop_id")
+
+    # Verificar límites de sub-bancos/muestras en WAVS y alineación 32B
+    try:
+        parsed = FmodBank(raw=bank_bytes)
+        sb_counts = [len(sb.samples) for sb in parsed.subbanks]
+        for k, _, _, bpay in tmap.get(b"WAVS", ()):
+            if len(bpay) >= 30:
+                _, sb_i, _, smp_i, _ = struct.unpack_from("<HHHII", bpay, 16)
+                if not (0 <= sb_i < len(sb_counts)) or not (0 <= smp_i < sb_counts[sb_i]):
+                    errors.append(f"WAV {bytes_to_guid_str(k)} fuera de rango (sb={sb_i}, smp={smp_i})")
+    except Exception as exc:
+        errors.append(f"Error al re-parsear FmodBank: {exc}")
+
+    return errors
+
+
+# ============================================================================
+# Injerto completo de eventos nativos AMS2 con audio FSB5 (Starter / Starting / Transmisión)
+# ============================================================================
+
+AMS2_STARTUP_BUS_BYTES = guid_str_to_bytes("{ffefac1b-0333-46ad-9d94-c7ae1494451f}")
+
+
+def _inject_clean_silent_events_in_proj(
+    proj_buf: bytes,
+    silent_guids: list[bytes],
+    bus_guid: bytes,
+    seed_bytes: bytes,
+) -> bytes:
+    """Inserta eventos silenciosos estructuralmente íntegros (EVNT + TMLN + IBUS + MBUS -> 0 punteros colgantes)."""
+    if not silent_guids:
+        return proj_buf
+    tables = list(_iter_proj_table_items(proj_buf))
+    existing_evts = {k for lt, items in tables if lt == b"EVTS" for k, _, _, _ in items}
+    to_add = [g for g in dict.fromkeys(silent_guids) if g not in existing_evts]
+    if not to_add:
+        return proj_buf
+
+    reserved = set(collect_local_proj_guids(proj_buf)) | set(to_add)
+    extra_by_tbl: dict[bytes, list[tuple[bytes, bytes]]] = {}
+    bus_pay = bytes.fromhex("00030000000100010008000000000000000000ffffff7f02000000")
+    ibus_bus_pay = bytes.fromhex("01030000000100010008000000000000000000ffffff7f00000000")
+
+    for sg in to_add:
+        s_tln = _alloc_unique_guid(reserved, seed_bytes, b"sil_tln:" + sg)
+        s_ibs = _alloc_unique_guid(reserved, seed_bytes, b"sil_ibs:" + sg)
+        s_mbs = _alloc_unique_guid(reserved, seed_bytes, b"sil_mbs:" + sg)
+        tlnb_pay = s_tln + sg + struct.pack("<HHHHH", 1, 1, 1, 0, 1)
+        ibsb_pay = s_ibs + b"\x18\x00" + bus_guid + struct.pack("<Ii", 3, -1)
+        mbsb_pay = s_mbs + b"\x18\x00" + (b"\x00" * 16) + struct.pack("<Ii", 3, -1)
+        evtb_pay = (
+            sg
+            + (b"\x00" * 16)
+            + s_tln
+            + s_ibs
+            + s_mbs
+            + struct.pack("<iIBI", 1, 0, 0, 1)
+            + struct.pack("<H", 1)
+            + struct.pack("<ffII", 0.0, 0.0, 1, 0)
+        )
+        extra_by_tbl.setdefault(b"EVTS", []).append(
+            (sg, _riff_list(b"EVNT", _riff_chunk(b"EVTB", evtb_pay) + _riff_list(b"PRPS", b"")))
+        )
+        extra_by_tbl.setdefault(b"TLNS", []).append(
+            (
+                s_tln,
+                _riff_list(
+                    b"TMLN",
+                    _riff_chunk(b"TLNB", tlnb_pay) + _riff_list(b"TRNS", b"") + _riff_chunk(b"CTRO", struct.pack("<H", 1)),
+                ),
+            )
+        )
+        extra_by_tbl.setdefault(b"IBSS", []).append(
+            (
+                s_ibs,
+                _riff_list(b"IBUS", _riff_chunk(b"IBSB", ibsb_pay) + _riff_chunk(b"BUS ", ibus_bus_pay) + _riff_list(b"PRPS", b"")),
+            )
+        )
+        extra_by_tbl.setdefault(b"MBSS", []).append(
+            (
+                s_mbs,
+                _riff_list(b"MBUS", _riff_chunk(b"MBSB", mbsb_pay) + _riff_chunk(b"BUS ", bus_pay) + _riff_list(b"PRPS", b"")),
+            )
+        )
+
+    existing_map = {lt: items for lt, items in tables}
+    out = bytearray()
+    for cid, ps, pe, pos in iter_riff_chunks(proj_buf, 0, len(proj_buf)):
+        pad_end = pe + ((pe - ps) & 1)
+        if cid != b"LIST":
+            out += proj_buf[pos:pad_end]
+            continue
+        lt = bytes(proj_buf[ps : ps + 4])
+        if lt not in extra_by_tbl:
+            out += proj_buf[pos:pad_end]
+            continue
+        comb: dict[bytes, bytes] = {k: f for k, f, _, _ in existing_map.get(lt, ())}
+        for k, f in extra_by_tbl[lt]:
+            comb[k] = f
+        comb_sorted = sorted(comb.items(), key=lambda x: x[0])
+        lcnt_ch = _riff_chunk(b"LCNT", struct.pack("<I", len(comb_sorted)))
+        out += _riff_chunk(b"LIST", lt + lcnt_ch + b"".join(f for _, f in comb_sorted))
+
+    evib_targets = _collect_evib_targets(bytes(out))
+    evts_keys_all = existing_evts | set(to_add)
+    exported_evs = {g for g in evts_keys_all if g not in evib_targets} | set(to_add)
+    return bytes(_sync_evts_partition_and_bnki(out, exported_evs))
+
+
+_AMS2_MASTER_STRINGS_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _load_ams2_master_strings_cached(ams2_root: Path | None) -> dict[str, str]:
+    """Lee y cachea Audio/MasterBank.strings.bank de AMS2 (guid_str_lower -> path)."""
+    eff_root = Path(ams2_root) if ams2_root else None
+    if eff_root is None:
+        try:
+            from .vanilla_manager import detect_ams2_root
+
+            eff_root = detect_ams2_root()
+        except Exception:
+            eff_root = None
+    if eff_root is None:
+        return {}
+    candidates = [
+        eff_root / "Audio" / "MasterBank.strings.bank",
+        eff_root / "Audio" / "AMS2" / "MasterBank.strings.bank",
+        eff_root / "Audio" / "Master Bank.strings.bank",
+    ]
+    ms_path = next((c for c in candidates if c.is_file()), None)
+    if ms_path is None:
+        return {}
+    cache_key = str(ms_path.resolve()).lower()
+    if cache_key in _AMS2_MASTER_STRINGS_CACHE:
+        return _AMS2_MASTER_STRINGS_CACHE[cache_key]
+    out: dict[str, str] = {}
+    try:
+        raw = ms_path.read_bytes()
+        for cid, ps, pe, _ in iter_riff_chunks(raw, 12, len(raw)):
+            if cid == b"LIST" and raw[ps : ps + 4] == b"PROJ":
+                for sc, sps, spe, _ in iter_riff_chunks(raw, ps + 4, pe):
+                    if sc == b"STDT":
+                        parsed = parse_stdt_all_paths(raw[sps:spe])
+                        out = {bytes_to_guid_str(g).lower(): p for g, p in parsed.items()}
+                        break
+    except Exception:
+        out = {}
+    _AMS2_MASTER_STRINGS_CACHE[cache_key] = out
+    return out
+
+
+def _find_native_starter_events_in_bank(
+    native_bank: FmodBank,
+    master_strings: dict[str, str] | None = None,
+    preferred_paths: dict[str, str] | None = None,
+    explicit_guids: list[bytes] | None = None,
+    exclude_guids: set[bytes] | None = None,
+) -> tuple[list[bytes], dict[bytes, str], dict[bytes, str]]:
+    """Localiza los eventos nativos AMS2 Starter/Starting con audio WAVS válido dentro de un .bank.
+
+    Retorna `(ordered_guids, guid_to_role, guid_to_path)` donde `guid_to_role[g]` es 'Starter' o 'Starting'.
+    """
+    nat_proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(native_bank.raw, 12, len(native_bank.raw)):
+        if cid == b"LIST" and native_bank.raw[ps : ps + 4] == b"PROJ":
+            nat_proj = native_bank.raw[ps + 4 : pe]
+            break
+    if not nat_proj:
+        return [], {}, {}
+
+    nat_tables = list(_iter_proj_table_items(nat_proj))
+    tmap = dict(nat_tables)
+    ev_items = tmap.get(b"EVTS", [])
+    if not ev_items:
+        return [], {}, {}
+
+    exported_ev_guids = _extract_bnki_exported_event_guids(nat_proj, ev_items)
+    if not exported_ev_guids:
+        exported_ev_guids = {k for k, _, _, _ in ev_items}
+    excluded = exclude_guids or set()
+
+    # Resolver bus padre de cada evento (EVTB[48:64] -> IBSB[18:34])
+    ibs_parent: dict[bytes, bytes] = {}
+    for k, _, _, bpay in tmap.get(b"IBSS", ()):
+        if len(bpay) >= 34:
+            ibs_parent[k] = bytes(bpay[18:34])
+    ev_parent_bus: dict[bytes, bytes] = {}
+    for k, _, _, bpay in ev_items:
+        if len(bpay) >= 64:
+            ev_parent_bus[k] = ibs_parent.get(bytes(bpay[48:64]), b"\x00" * 16)
+
+    # Mapa GUID -> path combinando STDT embebido y Master Bank.strings.bank
+    stdt_paths = parse_stdt_all_paths(native_bank.stdt_bytes) if native_bank.stdt_bytes else {}
+    ms = master_strings or {}
+    ev_path_by_g: dict[bytes, str] = {}
+    path_low_to_g: dict[str, bytes] = {}
+    for g in exported_ev_guids:
+        gs_low = bytes_to_guid_str(g).lower()
+        ep = stdt_paths.get(g) or ms.get(gs_low, "")
+        if not ep:
+            ev_obj = next((e for e in native_bank.events if e.guid_bytes == g), None)
+            if ev_obj and ev_obj.path:
+                ep = ev_obj.path
+        if ep:
+            ev_path_by_g[g] = ep
+            path_low_to_g[ep.lower()] = g
+
+    ev_role_obj: dict[bytes, str] = {e.guid_bytes: (e.role or "") for e in native_bank.events}
+    sb_counts = [len(sb.samples) for sb in native_bank.subbanks]
+    slot_names_loc: dict[tuple[int, int], str] = {
+        (sl.subbank_index, sl.sample_index): sl.name.lower() for sl in native_bank.slots
+    }
+    wav_items = tmap.get(b"WAVS", [])
+    ev_wav_names_cache: dict[bytes, list[str]] = {}
+
+    def _ev_wav_names(eg: bytes) -> list[str]:
+        if eg in ev_wav_names_cache:
+            return ev_wav_names_cache[eg]
+        if eg not in exported_ev_guids and eg not in ev_parent_bus:
+            ev_wav_names_cache[eg] = []
+            return []
+        clos = _extract_event_subgraph_closure(nat_tables, {eg})
+        out_n: list[str] = []
+        for wk, _, _, bpay in wav_items:
+            if wk in clos and len(bpay) >= 30:
+                _, sb_i, _, smp_i, _ = struct.unpack_from("<HHHII", bpay, 16)
+                if 0 <= sb_i < len(sb_counts) and 0 <= smp_i < sb_counts[sb_i]:
+                    out_n.append(slot_names_loc.get((int(sb_i), int(smp_i)), ""))
+        ev_wav_names_cache[eg] = out_n
+        return out_n
+
+    def _has_valid_audio(eg: bytes) -> bool:
+        return bool(_ev_wav_names(eg))
+
+    def _infer_st_role(eg: bytes, default_role: str = "Starter") -> str:
+        pl = ev_path_by_g.get(eg, "").lower()
+        if "starting" in pl:
+            return "Starting"
+        if "starter" in pl or "crank" in pl:
+            return "Starter"
+        sn = " ".join(_ev_wav_names(eg))
+        if "starting" in sn and "starter" not in sn:
+            return "Starting"
+        if "starter" in sn and "starting" not in sn:
+            return "Starter"
+        ro = ev_role_obj.get(eg, "")
+        if ro in ("Starter", "Starting"):
+            return ro
+        return default_role
+
+    selected: list[bytes] = []
+    guid_to_role: dict[bytes, str] = {}
+    guid_to_path: dict[bytes, str] = {}
+
+    if preferred_paths:
+        # Modo Mod (.csdbin): buscar exactamente los eventos pedidos por starter / starting
+        for role_k in ("Starter", "Starting"):
+            want_p = (preferred_paths.get(role_k) or "").strip()
+            if not want_p:
+                continue
+            want_low = want_p.lower()
+            matched_g = path_low_to_g.get(want_low)
+            if matched_g is None:
+                leaf = want_low.split("/")[-1]
+                for g, ep in ev_path_by_g.items():
+                    if ep.lower().endswith("/" + leaf) or ep.lower() == leaf:
+                        matched_g = g
+                        break
+            if matched_g is not None and matched_g not in excluded and _has_valid_audio(matched_g):
+                if matched_g not in guid_to_role:
+                    selected.append(matched_g)
+                    guid_to_role[matched_g] = role_k
+                    guid_to_path[matched_g] = ev_path_by_g.get(matched_g, want_p)
+
+        # Fallback por si faltó Starter o Starting en preferred_paths o no coincidió por ruta exacta
+        have_roles = set(guid_to_role.values())
+        if len(have_roles) < 2:
+            for g in sorted(exported_ev_guids):
+                if g in excluded or g in guid_to_role:
+                    continue
+                pl = ev_path_by_g.get(g, "").lower()
+                is_st_bus = ev_parent_bus.get(g) == AMS2_STARTUP_BUS_BYTES
+                is_st_name = any(k in pl for k in ("starter", "starting", "startup")) or ev_role_obj.get(g) in ("Starter", "Starting")
+                if not (is_st_bus or is_st_name):
+                    continue
+                if not _has_valid_audio(g):
+                    continue
+                inferred = _infer_st_role(g, "Starter" if "Starter" not in have_roles else "Starting")
+                if inferred not in have_roles:
+                    selected.append(g)
+                    guid_to_role[g] = inferred
+                    guid_to_path[g] = ev_path_by_g.get(g, "")
+                    have_roles.add(inferred)
+                    if len(have_roles) >= 2:
+                        break
+        return selected, guid_to_role, guid_to_path
+
+    # Modo Vanilla in-place: conservar TODOS los eventos Starter/Starting nativos del banco (ej. 963_Starter, 963_Starter_Old, 963_Starting)
+    cands_ordered: list[bytes] = []
+    seen_c: set[bytes] = set()
+    for g in (explicit_guids or ()):
+        if g not in excluded and g not in seen_c and g in ev_parent_bus:
+            seen_c.add(g)
+            cands_ordered.append(g)
+    for g in sorted(exported_ev_guids):
+        if g in excluded or g in seen_c:
+            continue
+        pl = ev_path_by_g.get(g, "").lower()
+        is_st_bus = ev_parent_bus.get(g) == AMS2_STARTUP_BUS_BYTES
+        is_st_name = any(k in pl for k in ("starter", "starting", "startup")) or ev_role_obj.get(g) in ("Starter", "Starting")
+        if is_st_bus or is_st_name:
+            seen_c.add(g)
+            cands_ordered.append(g)
+
+    for g in cands_ordered:
+        if not _has_valid_audio(g):
+            continue
+        selected.append(g)
+        guid_to_role[g] = _infer_st_role(g, "Starter" if "Starter" not in guid_to_role.values() else "Starting")
+        guid_to_path[g] = ev_path_by_g.get(g, "")
+
+    return selected, guid_to_role, guid_to_path
+
+
+def graft_native_events_with_audio_into_bank(
+    target_bank_bytes: bytes,
+    native_bank: FmodBank,
+    native_event_guids: list[bytes],
+    event_paths_map: dict[bytes, str] | None = None,
+    remap_root_guids: bool = False,
+    output_codec_mode: int = FSB5_MODE_FADPCM,
+    mod_identifier: str = "custom_mod",
+    seed_tag: str = "native_graft",
+) -> tuple[bytes, dict[bytes, bytes], dict[bytes, str]]:
+    """Injerta eventos nativos completos de AMS2 (subgrafo PROJ íntegro + audio FSB5 compacto) en un .bank destino.
+
+    - Preserva 100% del diseño FMOD original del evento nativo (TMLN, PMLS, PRMS, MBUS, GBUS, BEFX,
+      CTRS, CRVS, MPGS, MODS, WAIS, MUIS, EVIS, WAVS y enrutamiento IBSB al bus original de AMS2).
+    - Empaqueta únicamente las muestras referenciadas por los eventos injertados en un sub-banco FSB5
+      compacto (FADPCM por defecto; passthrough intacto para slots Vorbis/no decodificables).
+    - Si `remap_root_guids=False` (Vanilla in-place), conserva los GUIDs raíz originales exactos.
+    - Si `remap_root_guids=True` (Mod standalone), genera GUIDs únicos deterministas con 0 colisiones.
+
+    Retorna `(new_bank_bytes, orig_to_final_root_guid, final_guid_to_path)`.
+    """
+    if not native_event_guids:
+        return target_bank_bytes, {}, {}
+
+    nat_proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(native_bank.raw, 12, len(native_bank.raw)):
+        if cid == b"LIST" and native_bank.raw[ps : ps + 4] == b"PROJ":
+            nat_proj = native_bank.raw[ps + 4 : pe]
+            break
+    if not nat_proj:
+        return target_bank_bytes, {}, {}
+
+    native_tables = list(_iter_proj_table_items(nat_proj))
+    nat_evts_all = {k for lt, items in native_tables if lt == b"EVTS" for k, _, _, _ in items}
+    valid_roots = [g for g in dict.fromkeys(native_event_guids) if g in nat_evts_all]
+    if not valid_roots:
+        return target_bank_bytes, {}, {}
+
+    target_bank = FmodBank(raw=target_bank_bytes)
+    fmt_payload = struct.pack("<II", target_bank.file_version or 0x50, target_bank.compat_version or 0x46)
+    target_proj = b""
+    for cid, ps, pe, _ in iter_riff_chunks(target_bank.raw, 12, len(target_bank.raw)):
+        if cid == b"FMT ":
+            fmt_payload = target_bank.raw[ps:pe]
+        elif cid == b"LIST" and target_bank.raw[ps : ps + 4] == b"PROJ":
+            target_proj = target_bank.raw[ps + 4 : pe]
+    if not target_proj:
+        return target_bank_bytes, {}, {}
+
+    target_tables = list(_iter_proj_table_items(target_proj))
+    closure = _extract_event_subgraph_closure(native_tables, set(valid_roots))
+    if not closure:
+        return target_bank_bytes, {}, {}
+
+    seed_bytes = f"{seed_tag}:{mod_identifier}".encode("utf-8")
+    reserved_guids: set[bytes] = set(collect_local_proj_guids(target_proj))
+    if target_bank.bank_guid:
+        reserved_guids.add(target_bank.bank_guid)
+    if not remap_root_guids:
+        reserved_guids.update(valid_roots)
+
+    remap_nat: dict[bytes, bytes] = {}
+    root_set = set(valid_roots)
+    for g in sorted(closure):
+        if remap_root_guids:
+            remap_nat[g] = _alloc_unique_guid(reserved_guids, seed_bytes, b"nat_mod:" + g)
+        else:
+            if g in root_set:
+                remap_nat[g] = g
+            elif g not in reserved_guids:
+                remap_nat[g] = g
+                reserved_guids.add(g)
+            else:
+                remap_nat[g] = _alloc_unique_guid(reserved_guids, seed_bytes, b"nat_int:" + g)
+
+    # Extraer y compactar únicamente las muestras FSB5 referenciadas por el subgrafo nativo
+    slot_lookup: dict[tuple[int, int], FsbSampleSlot] = {
+        (sl.subbank_index, sl.sample_index): sl for sl in native_bank.slots
+    }
+    needed_locs_ordered: list[tuple[int, int]] = []
+    seen_locs: set[tuple[int, int]] = set()
+    for lt, items in native_tables:
+        if lt == b"WAVS":
+            for k, _full, _base, bpay in items:
+                if k in closure and len(bpay) >= 30:
+                    _, sb_i, _, smp_i, _ = struct.unpack_from("<HHHII", bpay, 16)
+                    loc = (int(sb_i), int(smp_i))
+                    if loc in slot_lookup and loc not in seen_locs:
+                        seen_locs.add(loc)
+                        needed_locs_ordered.append(loc)
+
+    final_fsb_blobs: list[bytes] = [bytes(sb.raw_fsb_bytes) for sb in target_bank.subbanks]
+    loc_remap: dict[tuple[int, int], tuple[int, int]] = {}
+    decodable_locs: list[tuple[tuple[int, int], FsbSampleSlot]] = []
+    passthrough_locs: list[tuple[int, int]] = []
+
+    for loc in needed_locs_ordered:
+        sl = slot_lookup[loc]
+        if sl.can_decode_audio:
+            decodable_locs.append((loc, sl))
+        else:
+            passthrough_locs.append(loc)
+
+    if decodable_locs:
+        fsb_samples = [
+            FsbBuildSample(
+                name=sl.name,
+                audio=native_bank.decode_slot_to_buffer(sl),
+                peak_override=sl.peak_volume,
+            )
+            for _loc, sl in decodable_locs
+        ]
+        eff_codec = output_codec_mode if output_codec_mode in (FSB5_MODE_PCM16, FSB5_MODE_FADPCM) else FSB5_MODE_FADPCM
+        compact_fsb = build_fsb5_container(fsb_samples, mode=eff_codec)
+        compact_sb_idx = len(final_fsb_blobs)
+        final_fsb_blobs.append(compact_fsb)
+        for new_smp_i, (orig_loc, _sl) in enumerate(decodable_locs):
+            loc_remap[orig_loc] = (compact_sb_idx, new_smp_i)
+
+    if passthrough_locs:
+        pt_sb_map: dict[int, int] = {}
+        for orig_sb, orig_smp in passthrough_locs:
+            if orig_sb not in pt_sb_map:
+                pt_sb_map[orig_sb] = len(final_fsb_blobs)
+                final_fsb_blobs.append(bytes(native_bank.subbanks[orig_sb].raw_fsb_bytes))
+            loc_remap[(orig_sb, orig_smp)] = (pt_sb_map[orig_sb], orig_smp)
+
+    # Remapear chunks del subgrafo nativo y redirigir WAVS al nuevo sub-banco
+    graft_items_by_table: dict[bytes, list[tuple[bytes, bytes]]] = {}
+    for lt, items in native_tables:
+        out_list: list[tuple[bytes, bytes]] = []
+        for k, full, _base, bpay in items:
+            if k not in closure:
+                continue
+            new_k = remap_nat.get(k, k)
+            new_full = _remap_chunk_guids_leaves(full, remap_nat)
+            if lt == b"WAVS" and len(bpay) >= 30:
+                _, old_sb, _, old_smp, _ = struct.unpack_from("<HHHII", bpay, 16)
+                dst_loc = loc_remap.get((int(old_sb), int(old_smp)))
+                if dst_loc is not None:
+                    new_full = _patch_wav_chunk_location(new_full, dst_loc[0], dst_loc[1])
+            out_list.append((new_k, new_full))
+        if out_list:
+            graft_items_by_table[lt] = out_list
+
+    # Fusionar tablas en target_proj preservando orden canónico FMOD
+    target_items_map = {lt: items for lt, items in target_tables}
+    merged_proj_parts = bytearray()
+    seen_tables: set[bytes] = set()
+    for cid, ps, pe, pos in iter_riff_chunks(target_proj, 0, len(target_proj)):
+        pad_end = pe + ((pe - ps) & 1)
+        if cid != b"LIST":
+            merged_proj_parts += target_proj[pos:pad_end]
+            continue
+        lt = bytes(target_proj[ps : ps + 4])
+        seen_tables.add(lt)
+        combined_map: dict[bytes, bytes] = {k: f for k, f, _, _ in target_items_map.get(lt, ())}
+        for k, f in graft_items_by_table.get(lt, ()):
+            combined_map[k] = f
+        combined_sorted = sorted(combined_map.items(), key=lambda x: x[0])
+        if combined_sorted:
+            lcnt_ch = _riff_chunk(b"LCNT", struct.pack("<I", len(combined_sorted)))
+            body_lt = lt + lcnt_ch + b"".join(f for _, f in combined_sorted)
+        else:
+            body_lt = lt
+        merged_proj_parts += _riff_chunk(b"LIST", body_lt)
+
+    # Anexar cualquier tabla extra presente en el subgrafo nativo y ausente en target_proj
+    for lt, items in graft_items_by_table.items():
+        if lt in seen_tables or not items:
+            continue
+        comb_sorted = sorted({k: f for k, f in items}.items(), key=lambda x: x[0])
+        lcnt_ch = _riff_chunk(b"LCNT", struct.pack("<I", len(comb_sorted)))
+        merged_proj_parts += _riff_chunk(b"LIST", lt + lcnt_ch + b"".join(f for _, f in comb_sorted))
+
+    # Sincronizar partición EVTS [0..BNKI_exp) (exportados) + [BNKI_exp..N) (sub-eventos EVIB)
+    all_evib_targets = _collect_evib_targets(bytes(merged_proj_parts))
+    target_evts_list = target_items_map.get(b"EVTS", [])
+    target_evib_targets = _collect_evib_targets(target_proj)
+    target_bnki_exp = _extract_bnki_exported_event_guids(target_proj, target_evts_list)
+    target_non_evib = {k for k, _, _, _ in target_evts_list if k not in target_evib_targets}
+    grafted_root_final = {remap_nat[g] for g in valid_roots}
+    exported_final = (target_bnki_exp - all_evib_targets) | target_non_evib | grafted_root_final
+    patched_proj_body = bytes(_sync_evts_partition_and_bnki(merged_proj_parts, exported_final))
+
+    # Actualizar STDT preservando todas las rutas existentes + registrando los eventos injertados
+    safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_mod"
+    existing_stdt = parse_stdt_all_paths(target_bank.stdt_bytes) if target_bank.stdt_bytes else {}
+    stdt_entries: list[tuple[str, bytes]] = []
+    for g_ex, p_ex in existing_stdt.items():
+        if g_ex not in grafted_root_final:
+            stdt_entries.append((p_ex, g_ex))
+    if not existing_stdt and target_bank.bank_guid:
+        stdt_entries.append((f"bank:/{safe_mod}", target_bank.bank_guid))
+
+    pmap = event_paths_map or {}
+    used_p_low = {p.lower() for p, _ in stdt_entries}
+    final_root_paths: dict[bytes, str] = {}
+    for idx_r, orig_g in enumerate(valid_roots):
+        fin_g = remap_nat[orig_g]
+        cand_p = pmap.get(orig_g) or f"event:/AMS2/Vehicles/Mods/{safe_mod}/Native_{idx_r:02d}"
+        if cand_p.lower() in used_p_low:
+            k_dup = 2
+            while f"{cand_p}_{k_dup}".lower() in used_p_low:
+                k_dup += 1
+            cand_p = f"{cand_p}_{k_dup}"
+        used_p_low.add(cand_p.lower())
+        stdt_entries.append((cand_p, fin_g))
+        final_root_paths[fin_g] = cand_p
+
+    new_stdt_payload = build_stdt_chunk(stdt_entries) if stdt_entries else None
+
+    # Recalcular siempre sndh_ver con el número actualizado de sub-bancos FSB5
+    sndh_ver = 0x00080000 | (2 * len(final_fsb_blobs) + 1)
+    dummy_sndh = struct.pack("<I", sndh_ver) + b"\x00" * (8 * len(final_fsb_blobs))
+    temp_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, dummy_sndh, new_stdt_payload)
+
+    fmt_chunk_bytes = b"FMT " + struct.pack("<I", len(fmt_payload)) + fmt_payload
+    if len(fmt_payload) & 1:
+        fmt_chunk_bytes += b"\x00"
+
+    proj_list_size = 4 + len(temp_proj_body)
+    proj_total_bytes = 8 + proj_list_size + (proj_list_size & 1)
+
+    cur_file_pos = 12 + len(fmt_chunk_bytes) + proj_total_bytes
+    sndh_entries: list[tuple[int, int]] = []
+    snd_chunks_built: list[bytes] = []
+
+    for fsb_blob in final_fsb_blobs:
+        snd_payload_start = cur_file_pos + 8
+        pad_before = (32 - (snd_payload_start % 32)) % 32
+        fsb_pos = snd_payload_start + pad_before
+        fsb_len = len(fsb_blob)
+        snd_payload = (b"\x00" * pad_before) + bytes(fsb_blob)
+        snd_chunk = b"SND " + struct.pack("<I", len(snd_payload)) + snd_payload
+        if len(snd_payload) & 1:
+            snd_chunk += b"\x00"
+        sndh_entries.append((fsb_pos, fsb_len))
+        snd_chunks_built.append(snd_chunk)
+        cur_file_pos += len(snd_chunk)
+
+    real_sndh = struct.pack("<I", sndh_ver) + b"".join(
+        struct.pack("<II", fpos, flen) for fpos, flen in sndh_entries
+    )
+    final_proj_body = _replace_sndh_and_stdt_in_proj(patched_proj_body, real_sndh, new_stdt_payload)
+    assert len(final_proj_body) == len(temp_proj_body), "Tamaño inesperado al actualizar SNDH/STDT tras injerto nativo"
+
+    proj_chunk_bytes = (
+        b"LIST"
+        + struct.pack("<I", 4 + len(final_proj_body))
+        + b"PROJ"
+        + final_proj_body
+        + (b"\x00" if (len(final_proj_body) & 1) else b"")
+    )
+    body = fmt_chunk_bytes + proj_chunk_bytes + b"".join(snd_chunks_built)
+    out_bytes = b"RIFF" + struct.pack("<I", 4 + len(body)) + b"FEV " + body
+    root_guid_map = {orig_g: remap_nat[orig_g] for orig_g in valid_roots}
+    return out_bytes, root_guid_map, final_root_paths
+
+
+def _resolve_native_starter_source_for_csdbin(
+    csd_doc: CsdbinDocument | None,
+    orig_engine_bank: str,
+    orig_starter_path: str,
+    orig_starting_path: str,
+    ams2_root: Path | None = None,
+    backup_dir: Path | None = None,
+    fallback_donor: FmodBank | None = None,
+    extra_search_roots: list[Path] | None = None,
+) -> tuple[FmodBank | None, list[bytes], dict[bytes, str], dict[bytes, str]]:
+    """Resuelve el banco AMS2 original y sus eventos Starter/Starting (con audio válido) para un Mod .csdbin."""
+    eff_ams2 = Path(ams2_root) if ams2_root else None
+    if eff_ams2 is None:
+        try:
+            from .vanilla_manager import detect_ams2_root
+
+            eff_ams2 = detect_ams2_root()
+        except Exception:
+            eff_ams2 = None
+
+    ms = _load_ams2_master_strings_cached(eff_ams2)
+    pref_paths: dict[str, str] = {}
+    if orig_starter_path:
+        pref_paths["Starter"] = orig_starter_path
+    if orig_starting_path:
+        pref_paths["Starting"] = orig_starting_path
+
+    cand_paths: list[Path] = []
+    seen_p: set[str] = set()
+
+    def _push_cand(p: Path | None) -> None:
+        if p is None:
+            return
+        try:
+            if not p.is_file():
+                return
+            key = str(p.resolve()).lower()
+        except Exception:
+            return
+        if key not in seen_p:
+            seen_p.add(key)
+            cand_paths.append(p)
+
+    clean_eb = orig_engine_bank.replace("\\", "/").removesuffix(".bank").strip("/")
+    if clean_eb:
+        eb_fname = Path(clean_eb).name + ".bank"
+        # 1. Priorizar respaldos limpios de Steam si existen (evita leer bancos vanilla modificados sin starter)
+        b_dirs: list[Path] = []
+        if backup_dir and Path(backup_dir).is_dir():
+            b_dirs.append(Path(backup_dir))
+        if eff_ams2:
+            ams2_bank_p = eff_ams2 / f"{clean_eb}.bank"
+            _push_cand(ams2_bank_p.parent / f"{ams2_bank_p.name}.orig")
+        for bdir in b_dirs:
+            for hit in bdir.rglob(eb_fname):
+                _push_cand(hit)
+        # 2. Banco en la instalación de AMS2 y carpetas de búsqueda extra (p.ej. re-exportación en output_root)
+        if eff_ams2:
+            _push_cand(eff_ams2 / f"{clean_eb}.bank")
+        for eroot in (extra_search_roots or ()):
+            _push_cand(Path(eroot) / f"{clean_eb}.bank")
+        # 3. Banco relativo a la carpeta raíz del mod (.csdbin en <ModRoot>/Vehicles/<car>/<car>.csdbin)
+        if csd_doc is not None and csd_doc.source_path is not None:
+            cur = csd_doc.source_path.parent
+            for _ in range(4):
+                _push_cand(cur / f"{clean_eb}.bank")
+                if cur.parent == cur:
+                    break
+                cur = cur.parent
+
+    # 4. Si el .csdbin tiene ruta starter/starting en Sort/<Letra>/<Marca>/..., localizar el banco vanilla allí
+    if eff_ams2 and (orig_starter_path or orig_starting_path):
+        sort_root = eff_ams2 / "Audio" / "AMS2" / "Vehicles" / "Sort"
+        for sp in (orig_starter_path, orig_starting_path):
+            if not sp:
+                continue
+            sp_norm = sp.replace("\\", "/")
+            marker = "/Vehicles/Sort/"
+            idx_m = sp_norm.lower().find(marker.lower())
+            if idx_m >= 0 and sort_root.is_dir():
+                tail_parts = [pt for pt in sp_norm[idx_m + len(marker) :].split("/") if pt]
+                if len(tail_parts) >= 2:
+                    brand_dir = sort_root / tail_parts[0] / tail_parts[1]
+                    if brand_dir.is_dir():
+                        for bp in sorted(brand_dir.rglob("*.bank")):
+                            if bp.stem.lower().endswith("_ai"):
+                                continue
+                            if backup_dir and Path(backup_dir).is_dir():
+                                for hit in Path(backup_dir).rglob(bp.name):
+                                    _push_cand(hit)
+                            _push_cand(bp.parent / f"{bp.name}.orig")
+                            _push_cand(bp)
+
+    for cp in cand_paths:
+        try:
+            nb = FmodBank(cp)
+            sel, g2r, g2p = _find_native_starter_events_in_bank(
+                nb,
+                master_strings=ms,
+                preferred_paths=(pref_paths if pref_paths else None),
+            )
+            if sel:
+                return nb, sel, g2r, g2p
+        except Exception:
+            continue
+
+    if fallback_donor is not None:
+        try:
+            sel, g2r, g2p = _find_native_starter_events_in_bank(
+                fallback_donor,
+                master_strings=ms,
+                preferred_paths=(pref_paths if pref_paths else None),
+            )
+            if sel:
+                return fallback_donor, sel, g2r, g2p
+        except Exception:
+            pass
+
+    return None, [], {}, {}
+
+
 def build_direct_ported_bank_from_ac(
     ac_bank: FmodBank,
     mod_identifier: str = "custom_mod",
@@ -4575,6 +6575,8 @@ def build_direct_ported_bank_from_ac(
     target_max_rpm: float | None = None,
     library: SourceAudioLibrary | None = None,
     active_scope: str = "full",
+    explicit_ac_int_guid: bytes | None = None,
+    explicit_ac_ext_guid: bytes | None = None,
 ) -> PortedBankResult:
     """Construye un nuevo archivo .bank para Automobilista 2 directamente desde un banco .bank de Assetto Corsa.
 
@@ -4669,6 +6671,9 @@ def build_direct_ported_bank_from_ac(
 
     active_root_orig_evs: set[bytes] = set()
     evib_targets_orig = _collect_evib_targets(bytes(proj_buf)) if is_ai_bank else set()
+    pending_native_starter_graft: tuple[FmodBank, list[bytes], dict[bytes, str]] | None = None
+    pending_clean_silent_exhaust: list[bytes] = []
+    pending_clean_silent_starters: list[bytes] = []
 
     if target_role_guids:
         # Seleccionar el evento primario de exterior e interior de AC
@@ -4684,14 +6689,22 @@ def build_direct_ported_bank_from_ac(
             if _is_engine_cand(e) and (e.role == "EngineExt" or any(k in (e.path or "").lower() for k in ("_ext", "ext_", "exterior", "chase")))
         ]
         ext_cands.sort(key=lambda x: -len(x.linked_samples))
-        p_ext = ext_cands[0] if ext_cands else next((e for e in ac_bank.events if e.role == "EngineExt"), None)
+        p_ext = (
+            next((e for e in ac_bank.events if e.guid_bytes == explicit_ac_ext_guid), None)
+            if explicit_ac_ext_guid
+            else None
+        ) or (ext_cands[0] if ext_cands else next((e for e in ac_bank.events if e.role == "EngineExt"), None))
 
         int_cands = [
             e for e in ac_bank.events
             if _is_engine_cand(e) and (e.role == "EngineInt" or any(k in (e.path or "").lower() for k in ("_int", "int_", "cockpit", "cabin")))
         ]
         int_cands.sort(key=lambda x: -len(x.linked_samples))
-        p_int = int_cands[0] if int_cands else next((e for e in ac_bank.events if e.role == "EngineInt"), None)
+        p_int = (
+            next((e for e in ac_bank.events if e.guid_bytes == explicit_ac_int_guid), None)
+            if explicit_ac_int_guid
+            else None
+        ) or (int_cands[0] if int_cands else next((e for e in ac_bank.events if e.role == "EngineInt"), None))
 
         if p_ext and active_scope in ("full", "exterior"):
             active_root_orig_evs.add(p_ext.guid_bytes)
@@ -4867,14 +6880,77 @@ def build_direct_ported_bank_from_ac(
                         )
                         stdt_entries.append((ex_p, ex_g))
 
-            # Comprobar si AC tiene evento de encendido / starter
+            # Preservar SIEMPRE el Starter / Starting nativo de AMS2 (subgrafo PROJ completo + audio FSB5)
+            # cuando el banco nativo los posee; solo caer al starter de AC o stub limpio si no existen en AMS2.
             starter_ac_ev = next(
                 (ev for ev in ac_bank.events if any(k in (ev.path or "").lower() or k in (ev.role or "").lower() for k in ("starter", "starting", "startup", "start_ext", "start_int", "ignition"))),
                 None,
             )
             starter_roles = [r for r in target_role_guids if r in ("Starter", "Starting")]
 
-            if starter_ac_ev and starter_roles:
+            nat_st_resolved = False
+            if starter_roles and native_bank_path and Path(native_bank_path).is_file():
+                try:
+                    nat_st_bank = FmodBank(Path(native_bank_path))
+                    explicit_st_guids: list[bytes] = [
+                        guid_str_to_bytes(target_role_guids[r]) for r in starter_roles
+                    ]
+                    extra_st_paths_by_g: dict[bytes, str] = {}
+                    for r in starter_roles:
+                        rg = guid_str_to_bytes(target_role_guids[r])
+                        if (target_role_paths or {}).get(r):
+                            extra_st_paths_by_g[rg] = str((target_role_paths or {})[r])
+                    if extra_role_variants:
+                        for s_role in ("Starter", "Starting"):
+                            for idx_ex, item in enumerate(extra_role_variants.get(s_role, ()), start=2):
+                                ex_g = guid_str_to_bytes(item[0])
+                                if ex_g not in explicit_st_guids:
+                                    explicit_st_guids.append(ex_g)
+                                ex_p = (item[1] if len(item) >= 2 and item[1] else "") or (
+                                    f"event:/AMS2/Vehicles/{safe_mod}/{s_role}_{idx_ex}"
+                                )
+                                extra_st_paths_by_g.setdefault(ex_g, ex_p)
+
+                    excl_for_st: set[bytes] = set()
+                    for r_ex in ("EngineInt", "EngineExt", "AuxInt", "Exhaust"):
+                        if r_ex in target_role_guids:
+                            excl_for_st.add(guid_str_to_bytes(target_role_guids[r_ex]))
+                        if extra_role_variants:
+                            for _it in extra_role_variants.get(r_ex, ()):
+                                if _it and _it[0]:
+                                    excl_for_st.add(guid_str_to_bytes(_it[0]))
+                    nat_st_guids, nat_st_roles, nat_st_paths = _find_native_starter_events_in_bank(
+                        nat_st_bank,
+                        explicit_guids=explicit_st_guids,
+                        exclude_guids=excl_for_st,
+                    )
+                    if nat_st_guids:
+                        nat_st_resolved = True
+                        st_pmap: dict[bytes, str] = {}
+                        for idx_g, sg in enumerate(nat_st_guids):
+                            sr = nat_st_roles.get(sg, "Starter")
+                            st_pmap[sg] = (
+                                extra_st_paths_by_g.get(sg)
+                                or nat_st_paths.get(sg)
+                                or f"event:/AMS2/Vehicles/{safe_mod}/{sr}_{idx_g + 1}"
+                            )
+                            used_guids.add(sg)
+                        pending_native_starter_graft = (nat_st_bank, nat_st_guids, st_pmap)
+                        nat_st_set = set(nat_st_guids)
+                        for s_role in starter_roles:
+                            s_bg = guid_str_to_bytes(target_role_guids[s_role])
+                            s_path = st_pmap.get(s_bg) or (target_role_paths or {}).get(s_role) or f"event:/AMS2/Vehicles/{safe_mod}/{s_role}"
+                            role_to_event_guid[s_role] = bytes_to_guid_str(s_bg)
+                            role_to_event_path[s_role] = s_path
+                            if s_bg not in nat_st_set:
+                                # Si uno de los roles pedidos no existía con audio en el banco nativo, emitir stub limpio
+                                pending_clean_silent_starters.append(s_bg)
+                                used_guids.add(s_bg)
+                                stdt_entries.append((s_path, s_bg))
+                except Exception:
+                    nat_st_resolved = False
+
+            if not nat_st_resolved and starter_ac_ev and starter_roles:
                 active_root_orig_evs.add(starter_ac_ev.guid_bytes)
                 for s_role in starter_roles:
                     s_bg = guid_str_to_bytes(target_role_guids[s_role])
@@ -4898,43 +6974,29 @@ def build_direct_ported_bank_from_ac(
                                 f"event:/AMS2/Vehicles/{safe_mod}/{s_role}_{idx_ex}"
                             )
                             stdt_entries.append((ex_p, ex_g))
-            elif starter_roles:
-                st_guids_to_extract = [guid_str_to_bytes(target_role_guids[r]) for r in starter_roles]
-                extra_st_entries: list[tuple[bytes, str]] = []
+            elif not nat_st_resolved and starter_roles:
+                for s_role in starter_roles:
+                    s_bg = guid_str_to_bytes(target_role_guids[s_role])
+                    pending_clean_silent_starters.append(s_bg)
+                    used_guids.add(s_bg)
+                    s_path = (target_role_paths or {}).get(s_role) or f"event:/AMS2/Vehicles/{safe_mod}/{s_role}"
+                    role_to_event_guid[s_role] = bytes_to_guid_str(s_bg)
+                    role_to_event_path[s_role] = s_path
+                    stdt_entries.append((s_path, s_bg))
                 if extra_role_variants:
-                    seen_st_ext = set(st_guids_to_extract)
+                    seen_st_ext = set(pending_clean_silent_starters)
                     for s_role in ("Starter", "Starting"):
                         for idx_ex, item in enumerate(extra_role_variants.get(s_role, ()), start=2):
                             ex_g = guid_str_to_bytes(item[0])
                             if ex_g in seen_st_ext:
                                 continue
                             seen_st_ext.add(ex_g)
-                            st_guids_to_extract.append(ex_g)
+                            pending_clean_silent_starters.append(ex_g)
+                            used_guids.add(ex_g)
                             ex_p = (item[1] if len(item) >= 2 and item[1] else "") or (
                                 f"event:/AMS2/Vehicles/{safe_mod}/{s_role}_{idx_ex}"
                             )
-                            extra_st_entries.append((ex_g, ex_p))
-                evnts = []
-                ibses = []
-                if native_bank_path and Path(native_bank_path).is_file():
-                    evnts, ibses = extract_native_starters(Path(native_bank_path), st_guids_to_extract)
-                if not evnts:
-                    MISC_BUS = guid_str_to_bytes("{ffefac1b-0333-46ad-9d94-c7ae1494451f}")
-                    for s_role in starter_roles:
-                        s_bg = guid_str_to_bytes(target_role_guids[s_role])
-                        s_ibg = hashlib.sha256(s_bg + b"_ibus_ams2").digest()[:16]
-                        evnts.append((s_bg, _make_trigger_evnt(s_bg, s_ibg, MISC_BUS)))
-                        ibses.append((s_ibg, _make_trigger_ibus(s_ibg, MISC_BUS)))
-                if evnts:
-                    proj_buf = bytearray(inject_native_chunks_in_proj(bytes(proj_buf), evnts, ibses))
-                    for s_role in starter_roles:
-                        s_bg = guid_str_to_bytes(target_role_guids[s_role])
-                        s_path = (target_role_paths or {}).get(s_role) or f"event:/AMS2/Vehicles/{safe_mod}/{s_role}"
-                        role_to_event_guid[s_role] = bytes_to_guid_str(s_bg)
-                        role_to_event_path[s_role] = s_path
-                        stdt_entries.append((s_path, s_bg))
-                    for ex_g, ex_p in extra_st_entries:
-                        stdt_entries.append((ex_p, ex_g))
+                            stdt_entries.append((ex_p, ex_g))
 
             # Evento de escape (Exhaust) si el objetivo lo requiere
             if "Exhaust" in target_role_guids and "Exhaust" not in role_to_event_guid:
@@ -4965,7 +7027,9 @@ def build_direct_ported_bank_from_ac(
                             )
                             stdt_entries.append((ep_extra, eg_extra))
                 else:
-                    ex_guids_to_extract = [ex_bg]
+                    # AC no trae evento Exhaust separado: emitir stub silencioso íntegro (0 punteros colgantes)
+                    # para neutralizar el escape vanilla sin superponerlo al motor de AC.
+                    ex_guids_to_silence = [ex_bg]
                     extra_ex_entries: list[tuple[bytes, str]] = []
                     if extra_role_variants:
                         seen_ex_ext = {ex_bg}
@@ -4974,29 +7038,20 @@ def build_direct_ported_bank_from_ac(
                             if eg_extra in seen_ex_ext:
                                 continue
                             seen_ex_ext.add(eg_extra)
-                            ex_guids_to_extract.append(eg_extra)
+                            ex_guids_to_silence.append(eg_extra)
                             ep_extra = (item[1] if len(item) >= 2 and item[1] else "") or (
                                 f"event:/AMS2/Vehicles/{safe_mod}/Exhaust_{idx_ex}"
                             )
                             extra_ex_entries.append((eg_extra, ep_extra))
-                    ex_evnts = []
-                    ex_ibses = []
-                    if native_bank_path and Path(native_bank_path).is_file():
-                        ex_evnts, ex_ibses = extract_native_starters(Path(native_bank_path), ex_guids_to_extract)
-                    if not ex_evnts:
-                        EXHAUST_BUS = guid_str_to_bytes("{ffe57d5c-46ed-4b06-86d5-8fa6f8ffdf07}")
-                        ex_ibg = hashlib.sha256(ex_bg + b"_ibus_ams2").digest()[:16]
-                        ex_evnts.append((ex_bg, _make_trigger_evnt(ex_bg, ex_ibg, EXHAUST_BUS)))
-                        ex_ibses.append((ex_ibg, _make_trigger_ibus(ex_ibg, EXHAUST_BUS)))
-                    if ex_evnts:
-                        proj_buf = bytearray(inject_native_chunks_in_proj(bytes(proj_buf), ex_evnts, ex_ibses))
-                        used_guids.add(ex_bg)
-                        role_to_event_guid["Exhaust"] = bytes_to_guid_str(ex_bg)
-                        ex_path = (target_role_paths or {}).get("Exhaust") or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust"
-                        role_to_event_path["Exhaust"] = ex_path
-                        stdt_entries.append((ex_path, ex_bg))
-                        for eg_extra, ep_extra in extra_ex_entries:
-                            stdt_entries.append((ep_extra, eg_extra))
+                    pending_clean_silent_exhaust.extend(ex_guids_to_silence)
+                    for g_ex in ex_guids_to_silence:
+                        used_guids.add(g_ex)
+                    role_to_event_guid["Exhaust"] = bytes_to_guid_str(ex_bg)
+                    ex_path = (target_role_paths or {}).get("Exhaust") or f"event:/AMS2/Vehicles/{safe_mod}/Exhaust"
+                    role_to_event_path["Exhaust"] = ex_path
+                    stdt_entries.append((ex_path, ex_bg))
+                    for eg_extra, ep_extra in extra_ex_entries:
+                        stdt_entries.append((ep_extra, eg_extra))
 
             # Asignar resto de eventos secundarios de AC con GUIDs únicos garantizados
             for ev in ac_bank.events:
@@ -5164,6 +7219,21 @@ def build_direct_ported_bank_from_ac(
         patched_proj_body = set_event_instance_limits_in_proj(
             patched_proj_body, None, 4, AI_EVENT_STEAL_VIRTUALIZE
         )
+        if pending_clean_silent_starters:
+            patched_proj_body = _inject_clean_silent_events_in_proj(
+                patched_proj_body,
+                pending_clean_silent_starters,
+                AMS2_STARTUP_BUS_BYTES,
+                (safe_mod + ":sil_st").encode("utf-8"),
+            )
+        if pending_clean_silent_exhaust:
+            EXHAUST_BUS = guid_str_to_bytes("{ffe57d5c-46ed-4b06-86d5-8fa6f8ffdf07}")
+            patched_proj_body = _inject_clean_silent_events_in_proj(
+                patched_proj_body,
+                pending_clean_silent_exhaust,
+                EXHAUST_BUS,
+                (safe_mod + ":sil_exh").encode("utf-8"),
+            )
         if extra_player_clones_count > 0:
             proj_mut = bytearray(patched_proj_body)
             for cid, ps, pe, _ in iter_riff_chunks(proj_mut, 0, len(proj_mut)):
@@ -5335,6 +7405,21 @@ def build_direct_ported_bank_from_ac(
 
     body = fmt_chunk_bytes + proj_chunk_bytes + b"".join(snd_chunks_built)
     full_riff = b"RIFF" + struct.pack("<I", 4 + len(body)) + b"FEV " + body
+    ac_fsb_cache = [bytes(b) for b in final_fsb_blobs]
+
+    # Injertar eventos nativos AMS2 Starter/Starting completos (subgrafo PROJ + audio FSB5 compacto)
+    if pending_native_starter_graft is not None:
+        nat_st_bank, nat_st_guids, st_pmap = pending_native_starter_graft
+        full_riff, _st_gmap, _st_pmap_fin = graft_native_events_with_audio_into_bank(
+            target_bank_bytes=full_riff,
+            native_bank=nat_st_bank,
+            native_event_guids=nat_st_guids,
+            event_paths_map=st_pmap,
+            remap_root_guids=False,
+            output_codec_mode=FSB5_MODE_FADPCM,
+            mod_identifier=safe_mod,
+            seed_tag="vanilla_starter",
+        )
 
     return PortedBankResult(
         bank_bytes=full_riff,
@@ -5349,7 +7434,7 @@ def build_direct_ported_bank_from_ac(
         codec_used=codec_label,
         throttle_cut_injected_events=0,
         local_guid_map=dict(guid_map or {}),
-        fsb_blobs_cache=[bytes(b) for b in final_fsb_blobs],
+        fsb_blobs_cache=ac_fsb_cache,
     )
 
 
@@ -5360,8 +7445,15 @@ def apply_ported_bank_to_csdbin(
     ai_bank_result: PortedBankResult | None = None,
     ai_bank_rel_path_no_ext: str | None = None,
     optimize_chase_cam: bool = True,
+    preserve_native_transmission: bool = True,
 ) -> CsdbinDocument:
-    """Actualiza los enlaces del documento .csdbin con las rutas `event:/...` registradas en STDT."""
+    """Actualiza los enlaces del documento .csdbin con las rutas `event:/...` registradas en STDT.
+
+    Con `preserve_native_transmission=True` (por defecto), mantiene intactos los enlaces nativos de
+    AMS2 para transmisión (`transmission_bank`/`transmission`/`gearbox`), caja de cambios
+    (`gearshift_bank`/`gearshift_up`/`gearshift_down`/`gearshift_grind`), viento y limitador nativos
+    para evitar que eventos incompatibles de AC (p.ej. `drivetrain_speed`) los silencien.
+    """
     clean_bank_path = bank_rel_path_no_ext.replace("\\", "/").removesuffix(".bank")
     csd_doc.links["engine_bank"] = clean_bank_path
 
@@ -5412,21 +7504,34 @@ def apply_ported_bank_to_csdbin(
     else:
         csd_doc.links.pop("starting", None)
 
-    # Enlaces de caja de cambios (gearshift)
-    gear_path = (
-        rpaths.get("GearshiftExt")
-        or rpaths.get("Gearshift")
-        or rpaths.get("GearshiftInt")
-        or rpaths.get("gear_ext")
-        or rpaths.get("gear_int")
-    )
-    if gear_path:
+    # Enlaces de caja de cambios (gearshift): conservar los nativos de AMS2 si ya existen en el .csdbin
+    if "NativeGearshiftUp" in rpaths or "NativeGearshiftDown" in rpaths:
         csd_doc.links["gearshift_bank"] = clean_bank_path
-        csd_doc.links["gearshift_up"] = gear_path
-        csd_doc.links["gearshift_down"] = gear_path
-    grind_path = rpaths.get("gear_grind") or rpaths.get("GearshiftGrind")
-    if grind_path:
-        csd_doc.links["gearshift_grind"] = grind_path
+        if "NativeGearshiftUp" in rpaths:
+            csd_doc.links["gearshift_up"] = rpaths["NativeGearshiftUp"]
+        if "NativeGearshiftDown" in rpaths:
+            csd_doc.links["gearshift_down"] = rpaths["NativeGearshiftDown"]
+    else:
+        has_native_gearshift = preserve_native_transmission and any(
+            k in csd_doc.links and csd_doc.links[k]
+            for k in ("gearshift_bank", "gearshift_up", "gearshift_down")
+        )
+        if not has_native_gearshift:
+            gear_path = (
+                rpaths.get("GearshiftExt")
+                or rpaths.get("Gearshift")
+                or rpaths.get("GearshiftInt")
+                or rpaths.get("gear_ext")
+                or rpaths.get("gear_int")
+            )
+            if gear_path:
+                csd_doc.links["gearshift_bank"] = clean_bank_path
+                csd_doc.links["gearshift_up"] = gear_path
+                csd_doc.links["gearshift_down"] = gear_path
+        if not (preserve_native_transmission and csd_doc.links.get("gearshift_grind")):
+            grind_path = rpaths.get("gear_grind") or rpaths.get("GearshiftGrind")
+            if grind_path:
+                csd_doc.links["gearshift_grind"] = grind_path
 
     # Enlaces de turbo / sobrealimentador
     turbo_path = rpaths.get("Turbo") or rpaths.get("turbo")
@@ -5434,17 +7539,26 @@ def apply_ported_bank_to_csdbin(
         csd_doc.links["turbo_bank"] = clean_bank_path
         csd_doc.links["turbo"] = turbo_path
 
-    # Enlaces de transmisión / diferencial
-    trans_path = rpaths.get("Transmission") or rpaths.get("transmission") or rpaths.get("transmission_ext")
-    if trans_path:
+    # Enlaces de transmisión / diferencial (GearWhine): preservar siempre el sonido original de AMS2
+    # (AC usa el parámetro `drivetrain_speed` que AMS2 no alimenta -> quedaría silenciado)
+    if "NativeTransmission" in rpaths:
         csd_doc.links["transmission_bank"] = clean_bank_path
-        csd_doc.links["transmission"] = trans_path
+        csd_doc.links["transmission"] = rpaths["NativeTransmission"]
+    elif not preserve_native_transmission:
+        trans_path = rpaths.get("Transmission") or rpaths.get("transmission") or rpaths.get("transmission_ext")
+        if trans_path:
+            csd_doc.links["transmission_bank"] = clean_bank_path
+            csd_doc.links["transmission"] = trans_path
 
-    # Enlaces de limitador de revoluciones
-    limiter_path = rpaths.get("Limiter") or rpaths.get("limiter")
-    if limiter_path:
-        csd_doc.links["rev_limiter_bank"] = clean_bank_path
-        csd_doc.links["rev_limiter"] = limiter_path
+    # Enlaces de limitador de revoluciones: no pisar el RevLimiterTC nativo de AMS2 si ya existe
+    has_native_limiter = preserve_native_transmission and any(
+        k in csd_doc.links and csd_doc.links[k] for k in ("rev_limiter_bank", "rev_limiter")
+    )
+    if not has_native_limiter:
+        limiter_path = rpaths.get("Limiter") or rpaths.get("limiter")
+        if limiter_path:
+            csd_doc.links["rev_limiter_bank"] = clean_bank_path
+            csd_doc.links["rev_limiter"] = limiter_path
 
     # Enlaces de petardeos (backfire)
     if "BackfireExt" in rpaths:
@@ -5457,11 +7571,15 @@ def apply_ported_bank_to_csdbin(
     elif "backfire_int" in rpaths:
         csd_doc.links["backfire_int"] = rpaths["backfire_int"]
 
-    # Enlaces de viento
-    wind_path = rpaths.get("Wind") or rpaths.get("wind")
-    if wind_path:
-        csd_doc.links["wind_bank"] = clean_bank_path
-        csd_doc.links["wind"] = wind_path
+    # Enlaces de viento: no pisar el WindBuffeting nativo de AMS2 si ya existe
+    has_native_wind = preserve_native_transmission and any(
+        k in csd_doc.links and csd_doc.links[k] for k in ("wind_bank", "wind")
+    )
+    if not has_native_wind:
+        wind_path = rpaths.get("Wind") or rpaths.get("wind")
+        if wind_path:
+            csd_doc.links["wind_bank"] = clean_bank_path
+            csd_doc.links["wind"] = wind_path
 
     # Optimización de colocación 3D para Chase Cam (3ra persona):
     # En AMS2 la cámara trasera se sitúa a 6-8m. Si la distancia mínima es 2.0m, la curva logarítmica
@@ -5521,11 +7639,25 @@ def export_ams2_mod_package(
     optimize_chase_cam: bool = True,
     mute_pops: bool = False,
     invert_spatial_cone: bool = True,
+    ams2_root: Path | None = None,
+    backup_dir: Path | None = None,
+    preserve_native_starter: bool = True,
+    preserve_native_transmission: bool = True,
 ) -> ModExportSummary:
     """Compila el .bank y el .csdbin listos para copiar en Automobilista 2 / AMS2 Content Manager."""
     output_root = Path(output_root)
     safe_mod = "".join(c if (c.isalnum() or c in "_-") else "_" for c in mod_identifier.strip()) or "custom_sound"
     safe_veh = "".join(c if (c.isalnum() or c in "_-") else "_" for c in vehicle_folder_name.strip()) or safe_mod
+
+    # Capturar enlaces originales de AMS2 antes de modificar el .csdbin
+    orig_engine_bank = csd_doc.links.get("engine_bank", "") if csd_doc is not None else ""
+    orig_starter_path = csd_doc.links.get("starter", "") if csd_doc is not None else ""
+    orig_starting_path = csd_doc.links.get("starting", "") if csd_doc is not None else ""
+    orig_trans_bank = csd_doc.links.get("transmission_bank", "") if csd_doc is not None else ""
+    orig_trans_path = csd_doc.links.get("transmission", "") if csd_doc is not None else ""
+    orig_gear_bank = csd_doc.links.get("gearshift_bank", "") if csd_doc is not None else ""
+    orig_gear_up = csd_doc.links.get("gearshift_up", "") if csd_doc is not None else ""
+    orig_gear_down = csd_doc.links.get("gearshift_down", "") if csd_doc is not None else ""
 
     if direct_ac_bank is not None:
         has_large_pcm16 = (
@@ -5561,6 +7693,92 @@ def export_ams2_mod_package(
             rpm_bands=rpm_bands,
             throttle_cut=throttle_cut,
         )
+
+    # Preservar Starter / Starting (y transmisión/gearshift empaquetados si vivían dentro de engine_bank)
+    # desde el banco original de AMS2 al exportar Mods para que nunca queden mudos.
+    need_starter_graft = preserve_native_starter and (
+        direct_ac_bank is not None
+        or ("Starter" not in bank_res.role_to_event_path and "Starting" not in bank_res.role_to_event_path)
+    )
+    if need_starter_graft and (csd_doc is not None or donor is not None):
+        nat_src_bank, st_guids, st_g2r, st_g2p = _resolve_native_starter_source_for_csdbin(
+            csd_doc=csd_doc,
+            orig_engine_bank=orig_engine_bank,
+            orig_starter_path=orig_starter_path,
+            orig_starting_path=orig_starting_path,
+            ams2_root=ams2_root,
+            backup_dir=backup_dir,
+            fallback_donor=donor,
+            extra_search_roots=[output_root],
+        )
+        if nat_src_bank is not None:
+            all_graft_guids: list[bytes] = list(st_guids)
+            graft_roles: dict[bytes, str] = dict(st_g2r)
+            graft_orig_paths: dict[bytes, str] = dict(st_g2p)
+
+            # Caso especial: si la transmisión o gearshift nativos venían empaquetados dentro del mismo engine_bank
+            eb_norm = orig_engine_bank.replace("\\", "/").removesuffix(".bank").strip("/").lower()
+            if preserve_native_transmission and eb_norm:
+                nat_stdt = parse_stdt_all_paths(nat_src_bank.stdt_bytes) if nat_src_bank.stdt_bytes else {}
+                nat_ms = _load_ams2_master_strings_cached(ams2_root)
+                p2g_nat: dict[str, bytes] = {}
+                for ev_n in nat_src_bank.events:
+                    ep_n = nat_stdt.get(ev_n.guid_bytes) or nat_ms.get(ev_n.guid_str.lower(), "") or (ev_n.path or "")
+                    if ep_n:
+                        p2g_nat[ep_n.lower()] = ev_n.guid_bytes
+
+                tb_norm = orig_trans_bank.replace("\\", "/").removesuffix(".bank").strip("/").lower()
+                if tb_norm == eb_norm and orig_trans_path:
+                    tg_b = p2g_nat.get(orig_trans_path.lower())
+                    if tg_b and tg_b not in graft_roles:
+                        all_graft_guids.append(tg_b)
+                        graft_roles[tg_b] = "NativeTransmission"
+                        graft_orig_paths[tg_b] = orig_trans_path
+
+                gb_norm = orig_gear_bank.replace("\\", "/").removesuffix(".bank").strip("/").lower()
+                if gb_norm == eb_norm:
+                    for g_role_k, g_path_v in (("NativeGearshiftUp", orig_gear_up), ("NativeGearshiftDown", orig_gear_down)):
+                        if g_path_v:
+                            gg_b = p2g_nat.get(g_path_v.lower())
+                            if gg_b and gg_b not in graft_roles:
+                                all_graft_guids.append(gg_b)
+                                graft_roles[gg_b] = g_role_k
+                                graft_orig_paths[gg_b] = g_path_v
+
+            if all_graft_guids:
+                graft_paths_map: dict[bytes, str] = {}
+                role_seq: dict[str, int] = {}
+                for og in all_graft_guids:
+                    rk = graft_roles.get(og, "Starter")
+                    if standalone_guids:
+                        role_seq[rk] = role_seq.get(rk, 0) + 1
+                        suf = "" if role_seq[rk] == 1 else f"_{role_seq[rk]}"
+                        graft_paths_map[og] = f"event:/AMS2/Vehicles/Mods/{safe_mod}/{rk}{suf}"
+                    else:
+                        graft_paths_map[og] = graft_orig_paths.get(og) or f"event:/AMS2/Vehicles/Mods/{safe_mod}/{rk}"
+
+                grafted_bytes, g_map_nat, fin_paths_nat = graft_native_events_with_audio_into_bank(
+                    target_bank_bytes=bank_res.bank_bytes,
+                    native_bank=nat_src_bank,
+                    native_event_guids=all_graft_guids,
+                    event_paths_map=graft_paths_map,
+                    remap_root_guids=standalone_guids,
+                    output_codec_mode=FSB5_MODE_FADPCM,
+                    mod_identifier=safe_mod,
+                    seed_tag="mod_native_starter",
+                )
+                bank_res.bank_bytes = grafted_bytes
+                assigned_graft_roles: set[str] = set()
+                for og in all_graft_guids:
+                    fin_g = g_map_nat.get(og)
+                    if fin_g is None:
+                        continue
+                    rk = graft_roles.get(og, "")
+                    if rk in ("Starter", "Starting", "NativeTransmission", "NativeGearshiftUp", "NativeGearshiftDown") and rk not in assigned_graft_roles:
+                        assigned_graft_roles.add(rk)
+                        fin_p = fin_paths_nat.get(fin_g, graft_paths_map.get(og, ""))
+                        bank_res.role_to_event_guid[rk] = bytes_to_guid_str(fin_g)
+                        bank_res.role_to_event_path[rk] = fin_p
 
     bank_rel_no_ext = f"Audio/AMS2/Vehicles/Mods/{safe_mod}/{safe_mod}_Engine"
     if csd_doc is not None and not standalone_guids and csd_doc.links.get("engine_bank"):
@@ -5649,6 +7867,7 @@ def export_ams2_mod_package(
                 ai_bank_result=ai_bank_res,
                 ai_bank_rel_path_no_ext=ai_bank_rel_no_ext,
                 optimize_chase_cam=optimize_chase_cam,
+                preserve_native_transmission=preserve_native_transmission,
             )
         # Conservar el nombre de archivo original del .csdbin si proviene de un vehículo mod existente
         # (p.ej. carpeta 'Vehicles/bmw_z4_gt3' con archivo 'z4_gt3.csdbin')
